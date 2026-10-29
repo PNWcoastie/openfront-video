@@ -273,6 +273,36 @@ Settings (environment): `PORT` (8080), `DATA_DIR` (`/data` in the image),
 `MAX_RENDERS` (2), `EMBED_WAIT_SECS` (25), `VIDEO_WAIT_SECS` (120: how long a video
 request waits for a render in progress), `MAX_STORAGE_GB` (35), `OPENFRONT_VIDEO_BIN`.
 
+### Admin dashboard
+
+Set `ADMIN_PASSWORD` and open `/admin`. The browser asks for a login: any user name
+plus that password. Without the setting, `/admin` returns 404. The dashboard refreshes
+every 15 seconds and shows:
+- **Totals:** stored videos and storage against the limit; renders in the last 24 hours
+  by outcome; average render time; views and Discord embeds; busy render slots and the
+  queue; what cleanup deleted.
+- **Hourly charts, last 48 hours:** renders by outcome (automatic, requested, not
+  finished, stopped for a request, failed) and views (page views, video plays, embeds).
+- **Breakdowns:** storage by when each game was last viewed (cleanup removes the oldest
+  first), render time distribution, top maps and modes among stored videos.
+- **Render queue:** a bar with one piece per game. From left to right: the last 12
+  finished or failed renders, the games rendering now (automatic or requested), and
+  the waiting queue, next first. Games close to being dropped for age are amber.
+  Hover a piece for the game and its timing.
+- **Visitors:** distinct visitors in the last 24 hours. Requests per hour by source
+  (people, Discord, other bots and apps). Requests and distinct visitors per source
+  (browsers, Discord, X, Slack, Telegram, WhatsApp, Facebook, other bots). What each
+  group opens (home, video page, rendering page, not-finished page, video plays). The
+  source comes from the User-Agent. A visitor is a hash of the IP address, taken from
+  Caddy's or Cloudflare's forwarding headers, with a secret salt in
+  `/data/.visitor-salt`. The IP itself is never stored.
+- **Tables:** what's rendering now, the most viewed games, recent renders, and why
+  renders failed over the last 7 days, with an example game for each reason.
+
+The data comes from the stored games' details files and an event log,
+`/data/events.jsonl` (renders; every page view and video play with its source and hashed visitor; cleanups), which keeps
+30 days.
+
 ### Storage cleanup
 
 Videos are kept under `MAX_STORAGE_GB` (35 by default, for a 40 GB volume; 0 turns

@@ -1,0 +1,349 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<title>openfront.video admin</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+:root {
+  color-scheme: dark;
+  --bg: #16181d;
+  --surface: #1e2128;
+  --border: #2c3039;
+  --grid: #2a2e36;
+  --text: #f0efec;
+  --text-2: #c3c2b7;
+  --muted: #8b8f98;
+  --link: #7cb7ff;
+  /* Categorical slots (validated on --surface, dark mode). */
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181;
+  /* Sequential blue, light -> dark. */
+  --q1: #9ec5f4; --q2: #5598e7; --q3: #256abf; --q4: #184f95;
+  /* Status (with icon + label, never alone). */
+  --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, Segoe UI, sans-serif; }
+header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; padding: 20px 16px 8px; max-width: 1400px; margin: 0 auto; }
+header h1 { font-size: 20px; margin: 0; }
+header .meta { color: var(--muted); font-size: 13px; }
+header .meta .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--good); margin-right: 6px; vertical-align: 1px; }
+header .meta.stale .dot { background: var(--critical); }
+main { max-width: 1400px; margin: 0 auto; padding: 8px 16px 40px; display: grid; gap: 16px; grid-template-columns: repeat(12, 1fr); }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; min-width: 0; }
+.card h2 { font-size: 13px; font-weight: 600; color: var(--text-2); margin: 0 0 10px; letter-spacing: .02em; }
+.card h2 small { font-weight: 400; color: var(--muted); margin-left: 6px; }
+.span-2 { grid-column: span 2; } .span-3 { grid-column: span 3; } .span-4 { grid-column: span 4; }
+.span-5 { grid-column: span 5; } .span-6 { grid-column: span 6; } .span-7 { grid-column: span 7; }
+.span-8 { grid-column: span 8; } .span-12 { grid-column: span 12; }
+@media (max-width: 1100px) { .span-2 { grid-column: span 4; } .span-3,.span-4,.span-5,.span-6,.span-7,.span-8 { grid-column: span 12; } }
+@media (max-width: 600px) { .span-2 { grid-column: span 6; } }
+.kpi .value { font-size: 28px; font-weight: 650; letter-spacing: -.01em; }
+.kpi .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+.meter { height: 6px; background: var(--grid); border-radius: 3px; margin-top: 8px; overflow: hidden; }
+.meter > div { height: 100%; border-radius: 3px; background: var(--s1); }
+.chart { position: relative; height: 260px; }
+.chart.short { height: 200px; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th { text-align: left; color: var(--muted); font-weight: 500; padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+td { padding: 6px 8px; border-bottom: 1px solid var(--grid); color: var(--text-2); vertical-align: top; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+tr:last-child td { border-bottom: 0; }
+a { color: var(--link); text-decoration: none; } a:hover { text-decoration: underline; }
+.mono { font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+.tag { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; white-space: nowrap; color: var(--text-2); }
+.tag::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--c); }
+.tag.done { --c: var(--good); } .tag.failed { --c: var(--critical); } .tag.not_found { --c: var(--warning); } .tag.preempted { --c: var(--serious); }
+.scroll { max-height: 360px; overflow: auto; }
+.live-row { display: flex; justify-content: space-between; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--grid); }
+.live-row:last-child { border-bottom: 0; }
+.empty { color: var(--muted); font-size: 13px; padding: 8px 0; }
+.legend { display: flex; flex-wrap: wrap; gap: 14px; margin: -2px 0 8px; font-size: 12px; color: var(--text-2); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend i { width: 10px; height: 10px; border-radius: 2px; background: var(--c); }
+.err { grid-column: span 12; color: var(--critical); }
+.qbar { display: flex; gap: 2px; height: 34px; align-items: stretch; margin-top: 4px; }
+.qbar .piece { flex: 1 1 0; min-width: 2px; max-width: 28px; border-radius: 3px; background: var(--c); cursor: default; }
+.qbar .piece.wide { max-width: none; }
+.qbar .sep { width: 2px; margin: 0 6px; background: var(--border); border-radius: 1px; flex: none; }
+.qaxis { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; margin-top: 6px; }
+.qtip { position: fixed; pointer-events: none; background: #0f1115; border: 1px solid var(--grid); border-radius: 6px; padding: 8px 10px; font-size: 12px; color: var(--text-2); display: none; z-index: 10; white-space: nowrap; }
+.qtip b { color: var(--text); font-weight: 600; }
+</style>
+</head>
+<body>
+<header>
+  <h1>openfront.video</h1>
+  <span class="meta" id="status"><span class="dot"></span>loading…</span>
+</header>
+<main id="main">
+  <section class="card kpi span-2"><h2>Stored videos</h2><div class="value" id="k-games">–</div><div class="sub" id="k-storage">–</div><div class="meter"><div id="k-meter" style="width:0"></div></div></section>
+  <section class="card kpi span-2"><h2>Renders <small>24 h</small></h2><div class="value" id="k-done">–</div><div class="sub" id="k-done-sub">–</div></section>
+  <section class="card kpi span-2"><h2>Avg render time <small>24 h</small></h2><div class="value" id="k-avg">–</div><div class="sub">per finished video</div></section>
+  <section class="card kpi span-2"><h2>Visitors <small>24 h</small></h2><div class="value" id="k-views">–</div><div class="sub" id="k-views-sub">–</div></section>
+  <section class="card kpi span-2"><h2>Render slots</h2><div class="value" id="k-slots">–</div><div class="sub" id="k-queue">–</div></section>
+  <section class="card kpi span-2"><h2>Cleaned up <small>24 h</small></h2><div class="value" id="k-clean">–</div><div class="sub" id="k-clean-sub">–</div></section>
+
+  <section class="card span-12">
+    <h2>Render queue <small>left to right: recently finished, rendering now, waiting (next first)</small></h2>
+    <div class="legend" id="lg-queue"></div>
+    <div class="qbar" id="qbar" aria-label="Render queue"></div>
+    <div class="qaxis"><span id="qaxis-left"></span><span id="qaxis-right"></span></div>
+  </section>
+
+  <section class="card span-8">
+    <h2>Renders per hour <small>last 48 h, by outcome</small></h2>
+    <div class="legend" id="lg-renders"></div>
+    <div class="chart"><canvas id="c-renders" aria-label="Renders per hour by outcome"></canvas></div>
+  </section>
+  <section class="card span-4">
+    <h2>Rendering now</h2>
+    <div id="live"></div>
+  </section>
+
+  <section class="card span-8">
+    <h2>Views per hour <small>last 48 h</small></h2>
+    <div class="legend" id="lg-views"></div>
+    <div class="chart"><canvas id="c-views" aria-label="Views per hour"></canvas></div>
+  </section>
+  <section class="card span-4">
+    <h2>Storage by last viewed <small>what cleanup removes first: oldest</small></h2>
+    <div class="chart"><canvas id="c-age" aria-label="Storage by last viewed"></canvas></div>
+  </section>
+
+  <section class="card span-6">
+    <h2>Requests by source per hour <small>last 48 h</small></h2>
+    <div class="legend" id="lg-src"></div>
+    <div class="chart"><canvas id="c-src" aria-label="Requests by source per hour"></canvas></div>
+  </section>
+  <section class="card span-3">
+    <h2>Visitors by source <small>24 h</small></h2>
+    <div class="chart"><canvas id="c-clients" aria-label="Visitors by source"></canvas></div>
+  </section>
+  <section class="card span-3">
+    <h2>What they open <small>24 h</small></h2>
+    <div class="legend" id="lg-pages"></div>
+    <div class="chart"><canvas id="c-pages" aria-label="Pages opened"></canvas></div>
+  </section>
+
+  <section class="card span-4">
+    <h2>Render time <small>stored videos, seconds</small></h2>
+    <div class="chart short"><canvas id="c-hist" aria-label="Render time distribution"></canvas></div>
+  </section>
+  <section class="card span-4">
+    <h2>Top maps <small>stored videos</small></h2>
+    <div class="chart short"><canvas id="c-maps" aria-label="Top maps"></canvas></div>
+  </section>
+  <section class="card span-4">
+    <h2>Modes <small>stored videos</small></h2>
+    <div class="chart short"><canvas id="c-modes" aria-label="Game modes"></canvas></div>
+  </section>
+
+  <section class="card span-6">
+    <h2>Most viewed <small>30 days</small></h2>
+    <div class="scroll"><table id="t-top"></table></div>
+  </section>
+  <section class="card span-6">
+    <h2>Recent renders</h2>
+    <div class="scroll"><table id="t-recent"></table></div>
+  </section>
+  <section class="card span-12">
+    <h2>Why renders failed <small>7 days</small></h2>
+    <div class="scroll"><table id="t-fail"></table></div>
+  </section>
+</main>
+<div class="qtip" id="qtip"></div>
+<script>
+const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const C = { s: [1, 2, 3, 4, 5].map((i) => css(`--s${i}`)), q: [1, 2, 3, 4].map((i) => css(`--q${i}`)),
+  text: css("--text-2"), muted: css("--muted"), grid: css("--grid"), surface: css("--surface") };
+const fmt = new Intl.NumberFormat("en-US");
+const gb = (b) => (b / 1e9).toFixed(b >= 1e10 ? 1 : 2) + " GB";
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+const ago = (t, now) => { const s = Math.max(0, now - t); return s < 60 ? `${s}s ago` : s < 3600 ? `${Math.floor(s / 60)}m ago` : s < 86400 ? `${Math.floor(s / 3600)}h ago` : `${Math.floor(s / 86400)}d ago`; };
+const hourLabel = (t) => { const d = new Date(t * 1000); return d.getHours() === 0 ? d.toLocaleDateString([], { month: "short", day: "numeric" }) : d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }); };
+const gameLink = (id) => `<a class="mono" href="/game/${encodeURIComponent(id)}" target="_blank" rel="noopener">${esc(id)}</a>`;
+const outcomeText = { done: "done", failed: "failed", not_found: "not finished", preempted: "stopped" };
+
+Chart.defaults.color = C.text;
+Chart.defaults.font.family = "system-ui, -apple-system, Segoe UI, sans-serif";
+Chart.defaults.font.size = 12;
+Chart.defaults.borderColor = C.grid;
+Chart.defaults.plugins.legend.display = false;
+Chart.defaults.plugins.tooltip.backgroundColor = "#0f1115";
+Chart.defaults.plugins.tooltip.borderColor = C.grid;
+Chart.defaults.plugins.tooltip.borderWidth = 1;
+Chart.defaults.plugins.tooltip.padding = 10;
+Chart.defaults.maintainAspectRatio = false;
+Chart.defaults.animation = false;
+
+const axis = (extra = {}) => ({ grid: { color: C.grid, drawTicks: false }, border: { display: false }, ticks: { color: C.muted, padding: 6 }, ...extra });
+const charts = {};
+function upsert(id, config) {
+  if (charts[id]) { charts[id].data = config.data; charts[id].update(); return; }
+  charts[id] = new Chart(document.getElementById(id), config);
+}
+function legend(id, items) {
+  document.getElementById(id).innerHTML = items.map(([label, color]) => `<span><i style="--c:${color}"></i>${esc(label)}</span>`).join("");
+}
+
+const RENDER_SERIES = [
+  ["Auto, done", "auto_done", 0], ["Request, done", "request_done", 1],
+  ["Not finished", "not_found", 2], ["Stopped for a request", "preempted", 3], ["Failed", "failed", 4],
+];
+const VIEW_SERIES = [["Page views", "page_views", 0], ["Video plays", "video_views", 1], ["Discord/link embeds", "embeds", 2]];
+legend("lg-renders", RENDER_SERIES.map(([l, , i]) => [l, C.s[i]]));
+const SRC_SERIES = [["People (browsers)", "src_browser", 0], ["Discord", "src_discord", 1], ["Other bots and apps", "src_bots", 2]];
+legend("lg-src", SRC_SERIES.map(([l, , i]) => [l, C.s[i]]));
+legend("lg-pages", [["People", C.s[0]], ["Bots and embeds", C.s[1]]]);
+const CLIENT_NAMES = { browser: "Browsers", discord: "Discord", twitter: "X / Twitter", slack: "Slack", telegram: "Telegram", whatsapp: "WhatsApp", facebook: "Facebook", other_bot: "Other bots" };
+const PAGE_NAMES = { home: "Home page", page: "Video page", pending: "Rendering page", not_found: "Not finished page", failed: "Failed page", video: "Video plays" };
+const Q = { done: css("--good"), failed: css("--critical"), auto: C.s[0], request: C.s[1], waiting: C.q[1], expiring: css("--warning") };
+
+const qtip = document.getElementById("qtip");
+function renderQueue(d) {
+  const now = d.now, maxAge = d.config.max_age_mins * 60;
+  const recent = d.queue.recent.slice().reverse();
+  const running = d.live.running;
+  const waiting = d.queue.waiting.map((w) => ({ ...w, expiring: maxAge > 0 && now - w.ended >= maxAge * 0.8 }));
+  const piece = (color, tip, wide) => `<div class="piece${wide ? " wide" : ""}" style="--c:${color}" data-tip="${esc(tip)}"></div>`;
+  const parts = [];
+  for (const r of recent) {
+    const ok = r.outcome === "done";
+    parts.push(piece(ok ? Q.done : Q.failed, `<b>${r.id}</b><br>${outcomeText[r.outcome] || r.outcome} ${ago(r.t, now)} · ${r.auto ? "auto" : "request"}`));
+  }
+  parts.push('<div class="sep"></div>');
+  if (running.length) {
+    for (const r of running) parts.push(piece(r.auto ? Q.auto : Q.request, `<b>${r.id}</b><br>rendering for ${r.secs.toFixed(0)} s · ${r.auto ? "auto" : "request"}`, true));
+  } else {
+    parts.push('<div class="piece wide" style="--c:var(--grid)" data-tip="Both slots idle"></div>');
+  }
+  parts.push('<div class="sep"></div>');
+  for (const w of waiting) {
+    const left = Math.max(0, Math.round((maxAge - (now - w.ended)) / 60));
+    parts.push(piece(w.expiring ? Q.expiring : Q.waiting, `<b>${w.id}</b><br>ended ${ago(w.ended, now)} · dropped in ${left} min`));
+  }
+  if (!waiting.length) parts.push('<div class="piece wide" style="--c:var(--grid)" data-tip="Queue empty"></div>');
+  document.getElementById("qbar").innerHTML = parts.join("");
+  const done = recent.filter((r) => r.outcome === "done").length, expiring = waiting.filter((w) => w.expiring).length;
+  legend("lg-queue", [
+    [`Finished (${done})`, Q.done], [`Failed or skipped (${recent.length - done})`, Q.failed],
+    [`Rendering, auto (${running.filter((r) => r.auto).length})`, Q.auto], [`Rendering, request (${running.filter((r) => !r.auto).length})`, Q.request],
+    [`Waiting (${waiting.length - expiring})`, Q.waiting], [`Expiring soon (${expiring})`, Q.expiring],
+  ]);
+  document.getElementById("qaxis-left").textContent = recent.length ? `last ${recent.length} renders` : "";
+  document.getElementById("qaxis-right").textContent = waiting.length
+    ? `${fmt.format(d.live.queue)} waiting${d.live.queue > waiting.length ? ` (first ${waiting.length} shown)` : ""}, oldest ended ${ago(Math.min(...waiting.map((w) => w.ended)), now)}`
+    : "";
+}
+document.getElementById("qbar").addEventListener("mousemove", (e) => {
+  const tip = e.target.dataset && e.target.dataset.tip;
+  if (!tip) { qtip.style.display = "none"; return; }
+  qtip.innerHTML = tip;
+  qtip.style.display = "block";
+  qtip.style.left = Math.min(e.clientX + 12, innerWidth - qtip.offsetWidth - 8) + "px";
+  qtip.style.top = e.clientY + 14 + "px";
+});
+document.getElementById("qbar").addEventListener("mouseleave", () => (qtip.style.display = "none"));
+legend("lg-views", VIEW_SERIES.map(([l, , i]) => [l, C.s[i]]));
+
+function render(d) {
+  const k = d.kpi, now = d.now, limit = d.config.storage_limit;
+  document.getElementById("k-games").textContent = fmt.format(k.games);
+  document.getElementById("k-storage").textContent = limit ? `${gb(k.bytes)} of ${gb(limit)}` : `${gb(k.bytes)}, no limit`;
+  document.getElementById("k-meter").style.width = limit ? `${Math.min(100, (100 * k.bytes) / limit).toFixed(1)}%` : "0";
+  document.getElementById("k-done").textContent = fmt.format(k.done24);
+  document.getElementById("k-done-sub").textContent = `${fmt.format(k.failed24)} failed · ${fmt.format(k.not_found24)} not finished · ${fmt.format(k.preempted24)} stopped`;
+  document.getElementById("k-avg").textContent = k.done24 ? `${k.avg_render24.toFixed(1)} s` : "–";
+  document.getElementById("k-views").textContent = fmt.format(k.visitors24);
+  document.getElementById("k-views-sub").textContent = `${fmt.format(k.views24)} views · ${fmt.format(k.embeds24)} bot requests`;
+  renderQueue(d);
+  document.getElementById("k-slots").textContent = `${d.live.running.length} / ${d.config.slots}`;
+  document.getElementById("k-queue").textContent = d.config.auto ? `${fmt.format(d.live.queue)} games queued` : "auto rendering off";
+  document.getElementById("k-clean").textContent = fmt.format(k.cleaned_games24);
+  document.getElementById("k-clean-sub").textContent = k.cleaned_games24 ? `${gb(k.cleaned_bytes24)} freed` : "nothing deleted";
+
+  const labels = d.hourly.map((h) => hourLabel(h.t));
+  const bar = (label, key, i) => ({ label, data: d.hourly.map((h) => h[key]), backgroundColor: C.s[i], borderColor: C.surface, borderWidth: { top: 2 }, borderRadius: 2, borderSkipped: false });
+  upsert("c-renders", { type: "bar", data: { labels, datasets: RENDER_SERIES.map(([l, key, i]) => bar(l, key, i)) },
+    options: { interaction: { mode: "index", intersect: false }, scales: { x: axis({ stacked: true, grid: { display: false }, ticks: { color: C.muted, maxRotation: 0, autoSkip: true, maxTicksLimit: 12 } }), y: axis({ stacked: true, beginAtZero: true, ticks: { color: C.muted, precision: 0 } }) },
+      plugins: { tooltip: { filter: (item) => item.raw > 0 } } } });
+
+  const line = (label, key, i) => ({ label, data: d.hourly.map((h) => h[key]), borderColor: C.s[i], backgroundColor: C.s[i], borderWidth: 2, pointRadius: 0, pointHoverRadius: 4, tension: 0.25 });
+  upsert("c-views", { type: "line", data: { labels, datasets: VIEW_SERIES.map(([l, key, i]) => line(l, key, i)) },
+    options: { interaction: { mode: "index", intersect: false }, scales: { x: axis({ grid: { display: false }, ticks: { color: C.muted, maxRotation: 0, autoSkip: true, maxTicksLimit: 12 } }), y: axis({ beginAtZero: true, ticks: { color: C.muted, precision: 0 } }) } } });
+
+  upsert("c-src", { type: "bar", data: { labels, datasets: SRC_SERIES.map(([l, key, i]) => bar(l, key, i)) },
+    options: { interaction: { mode: "index", intersect: false }, scales: { x: axis({ stacked: true, grid: { display: false }, ticks: { color: C.muted, maxRotation: 0, autoSkip: true, maxTicksLimit: 8 } }), y: axis({ stacked: true, beginAtZero: true, ticks: { color: C.muted, precision: 0 } }) },
+      plugins: { tooltip: { filter: (item) => item.raw > 0 } } } });
+
+  const clients = d.clients.filter((c) => c.requests > 0 || c.client === "browser" || c.client === "discord");
+  upsert("c-clients", { type: "bar", data: { labels: clients.map((c) => CLIENT_NAMES[c.client] || c.client), datasets: [{ label: "Requests", data: clients.map((c) => c.requests), backgroundColor: clients.map((c) => (c.client === "browser" ? C.s[0] : c.client === "discord" ? C.s[1] : C.s[2])), borderRadius: 4, visitors: clients.map((c) => c.visitors) }] },
+    options: { indexAxis: "y", scales: { x: axis({ beginAtZero: true, ticks: { color: C.muted, precision: 0 } }), y: axis({ grid: { display: false }, ticks: { color: C.text } }) },
+      plugins: { tooltip: { callbacks: { label: (c) => ` ${fmt.format(c.raw)} requests · ${fmt.format(c.dataset.visitors[c.dataIndex])} distinct visitors` } } } } });
+
+  const pages = d.pages.filter((p) => p.people + p.bots > 0 || p.what === "home" || p.what === "page");
+  upsert("c-pages", { type: "bar", data: { labels: pages.map((p) => PAGE_NAMES[p.what] || p.what), datasets: [
+      { label: "People", data: pages.map((p) => p.people), backgroundColor: C.s[0], borderColor: C.surface, borderWidth: { right: 2 }, borderRadius: 2, borderSkipped: false },
+      { label: "Bots and embeds", data: pages.map((p) => p.bots), backgroundColor: C.s[1], borderColor: C.surface, borderWidth: { right: 2 }, borderRadius: 2, borderSkipped: false }] },
+    options: { indexAxis: "y", interaction: { mode: "index", intersect: false }, scales: { x: axis({ stacked: true, beginAtZero: true, ticks: { color: C.muted, precision: 0 } }), y: axis({ stacked: true, grid: { display: false }, ticks: { color: C.text } }) },
+      plugins: { tooltip: { filter: (item) => item.raw > 0 } } } });
+
+  upsert("c-age", { type: "bar", data: { labels: d.by_age.map((a) => a.label), datasets: [{ label: "Storage", data: d.by_age.map((a) => a.bytes / 1e9), backgroundColor: [C.q[0], C.q[1], C.q[2], C.q[3]], borderRadius: 4, games: d.by_age.map((a) => a.games) }] },
+    options: { indexAxis: "y", scales: { x: axis({ beginAtZero: true, ticks: { color: C.muted, callback: (v) => `${v} GB` } }), y: axis({ grid: { display: false } }) },
+      plugins: { tooltip: { callbacks: { label: (c) => ` ${c.raw.toFixed(2)} GB · ${fmt.format(c.dataset.games[c.dataIndex])} videos` } } } } });
+
+  const histLabels = d.render_hist.map((_, i) => (i === 12 ? "60+" : `${i * 5}–${i * 5 + 5}`));
+  upsert("c-hist", { type: "bar", data: { labels: histLabels, datasets: [{ label: "Videos", data: d.render_hist, backgroundColor: C.s[0], borderRadius: 4, barPercentage: 0.9, categoryPercentage: 0.95 }] },
+    options: { scales: { x: axis({ grid: { display: false }, ticks: { color: C.muted, maxRotation: 0, autoSkip: true } }), y: axis({ beginAtZero: true, ticks: { color: C.muted, precision: 0 } }) },
+      plugins: { tooltip: { callbacks: { title: (c) => `${c[0].label} s`, label: (c) => ` ${fmt.format(c.raw)} videos` } } } } });
+
+  upsert("c-maps", { type: "bar", data: { labels: d.maps.map((m) => m.map), datasets: [{ label: "Videos", data: d.maps.map((m) => m.games), backgroundColor: C.s[0], borderRadius: 4, views: d.maps.map((m) => m.views) }] },
+    options: { indexAxis: "y", scales: { x: axis({ beginAtZero: true, ticks: { color: C.muted, precision: 0 } }), y: axis({ grid: { display: false }, ticks: { color: C.text, autoSkip: false } }) },
+      plugins: { tooltip: { callbacks: { label: (c) => ` ${fmt.format(c.raw)} videos · ${fmt.format(c.dataset.views[c.dataIndex])} views` } } } } });
+
+  upsert("c-modes", { type: "bar", data: { labels: d.modes.map((m) => m.mode), datasets: [{ label: "Videos", data: d.modes.map((m) => m.games), backgroundColor: C.s[0], borderRadius: 4 }] },
+    options: { indexAxis: "y", scales: { x: axis({ beginAtZero: true, ticks: { color: C.muted, precision: 0 } }), y: axis({ grid: { display: false }, ticks: { color: C.text } }) },
+      plugins: { tooltip: { callbacks: { label: (c) => ` ${fmt.format(c.raw)} videos` } } } } });
+
+  const live = document.getElementById("live");
+  const rows = d.live.running.map((r) => `<div class="live-row"><span>${gameLink(r.id)} <span class="tag" style="--c:${r.auto ? C.s[0] : C.s[1]}">${r.auto ? "auto" : "request"}</span></span><span class="mono">${r.secs.toFixed(0)} s</span></div>`);
+  const poll = d.config.auto ? (d.live.last_poll ? `Last check for finished games ${ago(d.live.last_poll, now)}, ${fmt.format(d.live.last_new)} new` : "Waiting for the first check") : "Automatic rendering is off";
+  live.innerHTML = (rows.length ? rows.join("") : `<div class="empty">Both slots idle.</div>`) +
+    `<div class="sub" style="margin-top:12px;color:var(--muted);font-size:12px">${esc(poll)}. ${d.config.auto ? `Queue: ${fmt.format(d.live.queue)} games, ${fmt.format(d.config.min_players)}+ players, ended in the last ${d.config.max_age_mins} min.` : ""}</div>`;
+
+  document.getElementById("t-top").innerHTML = `<tr><th>Game</th><th>Map</th><th>Mode</th><th class="num">Players</th><th class="num">Views</th><th>Last viewed</th><th class="num">Size</th></tr>` +
+    (d.top.length ? d.top.map((g) => `<tr><td>${gameLink(g.id)}</td><td>${esc(g.map)}</td><td>${esc(g.mode)}</td><td class="num">${g.players}</td><td class="num">${fmt.format(g.views)}</td><td>${ago(g.last_used, now)}</td><td class="num">${(g.bytes / 1e6).toFixed(1)} MB</td></tr>`).join("")
+      : `<tr><td colspan="7" class="empty">No videos yet.</td></tr>`);
+
+  document.getElementById("t-recent").innerHTML = `<tr><th>When</th><th>Game</th><th>Source</th><th>Outcome</th><th class="num">Time</th></tr>` +
+    (d.recent.length ? d.recent.map((r) => `<tr><td>${ago(r.t, now)}</td><td>${gameLink(r.id)}</td><td>${r.auto ? "auto" : "request"}</td><td><span class="tag ${r.outcome}" title="${esc(r.msg || "")}">${outcomeText[r.outcome] || esc(r.outcome)}</span></td><td class="num">${r.secs.toFixed(1)} s</td></tr>`).join("")
+      : `<tr><td colspan="5" class="empty">No renders yet.</td></tr>`);
+
+  document.getElementById("t-fail").innerHTML = `<tr><th>Reason</th><th class="num">Count</th><th>Last</th><th>Example</th></tr>` +
+    (d.failures.length ? d.failures.map((f) => `<tr><td>${esc(f.msg)}</td><td class="num">${fmt.format(f.count)}</td><td>${ago(f.last, now)}</td><td>${gameLink(f.id)}</td></tr>`).join("")
+      : `<tr><td colspan="4" class="empty">No failures in the last 7 days.</td></tr>`);
+}
+
+const status = document.getElementById("status");
+async function refresh() {
+  try {
+    // location.origin never carries user:password@, which fetch() rejects.
+    const res = await fetch(`${location.origin}/admin/api/stats`, { credentials: "same-origin", cache: "no-store" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const d = await res.json();
+    render(d);
+    status.className = "meta";
+    status.innerHTML = `<span class="dot"></span>Live · updated ${new Date().toLocaleTimeString()} · up ${ago(d.started, d.now).replace(" ago", "")}`;
+  } catch (e) {
+    status.className = "meta stale";
+    status.innerHTML = `<span class="dot"></span>Couldn't refresh (${esc(e.message)}), retrying`;
+  }
+}
+refresh();
+setInterval(refresh, 15000);
+</script>
+</body>
+</html>

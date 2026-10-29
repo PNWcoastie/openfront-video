@@ -66,14 +66,14 @@ fn scan(dir: &Path) -> Vec<Stored> {
 }
 
 /// Deletes the least recently viewed games while over the limit.
-pub fn run_once(dir: &Path, limit: u64) {
+pub fn run_once(dir: &Path, limit: u64) -> (u64, u64) {
     if limit == 0 {
-        return;
+        return (0, 0);
     }
     let mut games = scan(dir);
     let mut total: u64 = games.iter().map(|g| g.bytes).sum();
     if total <= limit {
-        return;
+        return (0, 0);
     }
     let target = limit / 10 * 9;
     games.sort_by_key(|g| g.last_used);
@@ -96,6 +96,7 @@ pub fn run_once(dir: &Path, limit: u64) {
         total as f64 / 1e9,
         limit as f64 / 1e9
     );
+    (removed, freed)
 }
 
 pub fn start(app: Arc<App>) {
@@ -109,7 +110,12 @@ pub fn start(app: Arc<App>) {
     tokio::spawn(async move {
         loop {
             let d = dir.clone();
-            let _ = tokio::task::spawn_blocking(move || run_once(&d, limit)).await;
+            if let Ok((removed, bytes)) = tokio::task::spawn_blocking(move || run_once(&d, limit)).await {
+                if removed > 0 {
+                    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+                    app.events.record(crate::stats::Event::Cleanup { t, removed, bytes });
+                }
+            }
             // Woken early after each finished render.
             let _ = tokio::time::timeout(CHECK_EVERY, app.rendered.notified()).await;
         }

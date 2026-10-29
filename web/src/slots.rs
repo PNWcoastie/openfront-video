@@ -12,6 +12,8 @@ use tokio::sync::{oneshot, Notify};
 
 struct Running {
     token: u64,
+    id: String,
+    started: std::time::Instant,
     auto: bool,
     /// Stops an auto render so a request can have its slot.
     preempt: Option<oneshot::Sender<()>>,
@@ -61,7 +63,12 @@ impl Slots {
         self.demand_waiting.load(Ordering::SeqCst) == 0 && self.running.lock().unwrap().len() < self.capacity
     }
 
-    pub async fn acquire(self: &Arc<Self>, auto: bool) -> Slot {
+    /// What each busy slot is rendering: game ID, automatic, seconds so far.
+    pub fn running(&self) -> Vec<(String, bool, f64)> {
+        self.running.lock().unwrap().iter().map(|r| (r.id.clone(), r.auto, r.started.elapsed().as_secs_f64())).collect()
+    }
+
+    pub async fn acquire(self: &Arc<Self>, id: &str, auto: bool) -> Slot {
         if !auto {
             self.demand_waiting.fetch_add(1, Ordering::SeqCst);
         }
@@ -72,7 +79,7 @@ impl Slots {
                 if open {
                     let token = self.next_token.fetch_add(1, Ordering::Relaxed);
                     let (tx, rx) = oneshot::channel();
-                    running.push(Running { token, auto, preempt: auto.then_some(tx) });
+                    running.push(Running { token, id: id.to_string(), started: std::time::Instant::now(), auto, preempt: auto.then_some(tx) });
                     if !auto {
                         self.demand_waiting.fetch_sub(1, Ordering::SeqCst);
                     }

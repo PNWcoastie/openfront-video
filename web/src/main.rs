@@ -35,6 +35,7 @@ use tower_http::services::ServeFile;
 mod auto;
 mod cleanup;
 mod slots;
+mod stats;
 
 /// A failed render is remembered this long before a request may retry it.
 const FAILURE_TTL: Duration = Duration::from_secs(600);
@@ -68,6 +69,10 @@ struct App {
     jobs: Mutex<HashMap<String, Job>>,
     /// Signalled after each finished render, so the cleanup checks usage.
     rendered: tokio::sync::Notify,
+    events: stats::EventLog,
+    auto_status: Mutex<stats::AutoStatus>,
+    /// When the server started (Unix seconds).
+    started: u64,
 }
 
 enum Status {
@@ -160,7 +165,7 @@ impl App {
     /// Runs openfront-video for the game into temporary files, then moves
     /// them into place (details last).
     async fn render(&self, id: &str, auto: bool) -> Outcome {
-        let mut slot = self.slots.acquire(auto).await;
+        let mut slot = self.slots.acquire(id, auto).await;
         let preempted = async {
             match slot.preempted.take() {
                 Some(rx) => {
@@ -223,6 +228,13 @@ impl App {
                 let _ = tokio::fs::remove_file(tmp(ext)).await;
             }
         }
+        let (kind, msg) = match &outcome {
+            Outcome::Done => ("done", ""),
+            Outcome::NotFound => ("not_found", ""),
+            Outcome::Preempted => ("preempted", ""),
+            Outcome::Failed(m) => ("failed", m.as_str()),
+        };
+        self.events.render(id, auto, kind, t0.elapsed().as_secs_f64(), msg);
         match &outcome {
             Outcome::Done => {
                 println!("render {id}: done in {:.1} s", t0.elapsed().as_secs_f64());
@@ -299,7 +311,8 @@ async fn ads_txt() -> Response {
     }
 }
 
-async fn index() -> Html<String> {
+async fn index(State(app): State<Arc<App>>, headers: HeaderMap) -> Html<String> {
+    app.events.view("", "home", &headers);
     page_with_ads(
         "<title>openfront.video</title><meta property=\"og:title\" content=\"openfront.video\">\
 <meta property=\"og:description\" content=\"Timelapse videos of OpenFront.io games\">",
@@ -343,6 +356,7 @@ async fn game_page(app: Arc<App>, id: String, headers: HeaderMap) -> Response {
     match app.status(&id, wait).await {
         Status::Ready(meta) => {
             cleanup::touch(&app.path(&id, "json"));
+            app.events.view(&id, "page", &headers);
             let s = |k: &str| meta[k].as_str().unwrap_or("?").to_string();
             let (w, h) = (meta["width"].as_u64().unwrap_or(1280), meta["height"].as_u64().unwrap_or(1280));
             let minutes = (meta["durationSeconds"].as_f64().unwrap_or(0.0) / 60.0).round();
@@ -382,6 +396,7 @@ async fn game_page(app: Arc<App>, id: String, headers: HeaderMap) -> Response {
             page_with_ads(&head, &body).into_response()
         }
         Status::Pending => {
+            app.events.view(&id, "pending", &headers);
             let head = format!(
                 "<title>Rendering {id}</title><meta http-equiv=\"refresh\" content=\"5\">\
 <meta property=\"og:site_name\" content=\"openfront.video\"><meta property=\"og:title\" content=\"OpenFront game {id}\">\
@@ -396,9 +411,11 @@ After that the video is ready right away.</p><p><a href=\"{source}\">Replay on O
         // Link previewers get no page at all, so they cache nothing and fetch
         // again the next time the link is posted.
         Status::NotFound if is_previewer(&headers) => {
+            app.events.view(&id, "not_found", &headers);
             (StatusCode::SERVICE_UNAVAILABLE, [(header::RETRY_AFTER, "60")], "game not finished yet").into_response()
         }
         Status::NotFound => {
+            app.events.view(&id, "not_found", &headers);
             let head = format!("<title>Game {id} isn't finished</title><meta http-equiv=\"refresh\" content=\"30\">");
             let body = format!(
                 "<h1>Game {id} isn't finished yet</h1><p>Its video is made once the game ends. This page checks again every 30 seconds. If the game is over, the ID may be wrong.</p><p><a href=\"{source}\">Watch it on OpenFront</a></p>"
@@ -406,6 +423,7 @@ After that the video is ready right away.</p><p><a href=\"{source}\">Replay on O
             page(&head, &body).into_response()
         }
         Status::Failed(msg) => {
+            app.events.view(&id, "failed", &headers);
             let head = format!("<title>Couldn't render {id}</title><meta property=\"og:title\" content=\"Couldn't render game {id}\">");
             let body = format!("<h1>Couldn't render game {id}</h1><p>{}</p><p><a href=\"/\">Try another game</a></p>", esc(&msg));
             page(&head, &body).into_response()
@@ -430,6 +448,11 @@ async fn media(app: Arc<App>, name: String, ext: &str, req: Request) -> Response
     match app.status(id, app.video_wait).await {
         Status::Ready(_) => {
             cleanup::touch(&app.path(id, "json"));
+            // A video play: the first request (later ranges are the same play).
+            let range = req.headers().get(header::RANGE).and_then(|v| v.to_str().ok()).unwrap_or("bytes=0-");
+            if ext == "mp4" && range.starts_with("bytes=0-") {
+                app.events.view(id, "video", req.headers());
+            }
             let mut res = match ServeFile::new(app.path(id, ext)).oneshot(req).await {
                 Ok(r) => r.map(Body::new),
                 Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -463,6 +486,7 @@ async fn main() {
         }
     }
     let secs = |k: &str, d: &str| Duration::from_secs(env_or(k, d).parse().expect(k));
+    let dir_for_events = dir.clone();
     let app = Arc::new(App {
         dir,
         bin: PathBuf::from(env_or("OPENFRONT_VIDEO_BIN", "openfront-video")),
@@ -472,6 +496,9 @@ async fn main() {
         slots: slots::Slots::new(env_or("MAX_RENDERS", "2").parse().expect("MAX_RENDERS")),
         jobs: Mutex::new(HashMap::new()),
         rendered: tokio::sync::Notify::new(),
+        events: stats::EventLog::open(&dir_for_events),
+        auto_status: Mutex::new(stats::AutoStatus::default()),
+        started: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
     });
     cleanup::start(app.clone());
     if env_or("AUTO_RENDER", "1") != "0" {
@@ -482,6 +509,8 @@ async fn main() {
         .route("/go", get(go))
         .route("/health", get(|| async { "ok" }))
         .route("/ads.txt", get(ads_txt))
+        .route("/admin", get(stats::page))
+        .route("/admin/api/stats", get(stats::api))
         .route("/game/{id}", get(game))
         .route("/{prefix}/game/{id}", get(game_prefixed))
         .route("/video/{name}", get(video))

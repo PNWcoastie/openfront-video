@@ -63,6 +63,12 @@ pub fn start(app: Arc<App>, settings: Settings) {
         settings.min_players,
         settings.max_age.num_minutes()
     );
+    {
+        let mut st = app.auto_status.lock().unwrap();
+        st.enabled = true;
+        st.min_players = settings.min_players;
+        st.max_age_mins = settings.max_age.num_minutes();
+    }
     let queue = Arc::new(Mutex::new(Queue::default()));
     let settings = Arc::new(settings);
     tokio::spawn(poll_loop(app.clone(), queue.clone(), settings.clone()));
@@ -144,6 +150,13 @@ async fn poll_loop(app: Arc<App>, queue: Arc<Mutex<Queue>>, s: Arc<Settings>) {
             // Newest first; anything too old to be worth it goes.
             q.pending.retain(|p| now - p.ended <= s.max_age);
             q.pending.sort_by(|a, b| b.ended.cmp(&a.ended));
+            {
+                let mut st = app.auto_status.lock().unwrap();
+                st.queue_len = q.pending.len();
+                st.queue = q.pending.iter().take(400).map(|p| (p.id.clone(), p.ended.timestamp() as u64)).collect();
+                st.last_poll = Some(now.timestamp() as u64);
+                st.last_new = added;
+            }
             if added > 0 {
                 println!("auto render: {added} new finished games queued, {} waiting", q.pending.len());
             }
@@ -163,11 +176,13 @@ async fn work_loop(app: Arc<App>, queue: Arc<Mutex<Queue>>, s: Arc<Settings>) {
             let mut q = queue.lock().unwrap();
             let now = Utc::now();
             q.pending.retain(|p| now - p.ended <= s.max_age);
-            if q.pending.is_empty() {
-                None
-            } else {
-                Some(q.pending.remove(0))
+            let job = if q.pending.is_empty() { None } else { Some(q.pending.remove(0)) };
+            {
+                let mut st = app.auto_status.lock().unwrap();
+                st.queue_len = q.pending.len();
+                st.queue = q.pending.iter().take(400).map(|p| (p.id.clone(), p.ended.timestamp() as u64)).collect();
             }
+            job
         };
         let Some(job) = next else {
             tokio::time::sleep(Duration::from_secs(5)).await;
