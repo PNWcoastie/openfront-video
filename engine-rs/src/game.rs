@@ -739,8 +739,17 @@ impl Game {
     // ── Config formulas (Config / EngineConfig) ──
 
     fn max_troops(&self, p: usize) -> f64 {
+        self.troop_cap(p, true)
+    }
+
+    /// maxTroopsWithoutCities
+    fn max_troops_without_cities(&self, p: usize) -> f64 {
+        self.troop_cap(p, false)
+    }
+
+    fn troop_cap(&self, p: usize, with_cities: bool) -> f64 {
         let pl = &self.players[p];
-        let city_troops = self.city_troops(p);
+        let city_troops = if with_cities { self.city_troops(p) } else { 0.0 };
         let max = if pl.info.player_type == PlayerType::Human && self.config.infinite_troops {
             1_000_000_000.0
         } else {
@@ -3116,23 +3125,36 @@ impl Game {
         true
     }
 
-    /// planBoatRoute without warships (none exist yet): the direct route to
-    /// the closest pair of shore tiles.
+    /// planBoatRoute for tribes, whose sail() never reports a blocker: the
+    /// direct route to the closest pair of shore tiles, or when it has no
+    /// launch, the shortest of the other landings.
     fn plan_boat_route(&mut self, p: usize, target: usize) -> Option<u32> {
         if self.unit_count(p, TRANSPORT_SHIP) >= 3 {
             return None;
         }
-        // Tribes' sail() never reports a blocker, so hostile warships only
-        // matter for otherLandings.
         let ours = self.shore_tiles(p);
         let theirs = self.shore_tiles(target);
-        let (_, landing) = closest_two_tiles(&self.map, &ours, &theirs)?;
-        // routeTo: a launch must exist; sail() never blocks without warships.
-        if self.can_build_transport_ship(p, landing).is_some() {
-            let _ = self.target_transport_tile(p, landing);
-            return Some(landing);
+        let (_, closest) = closest_two_tiles(&self.map, &ours, &theirs)?;
+        // routeTo: the length is from the launch to the tile the boat lands on.
+        let route_length = |g: &mut Game, landing: u32| -> Option<u32> {
+            let launch = g.can_build_transport_ship(p, landing)?;
+            let land = g.target_transport_tile(p, landing).unwrap_or(landing);
+            Some(g.map.manhattan_dist(launch, land))
+        };
+        if route_length(self, closest).is_some() {
+            return Some(closest);
         }
-        panic!("alternative landings (otherLandings) are not ported yet");
+        // Hostile warships only matter for where the other landings may be.
+        let warships = self.hostile_warships(p);
+        let mut best: Option<(u32, u32)> = None;
+        for landing in self.other_landings(&ours, &theirs, closest, &warships) {
+            if let Some(len) = route_length(self, landing) {
+                if best.is_none_or(|b| len < b.1) {
+                    best = Some((landing, len));
+                }
+            }
+        }
+        best.map(|b| b.0)
     }
 
     fn send_boat_attack_to_nearby_terra_nullius(&mut self, te: &mut TribeExec) -> bool {
@@ -6190,6 +6212,18 @@ impl Game {
             .any(|&(r, t)| r == recipient && (self.ticks as i64 - t as i64) < 100)
     }
 
+    /// Only nations answer a donation, with an emoji picked from `list`.
+    fn donation_emoji_reply(&mut self, de: &mut DonateExec, list: &[&str]) {
+        let (sender, recipient) = (de.sender, de.recipient.expect("initialized"));
+        if self.players[recipient].info.player_type != PlayerType::Nation || !self.can_send_emoji(recipient, Some(sender)) {
+            return;
+        }
+        let ids = emoji_ids(list);
+        let emoji = ids[de.random.as_mut().unwrap().next_int(0.0, ids.len() as f64) as usize];
+        let to = self.players[sender].info.id.clone();
+        self.add_execution(Exec::Emoji(Box::new(EmojiExec::new(recipient, to, emoji))));
+    }
+
     fn tick_donation(&mut self, de: &mut DonateExec) {
         let (sender, recipient) = (de.sender, de.recipient.expect("initialized"));
         let amount = de.amount.expect("not initialized");
@@ -6208,6 +6242,8 @@ impl Game {
                     if update > 0 {
                         self.update_relation(recipient, sender, update as f64);
                     }
+                    let list: &[&str] = if update >= 50 { &["❤️", "😊", "🥰"] } else if update > 0 { &["👍"] } else { &["❓", "🥱"] };
+                    self.donation_emoji_reply(de, list);
                 }
             }
         } else {
@@ -6223,6 +6259,8 @@ impl Game {
                     if amount >= min_troops {
                         self.update_relation(recipient, sender, 50.0);
                     }
+                    let list: &[&str] = if amount >= min_troops { &["❤️", "😊", "🥰"] } else { &["❓", "🥱"] };
+                    self.donation_emoji_reply(de, list);
                 }
             }
         }
@@ -8678,10 +8716,17 @@ impl Game {
         attacker
     }
 
+    /// NationUtils.hasHighStartingGold: from 3M, nations place many structures at once.
+    fn high_starting_gold(&self, p: usize) -> bool {
+        self.config.starting_gold(&self.players[p].info) >= 3_000_000
+    }
+
     fn nation_reserve_troops(&self, ne: &NationExec, target: Neighbor) -> f64 {
         let p = ne.player.unwrap();
-        assert!(self.config.starting_gold < 3_000_000, "high starting gold is not ported for nations");
-        let max = self.max_troops(p);
+        // reserveBasis: with high starting gold, cities don't hold back expanding
+        // into free land and bots (built all at once, they'd stall it).
+        let expansion = target.is_none_or(|t| self.players[t].info.player_type == PlayerType::Bot);
+        let max = if expansion && self.high_starting_gold(p) { self.max_troops_without_cities(p) } else { self.max_troops(p) };
         let bot_with_structures = target.is_some_and(|t| {
             self.players[t].info.player_type == PlayerType::Bot && self.players[t].units.iter().any(|&u| is_structure(self.units[u].type_name))
         });
@@ -8805,6 +8850,43 @@ impl Game {
         route
     }
 
+    /// AiAttackBehavior.otherLandings: landing spots on their coast apart from
+    /// `tried` and clear of hostile warships, nearest to our coast first
+    /// (Easy none, Medium 1, Hard 2, Impossible 4).
+    fn other_landings(&self, ours: &[u32], theirs: &[u32], tried: u32, warships: &[usize]) -> Vec<u32> {
+        let count = self.by_difficulty([0, 1, 2, 4]);
+        if count == 0 {
+            return Vec::new();
+        }
+        let range2 = 150i64 * 150;
+        let our_step = (ours.len() / 32).max(1);
+        let our_sample: Vec<u32> = ours.iter().copied().enumerate().filter(|(i, _)| i % our_step == 0).map(|(_, t)| t).collect();
+        let mut candidates: Vec<(u32, u32)> = Vec::new();
+        let their_step = (theirs.len() / 32).max(1);
+        let mut i = 0;
+        while i < theirs.len() {
+            let tile = theirs[i];
+            i += their_step;
+            if warships.iter().any(|&w| self.dist2(self.units[w].tile, tile) <= range2) {
+                continue;
+            }
+            let dist = our_sample.iter().map(|&s| self.map.manhattan_dist(s, tile)).min().unwrap_or(u32::MAX);
+            candidates.push((tile, dist));
+        }
+        candidates.sort_by_key(|c| c.1);
+        let mut picked = vec![tried];
+        for (tile, _) in candidates {
+            if picked.len() > count {
+                break;
+            }
+            if picked.iter().any(|&q| self.map.manhattan_dist(q, tile) < 50) {
+                continue;
+            }
+            picked.push(tile);
+        }
+        picked[1..].to_vec()
+    }
+
     fn nation_plan_boat_route(&mut self, p: usize, target: usize) -> Option<BoatRoute> {
         if self.unit_count(p, TRANSPORT_SHIP) >= 3 {
             return None;
@@ -8817,43 +8899,7 @@ impl Game {
         if direct.is_some_and(|r| r.blocker.is_none()) {
             return direct;
         }
-        // otherLandings (Medium: one)
-        let count = match self.config.difficulty.as_str() {
-            "Easy" => 0,
-            "Medium" => 1,
-            "Hard" => 2,
-            _ => 4,
-        };
-        let mut landings = Vec::new();
-        if count > 0 {
-            let range2 = 150i64 * 150;
-            let our_step = (ours.len() / 32).max(1);
-            let our_sample: Vec<u32> = ours.iter().copied().enumerate().filter(|(i, _)| i % our_step == 0).map(|(_, t)| t).collect();
-            let mut candidates: Vec<(u32, u32)> = Vec::new();
-            let their_step = (theirs.len() / 32).max(1);
-            let mut i = 0;
-            while i < theirs.len() {
-                let tile = theirs[i];
-                i += their_step;
-                if warships.iter().any(|&w| self.dist2(self.units[w].tile, tile) <= range2) {
-                    continue;
-                }
-                let dist = our_sample.iter().map(|&s| self.map.manhattan_dist(s, tile)).min().unwrap_or(u32::MAX);
-                candidates.push((tile, dist));
-            }
-            candidates.sort_by_key(|c| c.1);
-            let mut picked = vec![closest];
-            for (tile, _) in candidates {
-                if picked.len() > count {
-                    break;
-                }
-                if picked.iter().any(|&q| self.map.manhattan_dist(q, tile) < 50) {
-                    continue;
-                }
-                picked.push(tile);
-            }
-            landings = picked[1..].to_vec();
-        }
+        let landings = self.other_landings(&ours, &theirs, closest, &warships);
         let mut best: Option<BoatRoute> = None;
         for landing in landings {
             if let Some(route) = self.nation_route_to(p, landing, &warships) {
@@ -9087,7 +9133,11 @@ impl Game {
 
     fn nation_attack_best_target(&mut self, ne: &mut NationExec, friends: &[usize], enemies: &[usize]) {
         let p = ne.player.unwrap();
-        if self.nation_has_neighboring_bot_with_structures(p) && self.nation_attack_bots(ne) {
+        // Bots go first when they hold structures, and with high starting gold
+        // (measured without the cities built in a rush).
+        let expand_first = self.high_starting_gold(p)
+            && self.players[p].troops_f() / self.max_troops_without_cities(p) >= ne.trigger_ratio;
+        if (self.nation_has_neighboring_bot_with_structures(p) || expand_first) && self.nation_attack_bots(ne) {
             return;
         }
         // hasReserveRatioTroops
@@ -9685,7 +9735,16 @@ impl Game {
                 return;
             }
         }
-        // isOnStructureCooldown: only with high starting gold.
+        // isOnStructureCooldown: high (but below 10M) starting gold paces the first placements.
+        if let Some(last) = ne.structures.last_structure_tick {
+            let gold = self.config.starting_gold(&self.players[p].info);
+            if self.high_starting_gold(p) && gold < 10_000_000 {
+                let gap = [0, 0, 250, 150, 100].get(ne.structures.placements_count as usize).copied().unwrap_or(0);
+                if gap > 0 && self.ticks - last < gap {
+                    return;
+                }
+            }
+        }
         // isInPostSaveUpBlockedPhase
         let save_up = self.save_up_target(ne);
         let gold = self.players[p].gold;
