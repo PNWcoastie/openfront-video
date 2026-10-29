@@ -271,8 +271,20 @@ auto-refreshing pages. Neither ID is required; without them there are no ads.
 Settings (environment): `PORT` (8080), `DATA_DIR` (`/data` in the image),
 `PUBLIC_URL` (`https://openfront.video`, used for the absolute URLs in the tags),
 `MAX_RENDERS` (2), `EMBED_WAIT_SECS` (25), `VIDEO_WAIT_SECS` (120: how long a video
-request waits for a render in progress), `OPENFRONT_VIDEO_BIN`. Nothing is ever
-deleted from `/data` yet (a video is about 20 MB).
+request waits for a render in progress), `MAX_STORAGE_GB` (35), `OPENFRONT_VIDEO_BIN`.
+
+### Storage cleanup
+
+Videos are kept under `MAX_STORAGE_GB` (35 by default, for a 40 GB volume; 0 turns
+the limit off). A game takes about 23 MB, the video plus its thumbnail, so 35 GB holds
+roughly 1,500. Each view of a game's page, video or thumbnail bumps its details file's
+modified time (at most once an hour). That's the "last viewed" time, and it survives
+restarts. Every 5 minutes, and after each finished render, the server adds up usage.
+Over the limit, it deletes the least recently viewed games until usage is under 90%
+of the limit, so new renders don't trigger a deletion every time. The log says what it
+removed. A deleted game is rendered again the next time someone asks for it. With
+automatic rendering on, the folder reaches the limit within hours and then cycles:
+videos people watch stay, and unwatched automatic renders make room.
 
 ## Re-rendering from the cache
 

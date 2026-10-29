@@ -33,6 +33,7 @@ use tower::ServiceExt;
 use tower_http::services::ServeFile;
 
 mod auto;
+mod cleanup;
 mod slots;
 
 /// A failed render is remembered this long before a request may retry it.
@@ -65,6 +66,8 @@ struct App {
     video_wait: Duration,
     slots: Arc<slots::Slots>,
     jobs: Mutex<HashMap<String, Job>>,
+    /// Signalled after each finished render, so the cleanup checks usage.
+    rendered: tokio::sync::Notify,
 }
 
 enum Status {
@@ -221,7 +224,10 @@ impl App {
             }
         }
         match &outcome {
-            Outcome::Done => println!("render {id}: done in {:.1} s", t0.elapsed().as_secs_f64()),
+            Outcome::Done => {
+                println!("render {id}: done in {:.1} s", t0.elapsed().as_secs_f64());
+                self.rendered.notify_one();
+            }
             Outcome::NotFound => println!("render {id}: not finished yet (or no such game)"),
             Outcome::Preempted => println!("render {id}: stopped after {:.1} s to make room for a request", t0.elapsed().as_secs_f64()),
             Outcome::Failed(msg) => println!("render {id}: failed after {:.1} s: {msg}", t0.elapsed().as_secs_f64()),
@@ -336,6 +342,7 @@ async fn game_page(app: Arc<App>, id: String, headers: HeaderMap) -> Response {
     let source = format!("https://openfront.io/game/{id}");
     match app.status(&id, wait).await {
         Status::Ready(meta) => {
+            cleanup::touch(&app.path(&id, "json"));
             let s = |k: &str| meta[k].as_str().unwrap_or("?").to_string();
             let (w, h) = (meta["width"].as_u64().unwrap_or(1280), meta["height"].as_u64().unwrap_or(1280));
             let minutes = (meta["durationSeconds"].as_f64().unwrap_or(0.0) / 60.0).round();
@@ -422,6 +429,7 @@ async fn media(app: Arc<App>, name: String, ext: &str, req: Request) -> Response
     };
     match app.status(id, app.video_wait).await {
         Status::Ready(_) => {
+            cleanup::touch(&app.path(id, "json"));
             let mut res = match ServeFile::new(app.path(id, ext)).oneshot(req).await {
                 Ok(r) => r.map(Body::new),
                 Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -463,7 +471,9 @@ async fn main() {
         video_wait: secs("VIDEO_WAIT_SECS", "120"),
         slots: slots::Slots::new(env_or("MAX_RENDERS", "2").parse().expect("MAX_RENDERS")),
         jobs: Mutex::new(HashMap::new()),
+        rendered: tokio::sync::Notify::new(),
     });
+    cleanup::start(app.clone());
     if env_or("AUTO_RENDER", "1") != "0" {
         auto::start(app.clone(), auto::Settings::from_env());
     }
