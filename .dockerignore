@@ -1,0 +1,10 @@
+# Only the two Rust crates' sources go into the image build (the engine's
+# assets are fetched from GitHub at the pinned commit).
+*
+!engine-rs/Cargo.toml
+!engine-rs/Cargo.lock
+!engine-rs/build.rs
+!engine-rs/src
+!web/Cargo.toml
+!web/Cargo.lock
+!web/src

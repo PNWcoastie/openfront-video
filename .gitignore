@@ -1,0 +1,30 @@
+# Build output
+target/
+node_modules/
+
+# The engine checkout (cloned separately at the pinned commit, see README)
+/OpenFrontIO/
+
+# Rendered videos, render.ts's game cache, the web service's local data
+*.mp4
+/.cache/
+/data/
+*.log
+
+# Game records downloaded for testing (fetch them again by ID)
+/*.json
+/*.json.gz
+!/package.json
+!/package-lock.json
+
+# Comparison harness output (state dumps run to gigabytes)
+/engine-rs/harness/*.jsonl
+/engine-rs/harness/*.txt
+/engine-rs/*.jsonl
+*.owners-*.bin
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

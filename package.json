@@ -1,0 +1,9 @@
+{
+  "name": "openfront-render",
+  "private": true,
+  "type": "module",
+  "description": "Turns an OpenFront.io replay into a sped-up MP4",
+  "dependencies": {
+    "@napi-rs/canvas": "1.0.11"
+  }
+}
