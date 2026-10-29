@@ -2,7 +2,8 @@
 //! checkout ($OPENFRONT_ENGINE, default ../OpenFrontIO; it should be at the
 //! engine commit the port follows, 9f4a28f):
 //!
-//! - every map's manifest, map.bin and map4x.bin, each map zstd-compressed
+//! - every map's manifest, map.bin, map4x.bin and map16x.bin (compact maps),
+//!   each map zstd-compressed
 //!   (maps.bin, indexed by maps.rs)
 //! - tribe names, the client's theme and render settings, the structure and
 //!   unit sprite atlases
@@ -57,7 +58,7 @@ fn main() {
 }
 
 /// Every map, each compressed on its own so only the one a game uses is
-/// unpacked: [u32 length + bytes] for the manifest, map.bin and map4x.bin.
+/// unpacked: [u32 length + bytes] for the manifest, map.bin, map4x.bin and map16x.bin.
 fn build_maps(maps: &Path, out: &Path) {
     println!("cargo:rerun-if-changed={}", maps.display());
     let mut dirs: Vec<PathBuf> = fs::read_dir(maps)
@@ -80,7 +81,8 @@ fn build_maps(maps: &Path, out: &Path) {
                 let manifest = fs::read(dir.join("manifest.json")).unwrap();
                 let name = serde_name(&manifest);
                 let mut raw = Vec::new();
-                for part in [manifest, fs::read(dir.join("map.bin")).unwrap(), fs::read(dir.join("map4x.bin")).unwrap()] {
+                let bin = |f: &str| fs::read(dir.join(f)).unwrap();
+                for part in [manifest, bin("map.bin"), bin("map4x.bin"), bin("map16x.bin")] {
                     raw.extend_from_slice(&(part.len() as u32).to_le_bytes());
                     raw.extend_from_slice(&part);
                 }

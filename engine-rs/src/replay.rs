@@ -18,6 +18,7 @@ pub struct MapFiles {
     pub manifest: Value,
     pub map: Vec<u8>,
     pub map4x: Vec<u8>,
+    pub map16x: Vec<u8>,
 }
 
 /// Where the engine's static data comes from: an OpenFrontIO checkout, or
@@ -39,6 +40,7 @@ impl Resources for DirResources {
             manifest,
             map: std::fs::read(dir.join("map.bin")).expect("map.bin"),
             map4x: std::fs::read(dir.join("map4x.bin")).expect("map4x.bin"),
+            map16x: std::fs::read(dir.join("map16x.bin")).expect("map16x.bin"),
         }
     }
     fn tribe_name_themes(&self) -> Value {
@@ -53,22 +55,31 @@ pub fn setup(record: &Value, res: &dyn Resources) -> (Game, Vec<Vec<Value>>) {
     let game_id = info["gameID"].as_str().unwrap().to_string();
     let str_of = |v: &Value| v.as_str().map(|s| s.to_string());
 
-    assert_eq!(gc["gameMapSize"], "Normal", "only normal-size maps are ported");
+    // Compact games play on the 4x-smaller map, with the 16x one for pathfinding.
+    let compact = match gc["gameMapSize"].as_str() {
+        Some("Normal") => false,
+        Some("Compact") => true,
+        other => panic!("map size {other:?} is not ported yet"),
+    };
     let doomsday = gc["doomsdayClock"]["enabled"].as_bool().unwrap_or(false);
     assert!(!doomsday, "the doomsday clock is not ported yet");
 
     // The map: found by its display name in the manifests.
-    let MapFiles { manifest, map: terrain, map4x } = res.map(gc["gameMap"].as_str().unwrap());
-    let m = &manifest["map"];
-    let (w, h) = (m["width"].as_u64().unwrap() as u32, m["height"].as_u64().unwrap() as u32);
-    let map = GameMap::new(w, h, terrain, m["num_land_tiles"].as_u64().unwrap() as u32);
-    let m4 = &manifest["map4x"];
-    let mini_map = GameMap::new(
-        m4["width"].as_u64().unwrap() as u32,
-        m4["height"].as_u64().unwrap() as u32,
-        map4x,
-        m4["num_land_tiles"].as_u64().unwrap() as u32,
-    );
+    let MapFiles { manifest, map: map1x, map4x, map16x } = res.map(gc["gameMap"].as_str().unwrap());
+    let load = |key: &str, terrain: Vec<u8>| {
+        let m = &manifest[key];
+        GameMap::new(
+            m["width"].as_u64().unwrap() as u32,
+            m["height"].as_u64().unwrap() as u32,
+            terrain,
+            m["num_land_tiles"].as_u64().unwrap() as u32,
+        )
+    };
+    let (map, mini_map) = if compact {
+        (load("map4x", map4x), load("map16x", map16x))
+    } else {
+        (load("map", map1x), load("map4x", map4x))
+    };
 
     let is_team = gc["gameMode"] == "Team";
     let config = Config {
@@ -117,19 +128,34 @@ pub fn setup(record: &Value, res: &dyn Resources) -> (Game, Vec<Vec<Value>>) {
             team_index: p["teamIndex"].as_u64().map(|v| v as usize),
         })
         .collect();
-    let num_teams = if is_team {
-        Some(gc["playerTeams"].as_u64().expect("numeric team count (Duos etc. not ported)") as usize)
-    } else {
-        None
-    };
     let nations = if gc["nations"] == "disabled" {
         Vec::new()
     } else {
         assert!(!is_team, "nations in team games are not ported yet");
-        create_nations(&gc["nations"], &manifest, &mut random)
+        let public = gc["gameType"] == "Public";
+        create_nations(&gc["nations"], &manifest, compact, public, &mut random)
+    };
+    // resolveTeamsList: a team count, or Duos/Trios/Quads (players per team).
+    let teams = if is_team {
+        let total = humans.len() + nations.len();
+        Some(match &gc["playerTeams"] {
+            Value::Number(n) => game::TeamSetup { count: n.as_u64().unwrap() as usize, duos_trios_quads: false },
+            Value::String(s) => {
+                let per_team = match s.as_str() {
+                    "Duos" => 2,
+                    "Trios" => 3,
+                    "Quads" => 4,
+                    other => panic!("team mode {other} is not ported yet"),
+                };
+                game::TeamSetup { count: total.div_ceil(per_team).max(2), duos_trios_quads: true }
+            }
+            other => panic!("team setting {other} is not ported yet"),
+        })
+    } else {
+        None
     };
     let nation_infos: Vec<PlayerInfo> = nations.iter().map(|n| n.info.clone()).collect();
-    let mut game = Game::new(config, map, mini_map, humans, nation_infos, num_teams);
+    let mut game = Game::new(config, map, mini_map, humans, nation_infos, teams);
 
     // GameRunner.init
     if !game.config.is_singleplayer {
@@ -200,7 +226,17 @@ fn spawn_tribes(game: &Game, res: &dyn Resources, manifest: &Value, num: usize, 
             suffixes.push(s.as_str().unwrap().to_string());
         }
     }
-    assert!(!prefixes.is_empty() && !suffixes.is_empty(), "tribe name themes missing");
+    // Unknown themes are skipped (Benelux names "Europe", the file has
+    // "europe"); with none left, the default theme's names are used.
+    if prefixes.is_empty() || suffixes.is_empty() {
+        let default = &themes_json["default"];
+        for p in default["prefixes"].as_array().expect("default tribe name theme") {
+            prefixes.push(p.as_str().unwrap().to_string());
+        }
+        for s in default["suffixes"].as_array().unwrap() {
+            suffixes.push(s.as_str().unwrap().to_string());
+        }
+    }
 
     let mut random = PseudoRandom::new(simple_hash(&game.config.game_id) + 2.0);
     let mut by_slot = std::collections::HashMap::new();
@@ -302,18 +338,26 @@ pub fn create_exec(game: &Game, intent: &Value) -> Exec {
 }
 
 
-/// createNationsForGame for normal-size, non-team games: a custom count
-/// takes that many nations (the manifest's shuffled, then its
-/// additionalNations, then generated names); "default" takes the manifest's.
-fn create_nations(setting: &Value, manifest: &Value, random: &mut PseudoRandom) -> Vec<game::NationInfo> {
+/// createNationsForGame for non-team games: a custom count takes that many
+/// nations (the manifest's shuffled, then its additionalNations, then
+/// generated names); "default" takes the manifest's, or a shuffled quarter
+/// of them on a public compact map. Compact maps halve the coordinates.
+fn create_nations(setting: &Value, manifest: &Value, compact: bool, public: bool, random: &mut PseudoRandom) -> Vec<game::NationInfo> {
     let list = |k: &str| manifest[k].as_array().cloned().unwrap_or_default();
+    let scale = |v: i64| if compact { v.div_euclid(2) } else { v };
     let nation = |n: &Value, random: &mut PseudoRandom| game::NationInfo {
-        spawn_cell: n["coordinates"].as_array().map(|c| (c[0].as_i64().unwrap(), c[1].as_i64().unwrap())),
+        spawn_cell: n["coordinates"].as_array().map(|c| (scale(c[0].as_i64().unwrap()), scale(c[1].as_i64().unwrap()))),
         info: nation_info(n["name"].as_str().unwrap().to_string(), random),
     };
     let manifest_nations = list("nations");
     let Some(target) = setting.as_f64() else {
         assert_eq!(setting, "default", "an unknown nations setting");
+        if public && compact {
+            // getCompactMapNationCount: a quarter, at least one.
+            let count = if manifest_nations.is_empty() { 0 } else { (manifest_nations.len() / 4).max(1) };
+            let shuffled = random.shuffle(&manifest_nations);
+            return shuffled[..count].iter().map(|n| nation(n, random)).collect();
+        }
         return manifest_nations.iter().map(|n| nation(n, random)).collect();
     };
     let target = target as usize;

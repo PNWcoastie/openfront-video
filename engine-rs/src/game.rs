@@ -452,7 +452,7 @@ pub struct Game {
 }
 
 impl Game {
-    pub fn new(config: Config, map: GameMap, mini_map: GameMap, humans: Vec<PlayerInfo>, nations: Vec<PlayerInfo>, num_teams: Option<usize>) -> Game {
+    pub fn new(config: Config, map: GameMap, mini_map: GameMap, humans: Vec<PlayerInfo>, nations: Vec<PlayerInfo>, teams: Option<TeamSetup>) -> Game {
         let n = map.num_tiles() as usize;
         let num_cells = (((map.width + 99) / 100) * ((map.height + 99) / 100)) as usize;
         let mut g = Game {
@@ -500,10 +500,11 @@ impl Game {
             }
         }
         if g.config.is_team_mode {
-            g.player_teams = resolve_teams_list(num_teams.expect("team count"));
+            let setup = teams.expect("team setup");
+            g.player_teams = resolve_teams_list(setup.count);
             let max_team_size = humans.len().div_ceil(g.player_teams.len());
             let teams = g.player_teams.clone();
-            for (info, team) in assign_teams(&humans, &teams, false, max_team_size) {
+            for (info, team) in assign_teams(&humans, &teams, setup.duos_trios_quads, max_team_size) {
                 if let Some(team) = team {
                     g.add_player(info, Some(team));
                 }
@@ -2452,7 +2453,15 @@ fn js_sign(x: f64) -> f64 {
     }
 }
 
-/// TeamAssignment.resolveTeamsList for a numeric team count.
+/// How a team game splits its players: the number of teams, and whether it
+/// was given as Duos, Trios or Quads (which changes how friends are placed).
+#[derive(Clone, Copy)]
+pub struct TeamSetup {
+    pub count: usize,
+    pub duos_trios_quads: bool,
+}
+
+/// TeamAssignment.resolveTeamsList for a team count.
 pub fn resolve_teams_list(num_teams: usize) -> Vec<String> {
     assert!(num_teams >= 2, "too few teams: {num_teams}");
     if num_teams < 8 {

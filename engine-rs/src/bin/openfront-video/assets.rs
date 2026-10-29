@@ -32,8 +32,8 @@ impl Resources for Embedded {
             parts.push(raw[i + 4..i + 4 + n].to_vec());
             i += 4 + n;
         }
-        let [manifest, map, map4x]: [Vec<u8>; 3] = parts.try_into().unwrap();
-        MapFiles { manifest: serde_json::from_slice(&manifest).unwrap(), map, map4x }
+        let [manifest, map, map4x, map16x]: [Vec<u8>; 4] = parts.try_into().unwrap();
+        MapFiles { manifest: serde_json::from_slice(&manifest).unwrap(), map, map4x, map16x }
     }
 
     fn tribe_name_themes(&self) -> Value {
