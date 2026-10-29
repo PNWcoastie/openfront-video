@@ -157,6 +157,13 @@ fn main() {
             .map(|s| s.to_string())
             .or_else(|| info.payload().downcast_ref::<String>().cloned())
             .unwrap_or_else(|| "unknown error".into());
+        // One line, so whoever reads the last line (the web service) gets all of it:
+        // "a custom nation count is not ported yet (left: Number(400), right: "default")".
+        let msg = msg.trim_start_matches("assertion `left == right` failed: ");
+        let mut lines = msg.lines().map(str::trim).filter(|l| !l.is_empty());
+        let first = lines.next().unwrap_or("unknown error").to_string();
+        let rest: Vec<&str> = lines.collect();
+        let msg = if rest.is_empty() { first } else { format!("{first} ({})", rest.join(", ")) };
         eprintln!("\nopenfront-video stopped: {msg}");
         std::process::exit(1);
     }));

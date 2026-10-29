@@ -8,6 +8,7 @@ pub mod game;
 pub mod heap;
 pub mod js;
 pub mod map;
+pub mod nation_names;
 pub mod prof;
 pub mod replay;
 pub mod rng;

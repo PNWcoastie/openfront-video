@@ -122,27 +122,12 @@ pub fn setup(record: &Value, res: &dyn Resources) -> (Game, Vec<Vec<Value>>) {
     } else {
         None
     };
-    // createNationsForGame: every nation in the manifest (public FFA, normal map).
-    let mut nations = Vec::new();
-    if gc["nations"] != "disabled" {
-        assert_eq!(gc["nations"], "default", "a custom nation count is not ported yet");
-        assert_eq!(gc["gameType"], "Public", "nations outside public games are not ported yet");
+    let nations = if gc["nations"] == "disabled" {
+        Vec::new()
+    } else {
         assert!(!is_team, "nations in team games are not ported yet");
-        for n in manifest["nations"].as_array().into_iter().flatten() {
-            let spawn_cell = n["coordinates"].as_array().map(|c| (c[0].as_i64().unwrap(), c[1].as_i64().unwrap()));
-            let info = PlayerInfo {
-                name: n["name"].as_str().unwrap().to_string(),
-                player_type: PlayerType::Nation,
-                client_id: None,
-                id: random.next_id(),
-                is_lobby_creator: false,
-                clan_tag: None,
-                friends: Vec::new(),
-                team_index: None,
-            };
-            nations.push(game::NationInfo { info, spawn_cell });
-        }
-    }
+        create_nations(&gc["nations"], &manifest, &mut random)
+    };
     let nation_infos: Vec<PlayerInfo> = nations.iter().map(|n| n.info.clone()).collect();
     let mut game = Game::new(config, map, mini_map, humans, nation_infos, num_teams);
 
@@ -282,6 +267,7 @@ pub fn create_exec(game: &Game, intent: &Value) -> Exec {
             unit_id: intent["unitId"].as_f64().unwrap() as u32,
             amount: intent["amount"].as_f64().unwrap_or(1.0) as u32,
         },
+        "embargo_all" => Exec::EmbargoAll { player, start: intent["action"].as_str() == Some("start") },
         "delete_unit" => Exec::DeleteUnit {
             active: true,
             player,
@@ -315,6 +301,111 @@ pub fn create_exec(game: &Game, intent: &Value) -> Exec {
     }
 }
 
+
+/// createNationsForGame for normal-size, non-team games: a custom count
+/// takes that many nations (the manifest's shuffled, then its
+/// additionalNations, then generated names); "default" takes the manifest's.
+fn create_nations(setting: &Value, manifest: &Value, random: &mut PseudoRandom) -> Vec<game::NationInfo> {
+    let list = |k: &str| manifest[k].as_array().cloned().unwrap_or_default();
+    let nation = |n: &Value, random: &mut PseudoRandom| game::NationInfo {
+        spawn_cell: n["coordinates"].as_array().map(|c| (c[0].as_i64().unwrap(), c[1].as_i64().unwrap())),
+        info: nation_info(n["name"].as_str().unwrap().to_string(), random),
+    };
+    let manifest_nations = list("nations");
+    let Some(target) = setting.as_f64() else {
+        assert_eq!(setting, "default", "an unknown nations setting");
+        return manifest_nations.iter().map(|n| nation(n, random)).collect();
+    };
+    let target = target as usize;
+    // createRandomNations
+    let shuffled = random.shuffle(&manifest_nations);
+    if target <= manifest_nations.len() {
+        return shuffled[..target].iter().map(|n| nation(n, random)).collect();
+    }
+    let mut nations: Vec<game::NationInfo> = shuffled.iter().map(|n| nation(n, random)).collect();
+    let mut used: std::collections::HashSet<String> = nations.iter().map(|n| n.info.name.clone()).collect();
+    let mut remaining = target - manifest_nations.len();
+    let additional = list("additionalNations");
+    if !additional.is_empty() {
+        let candidates: Vec<Value> = additional.into_iter().filter(|n| !used.contains(n["name"].as_str().unwrap())).collect();
+        let extras = random.shuffle(&candidates);
+        let picked = &extras[..remaining.min(extras.len())];
+        for e in picked {
+            let n = nation(e, random);
+            used.insert(n.info.name.clone());
+            nations.push(n);
+        }
+        remaining -= picked.len();
+    }
+    for _ in 0..remaining {
+        let name = unique_nation_name(random, &used);
+        used.insert(name.clone());
+        nations.push(game::NationInfo { spawn_cell: None, info: nation_info(name, random) });
+    }
+    nations
+}
+
+fn nation_info(name: String, random: &mut PseudoRandom) -> PlayerInfo {
+    PlayerInfo {
+        name,
+        player_type: PlayerType::Nation,
+        client_id: None,
+        id: random.next_id(),
+        is_lobby_creator: false,
+        clan_tag: None,
+        friends: Vec::new(),
+        team_index: None,
+    }
+}
+
+fn unique_nation_name(random: &mut PseudoRandom, used: &std::collections::HashSet<String>) -> String {
+    for _ in 0..1000 {
+        let name = nation_name(random);
+        if !used.contains(&name) {
+            return name;
+        }
+    }
+    let base = nation_name(random);
+    let mut counter = 1;
+    while used.contains(&format!("{base} {counter}")) {
+        counter += 1;
+    }
+    format!("{base} {counter}")
+}
+
+/// generateNationName
+fn nation_name(random: &mut PseudoRandom) -> String {
+    use crate::nation_names::{Part, NAME_TEMPLATES, NOUNS};
+    let template = NAME_TEMPLATES[random.next_int(0.0, NAME_TEMPLATES.len() as f64) as usize];
+    let noun = NOUNS[random.next_int(0.0, NOUNS.len() as f64) as usize];
+    let parts: Vec<String> = template
+        .iter()
+        .map(|p| match p {
+            Part::Text(t) => t.to_string(),
+            Part::Noun => noun.to_string(),
+            Part::Plural => pluralize(noun),
+        })
+        .collect();
+    parts.join(" ")
+}
+
+fn pluralize(noun: &str) -> String {
+    use crate::nation_names::{O_TO_OES, SPECIAL_PLURALS};
+    if let Some((_, p)) = SPECIAL_PLURALS.iter().find(|(n, _)| *n == noun) {
+        return p.to_string();
+    }
+    if ["s", "ch", "sh", "x", "z"].iter().any(|e| noun.ends_with(e)) {
+        return format!("{noun}es");
+    }
+    let chars: Vec<char> = noun.chars().collect();
+    if noun.ends_with('y') && chars.len() >= 2 && !"aeiou".contains(chars[chars.len() - 2]) {
+        return format!("{}ies", &noun[..noun.len() - 1]);
+    }
+    if O_TO_OES.contains(&noun) {
+        return format!("{noun}es");
+    }
+    format!("{noun}s")
+}
 
 /// The archived state hash of every turn that has one.
 pub fn archived_hashes(record: &Value) -> HashMap<usize, f64> {

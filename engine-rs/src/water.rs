@@ -703,10 +703,121 @@ impl GraphAStar {
     }
 }
 
+// ── AStarWater: plain A* over the minimap, for small water graphs ──
+
+const COST_SCALE: u32 = 100;
+const BASE_COST: u32 = COST_SCALE;
+
+/// AStar.Water getMagnitudePenalty: prefer 3-10 tiles from shore.
+fn water_penalty(m: u8) -> u32 {
+    if m < 3 {
+        10 * COST_SCALE
+    } else if m <= 10 {
+        0
+    } else {
+        COST_SCALE
+    }
+}
+
+struct SimpleAStar {
+    stamp: u32,
+    closed: Vec<u32>,
+    g_stamp: Vec<u32>,
+    g: Vec<u32>,
+    came_from: Vec<i32>,
+    queue: MinHeap,
+}
+
+impl SimpleAStar {
+    const WEIGHT: u32 = 5;
+    const MAX_ITERATIONS: u32 = 1_000_000;
+
+    fn new(n: usize) -> Self {
+        SimpleAStar { stamp: 1, closed: vec![0; n], g_stamp: vec![0; n], g: vec![0; n], came_from: vec![0; n], queue: MinHeap::new() }
+    }
+
+    fn find(&mut self, map: &GameMap, starts: &[u32], goal: u32) -> Option<Vec<u32>> {
+        self.stamp += 1;
+        let stamp = self.stamp;
+        let w = map.width as i64;
+        let n = map.num_tiles() as i64;
+        let (gx, gy) = (goal as i64 % w, goal as i64 / w);
+        self.queue.clear();
+        // Cross-product tie-breaker: prefer the straight start-goal line.
+        let s0 = starts[0] as i64;
+        let (dxg, dyg) = (gx - s0 % w, gy - s0 / w);
+        let cross_norm = (dxg.abs() + dyg.abs()).max(1) as f64;
+        let tie = |nx: i64, ny: i64| -> u32 {
+            let cross = (dxg * (ny - gy) - dyg * (nx - gx)).abs() as f64;
+            ((cross * (COST_SCALE - 1) as f64) / cross_norm / cross_norm).floor() as u32
+        };
+        let h = |x: i64, y: i64| Self::WEIGHT * BASE_COST * ((x - gx).abs() + (y - gy).abs()) as u32;
+        for &s in starts {
+            self.g[s as usize] = 0;
+            self.g_stamp[s as usize] = stamp;
+            self.came_from[s as usize] = -1;
+            self.queue.push(s as i32, h(s as i64 % w, s as i64 / w) as f64);
+        }
+        let mut iterations = Self::MAX_ITERATIONS;
+        while !self.queue.is_empty() {
+            iterations -= 1;
+            if iterations == 0 {
+                return None;
+            }
+            let cur = self.queue.pop() as i64;
+            if self.closed[cur as usize] == stamp {
+                continue;
+            }
+            self.closed[cur as usize] = stamp;
+            if cur == goal as i64 {
+                let mut path = Vec::new();
+                let mut c = goal as i32;
+                while c != -1 {
+                    path.push(c as u32);
+                    c = self.came_from[c as usize];
+                }
+                path.reverse();
+                return Some(path);
+            }
+            let cur_g = self.g[cur as usize];
+            let (cx, cy) = (cur % w, cur / w);
+            // Up, down, left, right, as AStar.Water.ts.
+            let neighbors = [
+                (cur >= w, cur - w, cx, cy - 1),
+                (cur < n - w, cur + w, cx, cy + 1),
+                (cx != 0, cur - 1, cx - 1, cy),
+                (cx != w - 1, cur + 1, cx + 1, cy),
+            ];
+            for (ok, nb, nx, ny) in neighbors {
+                if !ok {
+                    continue;
+                }
+                let t = map.terrain_byte(nb as u32);
+                if self.closed[nb as usize] == stamp || !(nb == goal as i64 || t & LAND_MASK == 0) {
+                    continue;
+                }
+                let tentative = cur_g + BASE_COST + water_penalty(t & MAGNITUDE_MASK);
+                if self.g_stamp[nb as usize] != stamp || tentative < self.g[nb as usize] {
+                    self.came_from[nb as usize] = cur as i32;
+                    self.g[nb as usize] = tentative;
+                    self.g_stamp[nb as usize] = stamp;
+                    let f = tentative + h(nx, ny) + tie(nx, ny);
+                    self.queue.push(nb as i32, f as f64);
+                }
+            }
+        }
+        None
+    }
+}
+
 // ── The chain ──
 
 pub struct WaterPathfinder {
     pub mini: GameMap,
+    /// Set when the water graph is too small for the hierarchical search
+    /// (fewer than 100 nodes): PathFinder.ts then uses plain AStarWater behind
+    /// the shore and minimap transformers, without smoothing.
+    simple: Option<SimpleAStar>,
     cc: ConnectedComponents,
     graph: AbstractGraph,
     tile_bfs: BfsGrid,
@@ -721,10 +832,11 @@ impl WaterPathfinder {
     pub fn new(mini: GameMap) -> Self {
         let cc = ConnectedComponents::new(&mini);
         let graph = AbstractGraph::build(&mini, &cc);
-        assert!(graph.nodes.len() >= 100, "small water graphs use AStarWater, not ported yet");
         let n = mini.num_tiles() as usize;
+        let simple = (graph.nodes.len() < 100).then(|| SimpleAStar::new(n));
         let nodes = graph.nodes.len();
         WaterPathfinder {
+            simple,
             cc,
             tile_bfs: BfsGrid::new(n),
             graph_astar: GraphAStar::new(nodes),
@@ -850,7 +962,10 @@ impl WaterPathfinder {
             water_to = self.best_water_neighbor(to)?;
             original_to = Some(to);
         }
-        let mut path = self.smoothing(&water_from, water_to)?;
+        let mut path = match &mut self.simple {
+            Some(simple) => simple.find(&self.mini, &water_from, water_to)?,
+            None => self.smoothing(&water_from, water_to)?,
+        };
         if path.is_empty() {
             return None;
         }
