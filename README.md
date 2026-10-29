@@ -238,6 +238,24 @@ yet, `docker compose logs caddy` shows why, and it keeps retrying. Videos live i
 `git pull` and the same command. Renders take several CPU cores each; raise
 `MAX_RENDERS` only on a bigger machine.
 
+### Rendering games as they end
+
+With `AUTO_RENDER=1` (the default) the server also renders public games without
+waiting to be asked. Every `AUTO_POLL_SECS` (60) it lists public games from
+`api.openfront.io/public/games`. That listing filters by start time, so it looks back
+`AUTO_LOOKBACK_MINS` (180), since a game can run for about three hours. It queues
+games that have ended and that it can render: unranked, not Humans vs Nations, at
+least `AUTO_MIN_PLAYERS` (10) players.
+
+About ten public games end every minute, more than one machine renders. So the queue
+takes the newest game first and drops games that ended more than
+`AUTO_MAX_AGE_MINS` (30) ago. The worker renders one game at a time and steps aside
+whenever someone is waiting for an on-demand render. It goes through the same
+render path, so a game is never rendered twice. Auto renders pass `--same-engine`, so
+a game played on a different engine version is skipped in under a second instead of
+rendering a video that drifts. When OpenFront deploys a new engine version, auto
+rendering produces nothing until the port catches up.
+
 Settings (environment): `PORT` (8080), `DATA_DIR` (`/data` in the image),
 `PUBLIC_URL` (`https://openfront.video`, used for the absolute URLs in the tags),
 `MAX_RENDERS` (1), `EMBED_WAIT_SECS` (25), `VIDEO_WAIT_SECS` (120: how long a video

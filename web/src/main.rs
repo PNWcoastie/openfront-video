@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -31,6 +32,8 @@ use serde_json::Value;
 use tokio::sync::{watch, Semaphore};
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
+
+mod auto;
 
 /// A failed render is remembered this long before a request may retry it.
 const FAILURE_TTL: Duration = Duration::from_secs(600);
@@ -57,6 +60,8 @@ struct App {
     video_wait: Duration,
     renders: Semaphore,
     jobs: Mutex<HashMap<String, Job>>,
+    /// On-demand renders waiting for a slot; the auto renderer holds back while any do.
+    demand_waiting: AtomicUsize,
 }
 
 enum Status {
@@ -101,6 +106,11 @@ impl App {
     /// The game's status, starting its render if needed and waiting up to
     /// `wait` for it to finish.
     async fn status(self: &Arc<Self>, id: &str, wait: Duration) -> Status {
+        self.status_for(id, wait, false).await
+    }
+
+    /// `status`, for an on-demand request or (auto) the background renderer.
+    async fn status_for(self: &Arc<Self>, id: &str, wait: Duration, auto: bool) -> Status {
         if let Some(meta) = self.meta(id).await {
             return Status::Ready(meta);
         }
@@ -115,7 +125,7 @@ impl App {
                     let app = self.clone();
                     let id = id.to_string();
                     tokio::spawn(async move {
-                        let outcome = app.render(&id).await;
+                        let outcome = app.render(&id, auto).await;
                         let mut jobs = app.jobs.lock().unwrap();
                         match &outcome {
                             Outcome::Done => jobs.remove(&id),
@@ -140,10 +150,16 @@ impl App {
 
     /// Runs openfront-video for the game into temporary files, then moves
     /// them into place (details last).
-    async fn render(&self, id: &str) -> Outcome {
+    async fn render(&self, id: &str, auto: bool) -> Outcome {
+        if !auto {
+            self.demand_waiting.fetch_add(1, Ordering::SeqCst);
+        }
         let _permit = self.renders.acquire().await.unwrap();
+        if !auto {
+            self.demand_waiting.fetch_sub(1, Ordering::SeqCst);
+        }
         let t0 = Instant::now();
-        println!("render {id}: started");
+        println!("render {id}: started{}", if auto { " (auto)" } else { "" });
         let tmp = |ext: &str| self.dir.join(format!(".{id}.tmp.{ext}"));
         let mut cmd = tokio::process::Command::new(&self.bin);
         cmd.arg(id)
@@ -153,6 +169,8 @@ impl App {
             .arg(tmp("png"))
             .arg("--meta")
             .arg(tmp("json"))
+            // Auto renders skip games from other engine versions right away.
+            .args(if auto { &["--same-engine"][..] } else { &[][..] })
             .stdin(std::process::Stdio::null())
             .kill_on_drop(true);
         let result = tokio::time::timeout(RENDER_TIMEOUT, cmd.output()).await;
@@ -361,7 +379,11 @@ async fn main() {
         video_wait: secs("VIDEO_WAIT_SECS", "120"),
         renders: Semaphore::new(env_or("MAX_RENDERS", "1").parse().expect("MAX_RENDERS")),
         jobs: Mutex::new(HashMap::new()),
+        demand_waiting: AtomicUsize::new(0),
     });
+    if env_or("AUTO_RENDER", "1") != "0" {
+        auto::start(app.clone(), auto::Settings::from_env());
+    }
     let router = Router::new()
         .route("/", get(index))
         .route("/go", get(go))

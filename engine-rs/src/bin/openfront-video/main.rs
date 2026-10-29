@@ -48,6 +48,7 @@ Options:
   --bitrate <n>      target bitrate in Mbit/s (default: 6)
   --threads <n>      encoder threads (default: 4)
   --strict           stop if the replay desyncs from the archived hashes
+  --same-engine      stop right away if the game was played on another engine version
   --thumbnail <file> also save the last frame as a PNG
   --meta <file>      also write the game's and video's details as JSON
 ";
@@ -62,6 +63,7 @@ struct Options {
     bitrate: f64,
     threads: u16,
     strict: bool,
+    same_engine: bool,
     thumbnail: Option<String>,
     meta: Option<String>,
 }
@@ -77,6 +79,7 @@ fn parse_args() -> Result<Options, String> {
         bitrate: 6.0,
         threads: 4,
         strict: false,
+        same_engine: false,
         thumbnail: None,
         meta: None,
     };
@@ -95,6 +98,7 @@ fn parse_args() -> Result<Options, String> {
             "--bitrate" => o.bitrate = num(value()?)?,
             "--threads" => o.threads = num(value()?)?.round().max(1.0) as u16,
             "--strict" => o.strict = true,
+            "--same-engine" => o.same_engine = true,
             "--thumbnail" => o.thumbnail = Some(value()?),
             "--meta" => o.meta = Some(value()?),
             "-h" | "--help" => {
@@ -196,7 +200,15 @@ fn run() -> Result<(), String> {
     );
     let commit = assets::ENGINE_COMMIT;
     if let Some(played) = record["gitCommit"].as_str() {
-        if played != "DEV" && !commit.is_empty() && played != commit {
+        let known = replay::ENGINE_COMMITS.contains(&played) || played == commit;
+        if played != "DEV" && !known {
+            if opts.same_engine {
+                return Err(format!(
+                    "played on engine version {}, this build follows {}",
+                    &played[..played.len().min(9)],
+                    &commit[..commit.len().min(9)]
+                ));
+            }
             eprintln!(
                 "! this game was played on commit {}, but this build follows {}. The replay will probably desync.",
                 &played[..played.len().min(12)],

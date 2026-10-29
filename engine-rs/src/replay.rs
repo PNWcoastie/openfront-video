@@ -13,6 +13,14 @@ use crate::map::GameMap;
 use crate::prof;
 use crate::rng::PseudoRandom;
 
+/// Engine versions the port replays identically. 9f4a28f is the one it was
+/// written against; c144d13 (v35) adds only the onboarding tutorial (behind
+/// `tutorial`, rejected in setup), its map and translations.
+pub const ENGINE_COMMITS: &[&str] = &[
+    "9f4a28f16fae951df0daf727e5e64b34ce8b77d1",
+    "c144d134d1503191b4c3fd9a866fc583b9ecea4a",
+];
+
 /// A map's manifest and terrain files.
 pub struct MapFiles {
     pub manifest: Value,
@@ -61,6 +69,7 @@ pub fn setup(record: &Value, res: &dyn Resources) -> (Game, Vec<Vec<Value>>) {
         Some("Compact") => true,
         other => panic!("map size {other:?} is not ported yet"),
     };
+    assert!(gc["tutorial"].as_bool() != Some(true), "tutorial games are not ported yet");
     let doomsday = gc["doomsdayClock"]["enabled"].as_bool().unwrap_or(false);
     assert!(!doomsday, "the doomsday clock is not ported yet");
 

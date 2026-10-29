@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # openfront.video: the web service (web/) and the renderer it runs
 # (engine-rs's openfront-video, with its maps and assets built in).
 #
@@ -6,14 +7,13 @@
 #
 # Put a TLS-terminating proxy in front for https://openfront.video.
 
-# syntax=docker/dockerfile:1
 FROM rust:1.97-bookworm AS build
 # NASM lets OpenH264 build its assembly (much faster encoding).
 RUN apt-get update && apt-get install -y --no-install-recommends nasm && rm -rf /var/lib/apt/lists/*
 
 # The engine version the Rust port follows; build.rs takes the maps, sprites,
 # font and theme from it. Only those folders are checked out.
-ARG OPENFRONT_COMMIT=9f4a28f16fae951df0daf727e5e64b34ce8b77d1
+ARG OPENFRONT_COMMIT=c144d134d1503191b4c3fd9a866fc583b9ecea4a
 WORKDIR /src
 RUN git init -q OpenFrontIO \
  && cd OpenFrontIO \

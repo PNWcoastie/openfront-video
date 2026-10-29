@@ -1,7 +1,7 @@
 # engine-rs
 
 A Rust port of the OpenFront.io simulation, built to replay games bit-identically to
-the TypeScript engine and faster. It's pinned to engine commit `9f4a28f` and is being
+the TypeScript engine and faster. It follows engine commit `9f4a28f` and v35's `c144d13`, which only adds the onboarding tutorial (tutorial games stop the run); `replay::ENGINE_COMMITS` lists the versions it accepts. It is being
 built up one game at a time, starting with `cAj8yxzNsH` (Bab el-Mandeb Strait, 7
 teams, 400 bots, nations off).
 
