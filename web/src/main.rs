@@ -224,8 +224,58 @@ fn page(head: &str, body: &str) -> Html<String> {
     ))
 }
 
+/// Google AdSense: ADSENSE_CLIENT (ca-pub-...) loads the script (Auto ads), and
+/// ADSENSE_SLOT adds a fixed responsive unit. Both are checked to be plain IDs
+/// before they go into the page.
+struct Ads {
+    client: String,
+    slot: Option<String>,
+}
+
+static ADS: std::sync::OnceLock<Option<Ads>> = std::sync::OnceLock::new();
+
+fn ads() -> Option<&'static Ads> {
+    ADS.get_or_init(|| {
+        let client = std::env::var("ADSENSE_CLIENT").ok().filter(|c| !c.is_empty())?;
+        let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        if !client.strip_prefix("ca-pub-").is_some_and(digits) {
+            eprintln!("ADSENSE_CLIENT should look like ca-pub-1234567890123456; ads are off");
+            return None;
+        }
+        let slot = std::env::var("ADSENSE_SLOT").ok().filter(|s| digits(s));
+        Some(Ads { client, slot })
+    })
+    .as_ref()
+}
+
+/// `page` with ads. Only for pages that stay put: AdSense doesn't allow ads on
+/// a page that reloads itself, like the one shown while a game renders.
+fn page_with_ads(head: &str, body: &str) -> Html<String> {
+    let Some(ads) = ads() else { return page(head, body) };
+    let script = format!(
+        r#"<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client={}" crossorigin="anonymous"></script>"#,
+        ads.client
+    );
+    let unit = match &ads.slot {
+        Some(slot) => format!(
+            r#"<ins class="adsbygoogle" style="display:block;margin-top:24px" data-ad-client="{}" data-ad-slot="{slot}" data-ad-format="auto" data-full-width-responsive="true"></ins><script>(adsbygoogle=window.adsbygoogle||[]).push({{}});</script>"#,
+            ads.client
+        ),
+        None => String::new(),
+    };
+    page(&format!("{head}{script}"), &format!("{body}{unit}"))
+}
+
+/// /ads.txt, which AdSense checks to confirm who may sell ads on the site.
+async fn ads_txt() -> Response {
+    match ads() {
+        Some(ads) => format!("google.com, {}, DIRECT, f08c47fec0942fa0\n", ads.client.trim_start_matches("ca-")).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 async fn index() -> Html<String> {
-    page(
+    page_with_ads(
         "<title>openfront.video</title><meta property=\"og:title\" content=\"openfront.video\">\
 <meta property=\"og:description\" content=\"Timelapse videos of OpenFront.io games\">",
         "<h1>openfront.video</h1><p>Paste an OpenFront.io game link or ID to get a timelapse of the whole game. \
@@ -301,7 +351,7 @@ async fn game_page(app: Arc<App>, id: String, headers: HeaderMap) -> Response {
                 "<h1>{t}</h1><p>{d}. <a href=\"{source}\">Replay on OpenFront</a> · <a href=\"/video/{id}.mp4\" download>Download</a></p>\
 <video src=\"/video/{id}.mp4\" poster=\"/thumb/{id}.png\" width=\"{w}\" height=\"{h}\" controls autoplay muted loop playsinline></video>"
             );
-            page(&head, &body).into_response()
+            page_with_ads(&head, &body).into_response()
         }
         Status::Pending => {
             let head = format!(
@@ -388,6 +438,7 @@ async fn main() {
         .route("/", get(index))
         .route("/go", get(go))
         .route("/health", get(|| async { "ok" }))
+        .route("/ads.txt", get(ads_txt))
         .route("/game/{id}", get(game))
         .route("/{prefix}/game/{id}", get(game_prefixed))
         .route("/video/{name}", get(video))

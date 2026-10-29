@@ -256,6 +256,16 @@ a game played on a different engine version is skipped in under a second instead
 rendering a video that drifts. When OpenFront deploys a new engine version, auto
 rendering produces nothing until the port catches up.
 
+### Ads
+
+Set `ADSENSE_CLIENT` to your AdSense publisher ID (`ca-pub-…`) to load the AdSense
+script, which serves Auto ads. Optionally set `ADSENSE_SLOT` to an ad unit ID, which
+adds a responsive unit under the video and under the home page form. The server then
+also serves `/ads.txt` with your publisher ID, which AdSense checks. Ads appear only on
+the home page and finished video pages. They're left off the page shown while a game
+renders, because it reloads itself every 5 seconds and AdSense forbids ads on
+auto-refreshing pages. Neither ID is required; without them there are no ads.
+
 Settings (environment): `PORT` (8080), `DATA_DIR` (`/data` in the image),
 `PUBLIC_URL` (`https://openfront.video`, used for the absolute URLs in the tags),
 `MAX_RENDERS` (1), `EMBED_WAIT_SECS` (25), `VIDEO_WAIT_SECS` (120: how long a video

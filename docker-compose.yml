@@ -16,6 +16,8 @@ services:
       PUBLIC_URL: https://${DOMAIN:?set DOMAIN in .env}
       MAX_RENDERS: ${MAX_RENDERS:-1}
       EMBED_WAIT_SECS: ${EMBED_WAIT_SECS:-25}
+      ADSENSE_CLIENT: ${ADSENSE_CLIENT:-}
+      ADSENSE_SLOT: ${ADSENSE_SLOT:-}
     volumes:
       - videos:/data
     # Only Caddy talks to it.
