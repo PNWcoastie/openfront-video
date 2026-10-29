@@ -14,8 +14,14 @@ services:
     restart: unless-stopped
     environment:
       PUBLIC_URL: https://${DOMAIN:?set DOMAIN in .env}
-      MAX_RENDERS: ${MAX_RENDERS:-1}
+      MAX_RENDERS: ${MAX_RENDERS:-2}
       EMBED_WAIT_SECS: ${EMBED_WAIT_SECS:-25}
+      VIDEO_WAIT_SECS: ${VIDEO_WAIT_SECS:-120}
+      AUTO_RENDER: ${AUTO_RENDER:-1}
+      AUTO_POLL_SECS: ${AUTO_POLL_SECS:-60}
+      AUTO_LOOKBACK_MINS: ${AUTO_LOOKBACK_MINS:-180}
+      AUTO_MAX_AGE_MINS: ${AUTO_MAX_AGE_MINS:-30}
+      AUTO_MIN_PLAYERS: ${AUTO_MIN_PLAYERS:-10}
       ADSENSE_CLIENT: ${ADSENSE_CLIENT:-}
       ADSENSE_SLOT: ${ADSENSE_SLOT:-}
     volumes:

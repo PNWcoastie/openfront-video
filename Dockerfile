@@ -52,7 +52,7 @@ ENV PORT=8080 \
     DATA_DIR=/data \
     PUBLIC_URL=https://openfront.video \
     OPENFRONT_VIDEO_BIN=/usr/local/bin/openfront-video \
-    MAX_RENDERS=1
+    MAX_RENDERS=2
 VOLUME /data
 EXPOSE 8080
 CMD ["openfront-web"]

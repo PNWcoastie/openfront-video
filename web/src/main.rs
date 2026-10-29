@@ -17,7 +17,6 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -29,11 +28,12 @@ use axum::routing::get;
 use axum::Router;
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::sync::{watch, Semaphore};
+use tokio::sync::watch;
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
 
 mod auto;
+mod slots;
 
 /// A failed render is remembered this long before a request may retry it.
 const FAILURE_TTL: Duration = Duration::from_secs(600);
@@ -43,6 +43,11 @@ const RENDER_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 #[derive(Clone)]
 enum Outcome {
     Done,
+    /// The API has no such game: unfinished (the API only lists finished
+    /// games) or a wrong ID. Not remembered, so the next request asks again.
+    NotFound,
+    /// An auto render stopped so a request could have its slot.
+    Preempted,
     Failed(String),
 }
 
@@ -58,15 +63,14 @@ struct App {
     public_url: String,
     embed_wait: Duration,
     video_wait: Duration,
-    renders: Semaphore,
+    slots: Arc<slots::Slots>,
     jobs: Mutex<HashMap<String, Job>>,
-    /// On-demand renders waiting for a slot; the auto renderer holds back while any do.
-    demand_waiting: AtomicUsize,
 }
 
 enum Status {
     Ready(Value),
     Pending,
+    NotFound,
     Failed(String),
 }
 
@@ -128,7 +132,7 @@ impl App {
                         let outcome = app.render(&id, auto).await;
                         let mut jobs = app.jobs.lock().unwrap();
                         match &outcome {
-                            Outcome::Done => jobs.remove(&id),
+                            Outcome::Done | Outcome::NotFound | Outcome::Preempted => jobs.remove(&id),
                             Outcome::Failed(msg) => jobs.insert(id.clone(), Job::Failed(msg.clone(), Instant::now())),
                         };
                         let _ = tx.send(Some(outcome));
@@ -142,6 +146,8 @@ impl App {
         match finished {
             Some(o) => match o.unwrap() {
                 Outcome::Done => self.meta(id).await.map_or(Status::Failed("the render left no details".into()), Status::Ready),
+                Outcome::NotFound => Status::NotFound,
+                Outcome::Preempted => Status::Pending,
                 Outcome::Failed(msg) => Status::Failed(msg),
             },
             None => Status::Pending,
@@ -151,13 +157,15 @@ impl App {
     /// Runs openfront-video for the game into temporary files, then moves
     /// them into place (details last).
     async fn render(&self, id: &str, auto: bool) -> Outcome {
-        if !auto {
-            self.demand_waiting.fetch_add(1, Ordering::SeqCst);
-        }
-        let _permit = self.renders.acquire().await.unwrap();
-        if !auto {
-            self.demand_waiting.fetch_sub(1, Ordering::SeqCst);
-        }
+        let mut slot = self.slots.acquire(auto).await;
+        let preempted = async {
+            match slot.preempted.take() {
+                Some(rx) => {
+                    let _ = rx.await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
         let t0 = Instant::now();
         println!("render {id}: started{}", if auto { " (auto)" } else { "" });
         let tmp = |ext: &str| self.dir.join(format!(".{id}.tmp.{ext}"));
@@ -173,10 +181,17 @@ impl App {
             .args(if auto { &["--same-engine"][..] } else { &[][..] })
             .stdin(std::process::Stdio::null())
             .kill_on_drop(true);
-        let result = tokio::time::timeout(RENDER_TIMEOUT, cmd.output()).await;
+        // Dropping the output future on preemption kills the renderer (kill_on_drop).
+        let result = tokio::select! {
+            r = tokio::time::timeout(RENDER_TIMEOUT, cmd.output()) => Some(r),
+            _ = preempted => None,
+        };
         let outcome = match result {
+            None => Outcome::Preempted,
+            Some(result) => match result {
             Err(_) => Outcome::Failed("the render took too long".into()),
             Ok(Err(e)) => Outcome::Failed(format!("couldn't start the renderer: {e}")),
+            Ok(Ok(out)) if out.status.code() == Some(3) => Outcome::NotFound,
             Ok(Ok(out)) if !out.status.success() => {
                 // The renderer's last line says why ("error: ...", "... is not ported yet").
                 let err = String::from_utf8_lossy(&out.stderr);
@@ -197,14 +212,18 @@ impl App {
                     Err(e) => Outcome::Failed(format!("couldn't store the video: {e}")),
                 }
             }
+            },
         };
-        if matches!(outcome, Outcome::Failed(_)) {
+        drop(slot);
+        if !matches!(outcome, Outcome::Done) {
             for ext in ["mp4", "png", "json"] {
                 let _ = tokio::fs::remove_file(tmp(ext)).await;
             }
         }
         match &outcome {
             Outcome::Done => println!("render {id}: done in {:.1} s", t0.elapsed().as_secs_f64()),
+            Outcome::NotFound => println!("render {id}: not finished yet (or no such game)"),
+            Outcome::Preempted => println!("render {id}: stopped after {:.1} s to make room for a request", t0.elapsed().as_secs_f64()),
             Outcome::Failed(msg) => println!("render {id}: failed after {:.1} s: {msg}", t0.elapsed().as_secs_f64()),
         }
         outcome
@@ -307,7 +326,9 @@ async fn game_page(app: Arc<App>, id: String, headers: HeaderMap) -> Response {
     if !valid_id(&id) {
         return (StatusCode::NOT_FOUND, page("<title>Not found</title>", "<h1>Not a game ID</h1>")).into_response();
     }
-    let wait = if is_previewer(&headers) { app.embed_wait } else { Duration::ZERO };
+    // People wait a moment too: long enough to learn a game is not finished
+    // (a quick API lookup), not for a whole render.
+    let wait = if is_previewer(&headers) { app.embed_wait } else { Duration::from_secs(3) };
     let base = &app.public_url;
     let video = format!("{base}/video/{id}.mp4");
     let thumb = format!("{base}/thumb/{id}.png");
@@ -365,6 +386,18 @@ After that the video is ready right away.</p><p><a href=\"{source}\">Replay on O
             );
             page(&head, &body).into_response()
         }
+        // Link previewers get no page at all, so they cache nothing and fetch
+        // again the next time the link is posted.
+        Status::NotFound if is_previewer(&headers) => {
+            (StatusCode::SERVICE_UNAVAILABLE, [(header::RETRY_AFTER, "60")], "game not finished yet").into_response()
+        }
+        Status::NotFound => {
+            let head = format!("<title>Game {id} isn't finished</title><meta http-equiv=\"refresh\" content=\"30\">");
+            let body = format!(
+                "<h1>Game {id} isn't finished yet</h1><p>Its video is made once the game ends. This page checks again every 30 seconds. If the game is over, the ID may be wrong.</p><p><a href=\"{source}\">Watch it on OpenFront</a></p>"
+            );
+            page(&head, &body).into_response()
+        }
         Status::Failed(msg) => {
             let head = format!("<title>Couldn't render {id}</title><meta property=\"og:title\" content=\"Couldn't render game {id}\">");
             let body = format!("<h1>Couldn't render game {id}</h1><p>{}</p><p><a href=\"/\">Try another game</a></p>", esc(&msg));
@@ -398,6 +431,7 @@ async fn media(app: Arc<App>, name: String, ext: &str, req: Request) -> Response
             res
         }
         Status::Pending => (StatusCode::SERVICE_UNAVAILABLE, [(header::RETRY_AFTER, "10")], "still rendering").into_response(),
+        Status::NotFound => (StatusCode::NOT_FOUND, "game not finished yet").into_response(),
         Status::Failed(msg) => (StatusCode::NOT_FOUND, msg).into_response(),
     }
 }
@@ -427,9 +461,8 @@ async fn main() {
         public_url: env_or("PUBLIC_URL", "https://openfront.video").trim_end_matches('/').to_string(),
         embed_wait: secs("EMBED_WAIT_SECS", "25"),
         video_wait: secs("VIDEO_WAIT_SECS", "120"),
-        renders: Semaphore::new(env_or("MAX_RENDERS", "1").parse().expect("MAX_RENDERS")),
+        slots: slots::Slots::new(env_or("MAX_RENDERS", "2").parse().expect("MAX_RENDERS")),
         jobs: Mutex::new(HashMap::new()),
-        demand_waiting: AtomicUsize::new(0),
     });
     if env_or("AUTO_RENDER", "1") != "0" {
         auto::start(app.clone(), auto::Settings::from_env());

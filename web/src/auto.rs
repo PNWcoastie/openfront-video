@@ -7,11 +7,11 @@
 //! render, so the queue keeps only games worth rendering (unranked, not Humans
 //! vs Nations, at least AUTO_MIN_PLAYERS players), takes the newest first and
 //! drops games that ended more than AUTO_MAX_AGE_MINS ago. The worker renders
-//! one game at a time, steps aside whenever an on-demand render is waiting,
+//! up to one game per render slot, gives its slot to any request that needs one,
 //! and uses the same render path, so a game is never rendered twice.
 
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -152,10 +152,12 @@ async fn poll_loop(app: Arc<App>, queue: Arc<Mutex<Queue>>, s: Arc<Settings>) {
 }
 
 async fn work_loop(app: Arc<App>, queue: Arc<Mutex<Queue>>, s: Arc<Settings>) {
+    // Auto renders in flight: up to one per slot, all yielding to requests.
+    let in_flight = Arc::new(AtomicUsize::new(0));
     loop {
-        // People asking for a video go first.
-        while app.demand_waiting.load(Ordering::SeqCst) > 0 {
-            tokio::time::sleep(Duration::from_secs(1)).await;
+        if in_flight.load(Ordering::SeqCst) >= app.slots.capacity() || !app.slots.auto_can_start() {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            continue;
         }
         let next = {
             let mut q = queue.lock().unwrap();
@@ -171,9 +173,19 @@ async fn work_loop(app: Arc<App>, queue: Arc<Mutex<Queue>>, s: Arc<Settings>) {
             tokio::time::sleep(Duration::from_secs(5)).await;
             continue;
         };
-        // Waits for the render (or joins one a request already started).
-        if let Status::Failed(_) = app.status_for(&job.id, Duration::from_secs(30 * 60), true).await {
-            // The render logs why; failures are remembered so requests don't retry at once.
-        }
+        in_flight.fetch_add(1, Ordering::SeqCst);
+        let (app, queue, in_flight) = (app.clone(), queue.clone(), in_flight.clone());
+        tokio::spawn(async move {
+            // Waits for the render (or joins one a request already started).
+            // Still pending afterwards means a request took its slot: queue it again.
+            if let Status::Pending = app.status_for(&job.id, Duration::from_secs(30 * 60), true).await {
+                if !app.path(&job.id, "json").exists() {
+                    let mut q = queue.lock().unwrap();
+                    q.pending.push(job);
+                    q.pending.sort_by(|a, b| b.ended.cmp(&a.ended));
+                }
+            }
+            in_flight.fetch_sub(1, Ordering::SeqCst);
+        });
     }
 }

@@ -173,7 +173,9 @@ fn main() {
     }));
     if let Err(e) = run() {
         eprintln!("error: {e}");
-        std::process::exit(1);
+        // Exit code 3: the API has no such game (yet). The web service treats
+        // that as "not finished" rather than as a failure.
+        std::process::exit(if e.starts_with("game ") && e.contains(" not found (") { 3 } else { 1 });
     }
 }
 

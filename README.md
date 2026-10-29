@@ -249,8 +249,10 @@ least `AUTO_MIN_PLAYERS` (10) players.
 
 About ten public games end every minute, more than one machine renders. So the queue
 takes the newest game first and drops games that ended more than
-`AUTO_MAX_AGE_MINS` (30) ago. The worker renders one game at a time and steps aside
-whenever someone is waiting for an on-demand render. It goes through the same
+`AUTO_MAX_AGE_MINS` (30) ago. Renders share `MAX_RENDERS` slots (2 by default) between requests and the queue.
+A request never waits behind an automatic render: when every slot is busy, an
+automatic render is stopped, its slot goes to the request and its game goes back on
+the queue. No automatic render starts while a request is waiting. It goes through the same
 render path, so a game is never rendered twice. Auto renders pass `--same-engine`, so
 a game played on a different engine version is skipped in under a second instead of
 rendering a video that drifts. When OpenFront deploys a new engine version, auto
@@ -268,7 +270,7 @@ auto-refreshing pages. Neither ID is required; without them there are no ads.
 
 Settings (environment): `PORT` (8080), `DATA_DIR` (`/data` in the image),
 `PUBLIC_URL` (`https://openfront.video`, used for the absolute URLs in the tags),
-`MAX_RENDERS` (1), `EMBED_WAIT_SECS` (25), `VIDEO_WAIT_SECS` (120: how long a video
+`MAX_RENDERS` (2), `EMBED_WAIT_SECS` (25), `VIDEO_WAIT_SECS` (120: how long a video
 request waits for a render in progress), `OPENFRONT_VIDEO_BIN`. Nothing is ever
 deleted from `/data` yet (a video is about 20 MB).
 
