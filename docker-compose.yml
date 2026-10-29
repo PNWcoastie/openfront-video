@@ -1,0 +1,46 @@
+# openfront.video on one server: the app, and Caddy in front for HTTPS with
+# Let's Encrypt certificates (issued and renewed automatically).
+#
+#   cp .env.example .env    # set DOMAIN and ACME_EMAIL
+#   docker compose up -d --build
+#
+# Needs DNS A/AAAA records for the domain (and www.) pointing at this server,
+# and ports 80 and 443 open.
+
+services:
+  app:
+    build: .
+    image: openfront-video
+    restart: unless-stopped
+    environment:
+      PUBLIC_URL: https://${DOMAIN:?set DOMAIN in .env}
+      MAX_RENDERS: ${MAX_RENDERS:-1}
+      EMBED_WAIT_SECS: ${EMBED_WAIT_SECS:-25}
+    volumes:
+      - videos:/data
+    # Only Caddy talks to it.
+    expose:
+      - "8080"
+
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      DOMAIN: ${DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Certificates and ACME account; keep them so restarts don't hit Let's Encrypt rate limits.
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  videos:
+  caddy_data:
+  caddy_config:

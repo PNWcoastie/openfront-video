@@ -1,0 +1,25 @@
+# Caddy gets and renews Let's Encrypt certificates for these names by itself
+# and redirects HTTP to HTTPS.
+{
+	email {$ACME_EMAIL}
+}
+
+www.{$DOMAIN} {
+	redir https://{$DOMAIN}{uri} permanent
+}
+
+{$DOMAIN} {
+	# Only text types by default; videos and PNGs are already compressed.
+	encode zstd gzip
+	# The app may hold a request while a game renders (link previewers, video
+	# requests), so the proxy must not time out before it answers.
+	reverse_proxy app:8080 {
+		transport http {
+			read_timeout 5m
+		}
+	}
+	log {
+		output stdout
+		format console
+	}
+}

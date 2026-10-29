@@ -214,6 +214,30 @@ to finish. Discord stops waiting at some point, and a game takes 20–40 s to re
 link posted before its video exists may therefore embed as a plain card, and Discord
 caches that card for a while. Opening the page first, then sharing it, always embeds.
 
+### Deploying with HTTPS
+
+`docker-compose.yml` runs the app behind Caddy, which gets and renews Let's Encrypt
+certificates by itself, redirects HTTP to HTTPS and `www.` to the bare domain. On a
+Linux server with Docker:
+
+1. Point DNS A (and AAAA) records for the domain and `www.` at the server. Open ports
+   80 and 443 (443/udp too, for HTTP/3).
+2. Copy the repo there. The image build fetches the engine assets itself, so the
+   OpenFrontIO checkout isn't needed.
+3. `cp .env.example .env`, then set `DOMAIN` and `ACME_EMAIL`.
+4. Start it:
+
+```bash
+docker compose up -d --build
+```
+
+The first build takes several minutes: compiling, and compressing every map. Caddy
+asks Let's Encrypt for certificates once DNS resolves to the server. If it can't
+yet, `docker compose logs caddy` shows why, and it keeps retrying. Videos live in the
+`videos` volume and certificates in `caddy_data`; both survive rebuilds. Update with
+`git pull` and the same command. Renders take several CPU cores each; raise
+`MAX_RENDERS` only on a bigger machine.
+
 Settings (environment): `PORT` (8080), `DATA_DIR` (`/data` in the image),
 `PUBLIC_URL` (`https://openfront.video`, used for the absolute URLs in the tags),
 `MAX_RENDERS` (1), `EMBED_WAIT_SECS` (25), `VIDEO_WAIT_SECS` (120: how long a video

@@ -1,3 +1,6 @@
+# Deployment settings (see .env.example)
+/.env
+
 # Build output
 target/
 node_modules/
