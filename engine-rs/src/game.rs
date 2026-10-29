@@ -15,6 +15,9 @@ use crate::rng::PseudoRandom;
 use crate::tileset::TileSet;
 use crate::water::{BoundedAStar, Bounds, WaterPathfinder};
 
+mod doomsday;
+pub use doomsday::DoomsdayExec;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PlayerType {
     Bot,
@@ -87,6 +90,8 @@ pub struct Player {
     pub units_constructed: HashMap<&'static str, u32>,
     pub last_delete_unit_tick: i64,
     pub last_embargo_all_tick: i64,
+    /// The tick the Doomsday Clock marked this player (-1: not marked).
+    pub marked_doomsday_tick: i64,
 }
 
 impl Player {
@@ -176,6 +181,8 @@ pub struct Config {
     pub overtime_enabled: bool,
     pub overtime_start_minutes: f64,
     pub max_timer_minutes: Option<f64>,
+    /// The Doomsday Clock's speed preset, when it is on.
+    pub doomsday_speed: Option<String>,
 }
 
 impl Config {
@@ -265,6 +272,7 @@ pub enum Exec {
     SpawnTimer,
     Spawn(Box<SpawnExec>),
     WinCheck { active: bool },
+    Doomsday(Box<DoomsdayExec>),
     RecomputeRailCluster,
     MarkDisconnected { player: usize, disconnected: bool },
     Player(Box<PlayerExec>),
@@ -313,6 +321,7 @@ impl Exec {
             Exec::SpawnTimer => "SpawnTimerExecution",
             Exec::Spawn(_) => "SpawnExecution",
             Exec::WinCheck { .. } => "WinCheckExecution",
+            Exec::Doomsday(_) => "DoomsdayClockExecution",
             Exec::RecomputeRailCluster => "RecomputeRailClusterExecution",
             Exec::MarkDisconnected { .. } => "MarkDisconnectedExecution",
             Exec::Player(_) => "PlayerExecution",
@@ -364,6 +373,7 @@ impl Exec {
             Exec::Spawn(s) => s.active,
             Exec::NoOp | Exec::MarkDisconnected { .. } => false,
             Exec::WinCheck { active } => *active,
+            Exec::Doomsday(d) => d.active,
             Exec::RecomputeRailCluster => true,
             Exec::Player(p) => p.active,
             Exec::Tribe(t) => t.active,
@@ -570,6 +580,7 @@ impl Game {
             units_constructed: HashMap::new(),
             last_delete_unit_tick: -1,
             last_embargo_all_tick: -1,
+            marked_doomsday_tick: -1,
         };
         self.players_by_id.insert(player.info.id.clone(), idx);
         self.players.push(player);
@@ -965,7 +976,7 @@ impl Game {
 
     fn init_exec(&mut self, e: &mut Exec) {
         match e {
-            Exec::SpawnTimer | Exec::WinCheck { .. } | Exec::RecomputeRailCluster | Exec::NoOp | Exec::Tribe(_) => {}
+            Exec::SpawnTimer | Exec::WinCheck { .. } | Exec::Doomsday(_) | Exec::RecomputeRailCluster | Exec::NoOp | Exec::Tribe(_) => {}
             Exec::Spawn(s) => s.queued_during_spawn_phase = self.in_spawn_phase(),
             Exec::MarkDisconnected { player, disconnected } => {
                 // The disconnect snapshot only matters when a player comes back.
@@ -1068,6 +1079,7 @@ impl Game {
             }
             Exec::Spawn(s) => self.tick_spawn(s),
             Exec::WinCheck { active } => self.tick_win_check(active),
+            Exec::Doomsday(d) => self.tick_doomsday(d),
             Exec::RecomputeRailCluster => self.recompute_clusters(),
             Exec::Player(p) => self.tick_player(p),
             Exec::Tribe(t) => self.tick_tribe(t),
@@ -1818,14 +1830,12 @@ impl Game {
         mode
     }
 
-    /// GameImpl.conquerPlayer: gold changes hands (ships too, once ported).
+    /// GameImpl.conquerPlayer: gold changes hands, and a teammate takes a disconnected player's ships.
     fn conquer_player(&mut self, conqueror: usize, conquered: usize) {
         if self.players[conquered].is_disconnected && self.is_on_same_team(conqueror, conquered) {
             for u in self.players[conquered].units.clone() {
-                match self.units[u].type_name {
-                    WARSHIP => self.set_unit_owner(u, conqueror),
-                    TRANSPORT_SHIP => panic!("captured transport ships are not ported yet"),
-                    _ => {}
+                if matches!(self.units[u].type_name, WARSHIP | TRANSPORT_SHIP) {
+                    self.set_unit_owner(u, conqueror);
                 }
             }
         }
@@ -3023,11 +3033,15 @@ impl Game {
             return;
         }
         te.last_move = self.ticks;
+        // A teammate who conquered a disconnected player took its boats: it sails on for them.
         let boat_owner = self.units[boat].owner;
-        assert!(
-            !(self.players[te.original_owner].is_disconnected && boat_owner != te.original_owner),
-            "captured boats are not ported yet"
-        );
+        if self.players[te.original_owner].is_disconnected
+            && boat_owner != te.original_owner
+            && self.is_on_same_team(boat_owner, te.original_owner)
+        {
+            te.attacker = boat_owner;
+            te.original_owner = boat_owner;
+        }
         let mut dst = dst;
         if self.units[boat].retreating {
             if te.retreat_dst.is_none() {
@@ -5405,7 +5419,10 @@ impl Game {
             return;
         }
         let health_before = self.units[w].health;
-        self.heal_warship(we, w);
+        // A side under the Doomsday Clock can't repair its navy.
+        if !self.in_doomsday(self.units[w].owner) {
+            self.heal_warship(we, w);
+        }
         // handleManualPatrolOverride
         let pt = self.ws(w).patrol_tile;
         if we.last_observed_patrol.is_some_and(|o| o != pt) {
@@ -5415,6 +5432,10 @@ impl Game {
             }
         }
         we.last_observed_patrol = Some(pt);
+        // Nothing to retreat to a port for while it can't repair: keep patrolling.
+        if self.in_doomsday(self.units[w].owner) && self.ws(w).mode != WarshipMode::Patrolling {
+            self.cancel_repair_retreat(we, w, true);
+        }
 
         if self.ws(w).mode == WarshipMode::Docked {
             if self.current_retreat_port(w).is_none() {
@@ -5615,7 +5636,7 @@ impl Game {
     }
 
     fn should_start_repair_retreat(&self, we: &WarshipExec, w: usize, health_before: i64) -> bool {
-        if self.ws(w).mode != WarshipMode::Patrolling {
+        if self.ws(w).mode != WarshipMode::Patrolling || self.in_doomsday(self.units[w].owner) {
             return false;
         }
         if (self.ticks as i64 - we.last_manual_move_tick as i64) < 50 {

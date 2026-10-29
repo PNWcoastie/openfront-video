@@ -70,8 +70,6 @@ pub fn setup(record: &Value, res: &dyn Resources) -> (Game, Vec<Vec<Value>>) {
         other => panic!("map size {other:?} is not ported yet"),
     };
     assert!(gc["tutorial"].as_bool() != Some(true), "tutorial games are not ported yet");
-    let doomsday = gc["doomsdayClock"]["enabled"].as_bool().unwrap_or(false);
-    assert!(!doomsday, "the doomsday clock is not ported yet");
 
     // The map: found by its display name in the manifests.
     let MapFiles { manifest, map: map1x, map4x, map16x } = res.map(gc["gameMap"].as_str().unwrap());
@@ -112,10 +110,11 @@ pub fn setup(record: &Value, res: &dyn Resources) -> (Game, Vec<Vec<Value>>) {
         overtime_enabled: gc["overtime"]["enabled"].as_bool().unwrap_or(false),
         overtime_start_minutes: gc["overtime"]["startMinutes"].as_f64().unwrap_or(30.0),
         max_timer_minutes: gc["maxTimerValue"].as_f64(),
+        doomsday_speed: (gc["doomsdayClock"]["enabled"].as_bool() == Some(true))
+            .then(|| gc["doomsdayClock"]["speed"].as_str().unwrap_or("normal").to_string()),
     };
     assert!(gc["hostCheats"].is_null(), "host cheats are not ported yet");
     assert!(gc["rankedType"].is_null(), "ranked games are not ported yet");
-    assert!(config.random_spawn == false, "random spawn is not ported yet");
 
     // Humans get ids from a generator seeded with the game id.
     let mut random = PseudoRandom::new(simple_hash(&game_id));
@@ -174,6 +173,15 @@ pub fn setup(record: &Value, res: &dyn Resources) -> (Game, Vec<Vec<Value>>) {
         let e = game.new_nation(n);
         game.add_execution(e);
     }
+    // PlayerSpawner: with random spawn every human is placed at the start.
+    if game.config.random_spawn {
+        let humans: Vec<PlayerInfo> =
+            game.players.iter().filter(|p| p.info.player_type == PlayerType::Human).map(|p| p.info.clone()).collect();
+        for info in humans {
+            let e = game.new_spawn(info, None, false);
+            game.add_execution(e);
+        }
+    }
     let bots = gc["bots"].as_u64().unwrap_or(0) as usize;
     if bots > 0 {
         let purchased: Vec<String> = info["tribes"]
@@ -185,6 +193,9 @@ pub fn setup(record: &Value, res: &dyn Resources) -> (Game, Vec<Vec<Value>>) {
         }
     }
     game.add_execution(Exec::WinCheck { active: true });
+    if game.config.doomsday_speed.is_some() {
+        game.add_execution(Exec::Doomsday(Box::new(game::DoomsdayExec::new())));
+    }
     let disabled = gc["disabledUnits"].as_array().cloned().unwrap_or_default();
     if !disabled.iter().any(|u| u == "Factory") {
         game.add_execution(Exec::RecomputeRailCluster);

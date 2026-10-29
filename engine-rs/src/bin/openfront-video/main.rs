@@ -235,8 +235,15 @@ fn run() -> Result<(), String> {
 
     let frames = ((opts.seconds * opts.fps as f64).round() as u64).max(1);
     let hold_frames = (opts.hold * opts.fps as f64).round() as u64;
-    let out_w = ((opts.width as f64 / 2.0).round() as usize * 2).max(2);
-    let out_h = (((h * out_w) as f64 / w as f64 / 2.0).round() as usize * 2).max(2);
+    // The requested width, scaled down if needed so the video fits OpenH264's
+    // limits (3840x2160 landscape, 2160x3840 portrait): tall maps like
+    // Mississippi River would otherwise come out several thousand pixels high.
+    let (max_w, max_h) = if h > w { (2160.0, 3840.0) } else { (3840.0, 2160.0) };
+    let want_w = opts.width as f64;
+    let fit = (max_w / want_w).min(max_h / (want_w * h as f64 / w as f64)).min(1.0);
+    let even_floor = |v: f64| ((v / 2.0).floor() as usize * 2).max(2);
+    let out_w = even_floor(want_w * fit);
+    let out_h = even_floor(out_w as f64 * h as f64 / w as f64).min(max_h as usize);
     let out = opts.out.clone().unwrap_or_else(|| format!("{game_id}.mp4"));
     let out_abs = std::path::absolute(&out).map(|p| p.display().to_string()).unwrap_or(out.clone());
     let t_init = t_init0.elapsed();
