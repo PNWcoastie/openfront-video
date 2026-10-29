@@ -6,6 +6,7 @@
 #
 # Put a TLS-terminating proxy in front for https://openfront.video.
 
+# syntax=docker/dockerfile:1
 FROM rust:1.97-bookworm AS build
 # NASM lets OpenH264 build its assembly (much faster encoding).
 RUN apt-get update && apt-get install -y --no-install-recommends nasm && rm -rf /var/lib/apt/lists/*
@@ -22,17 +23,30 @@ RUN git init -q OpenFrontIO \
  && git fetch -q --depth 1 --filter=blob:none origin "$OPENFRONT_COMMIT" \
  && git checkout -q FETCH_HEAD
 
+# Cargo's downloads and build folders live in BuildKit caches that outlast
+# this layer, so a source change recompiles only what changed (dependencies
+# and the compressed maps stay built). The binaries are copied out of the
+# cache in the same step, since the cache isn't part of the image. Debug info
+# only slows the link here.
+ENV CARGO_PROFILE_RELEASE_DEBUG=false
 COPY engine-rs engine-rs
-RUN cd engine-rs && cargo build --release --locked --bin openfront-video
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/src/engine-rs/target \
+    cd engine-rs && cargo build --release --locked --bin openfront-video \
+ && mkdir -p /out && cp target/release/openfront-video /out/
 COPY web web
-RUN cd web && cargo build --release --locked
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/src/web/target \
+    cd web && cargo build --release --locked \
+ && cp target/release/openfront-web /out/
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/* \
  && useradd --system --create-home --uid 10001 openfront \
  && mkdir /data && chown openfront /data
-COPY --from=build /src/engine-rs/target/release/openfront-video /usr/local/bin/openfront-video
-COPY --from=build /src/web/target/release/openfront-web /usr/local/bin/openfront-web
+COPY --from=build /out/openfront-video /out/openfront-web /usr/local/bin/
 USER openfront
 ENV PORT=8080 \
     DATA_DIR=/data \
