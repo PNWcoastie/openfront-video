@@ -19,6 +19,39 @@ pub struct Label {
     pub x: f64,
     pub y: f64,
     pub size: f64,
+    /// Status icon bits (engine_rs::game::STATUS_*).
+    pub status: u8,
+}
+
+/// Status icons in the client's order (StatusIconProgram slots) with their
+/// atlas cells: crown, traitor, disconnected, nuke (white), doomsday skull.
+const STATUS_ICONS: [(u8, u32); 5] = [
+    (engine_rs::game::STATUS_CROWN, 0),
+    (engine_rs::game::STATUS_TRAITOR, 1),
+    (engine_rs::game::STATUS_DISCONNECTED, 2),
+    (engine_rs::game::STATUS_NUKE, 8),
+    (engine_rs::game::STATUS_DOOMSDAY, 10),
+];
+const STATUS_CELL: u32 = 256;
+const STATUS_COLS: u32 = 3;
+const STATUS_PAD: u32 = 16;
+
+/// Halves an image with a 2x2 box filter (premultiplied, so averaging is exact enough).
+fn halve(src: &Pixmap) -> Pixmap {
+    let (w, h) = ((src.width() / 2).max(1), (src.height() / 2).max(1));
+    let mut out = Pixmap::new(w, h).unwrap();
+    let s = src.data();
+    let sw = src.width() as usize;
+    let o = out.data_mut();
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            for c in 0..4 {
+                let at = |dx: usize, dy: usize| s[((2 * y + dy) * sw + 2 * x + dx) * 4 + c] as u32;
+                o[(y * w as usize + x) * 4 + c] = ((at(0, 0) + at(1, 0) + at(0, 1) + at(1, 1) + 2) / 4) as u8;
+            }
+        }
+    }
+    out
 }
 
 /// Unit codes in the units array: unit atlas columns 0-11, structures 16-21.
@@ -239,6 +272,9 @@ pub struct Renderer {
     u: f64,
     icon_atlas: Atlas,
     unit_atlas: Atlas,
+    status_atlas: Pixmap,
+    /// Status icons scaled down, by (atlas cell, size in pixels).
+    status_icons: HashMap<(u32, u32), Pixmap>,
     font: Font,
     unit_sprites: HashMap<(u16, i32), Pixmap>,
     structure_sprites: HashMap<(u16, i32, bool), Pixmap>,
@@ -247,6 +283,8 @@ pub struct Renderer {
     placed_units: HashMap<(u16, i32, u8, u8), Placed>,
     placed_text: HashMap<TextKey, Placed>,
     frame_no: u64,
+    /// Frames with nuke targets, and status icons drawn per cell (for OPENFRONT_DRAW_PROFILE).
+    pub overlay_counts: (u64, [u64; 12]),
     /// OPENFRONT_DRAW_PROFILE=1: time per drawing step.
     pub profile: Option<Vec<(&'static str, std::time::Duration)>>,
 }
@@ -308,12 +346,15 @@ impl Renderer {
             u: out_w as f64 / 1280.0,
             icon_atlas: load_atlas(assets::ICON_ATLAS),
             unit_atlas: load_atlas(assets::UNIT_ATLAS),
+            status_atlas: Pixmap::decode_png(assets::STATUS_ATLAS).expect("status atlas png"),
+            status_icons: HashMap::new(),
             font: Font::new(),
             unit_sprites: HashMap::new(),
             structure_sprites: HashMap::new(),
             placed_units: HashMap::new(),
             placed_text: HashMap::new(),
             frame_no: 0,
+            overlay_counts: (0, [0; 12]),
             profile: std::env::var("OPENFRONT_DRAW_PROFILE").is_ok().then(Vec::new),
         }
     }
@@ -547,11 +588,83 @@ impl Renderer {
         self.canvas.draw_pixmap(x, y, sprite.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
     }
 
+    /// A status icon at `size` pixels: the atlas cell's content, halved down
+    /// to near the size first (bilinear alone would alias from 224 px).
+    fn status_icon(&mut self, cell: u32, size: u32) -> &Pixmap {
+        let atlas = &self.status_atlas;
+        self.status_icons.entry((cell, size)).or_insert_with(|| {
+            let inner = STATUS_CELL - 2 * STATUS_PAD;
+            let (cx, cy) = ((cell % STATUS_COLS) * STATUS_CELL + STATUS_PAD, (cell / STATUS_COLS) * STATUS_CELL + STATUS_PAD);
+            let mut img = Pixmap::new(inner, inner).unwrap();
+            img.draw_pixmap(-(cx as i32), -(cy as i32), atlas.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+            while img.width() >= size * 2 && img.width() > 2 {
+                img = halve(&img);
+            }
+            let mut out = Pixmap::new(size.max(1), size.max(1)).unwrap();
+            let k = size as f32 / img.width() as f32;
+            let paint = PixmapPaint { quality: FilterQuality::Bilinear, ..Default::default() };
+            out.draw_pixmap(0, 0, img.as_ref(), &paint, Transform::from_scale(k, k), None);
+            out
+        })
+    }
+
+    /// The status row above a name (status-icon.vert.glsl): icons 1.1 name
+    /// heights tall, 0.15 of that apart, centred on the name, top edge 1.4
+    /// name heights above its centre.
+    fn draw_status(&mut self, status: u8, cx: f64, cy: f64, em: f64) {
+        let icons: Vec<u32> = STATUS_ICONS.iter().filter(|(bit, _)| status & bit != 0).map(|&(_, cell)| cell).collect();
+        if icons.is_empty() {
+            return;
+        }
+        let size = (em * 1.1).round().max(4.0);
+        let gap = size * 0.15;
+        let total = icons.len() as f64 * size + (icons.len() - 1) as f64 * gap;
+        let top = (cy - em * self.settings.status_row_offset).round() as i32;
+        for (i, cell) in icons.into_iter().enumerate() {
+            self.overlay_counts.1[cell as usize] += 1;
+            let x = (cx - total / 2.0 + i as f64 * (size + gap)).round() as i32;
+            self.status_icon(cell, size as u32);
+            let icon = &self.status_icons[&(cell, size as u32)];
+            self.canvas.draw_pixmap(x, top, icon.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+        }
+    }
+
+    /// NukeTelegraphPass: at each nuke's target, the inner blast radius as a
+    /// faint red disc with a solid edge and the outer radius as a dashed red
+    /// ring that turns slowly.
+    fn draw_nuke_targets(&mut self, nukes: &[(u32, u16, u16)]) {
+        if !nukes.is_empty() {
+            self.overlay_counts.0 += 1;
+        }
+        let t = self.frame_no as f32 / 30.0;
+        let alpha = 0.85 + 0.1 * (t * 3.0).sin();
+        let scale = self.scale as f32;
+        let stroke_w = (1.5 * scale).max(1.0);
+        let red = |a: f32| {
+            let mut p = Paint::default();
+            p.set_color(Color::from_rgba(1.0, 0.0, 0.0, a.clamp(0.0, 1.0)).unwrap());
+            p.anti_alias = true;
+            p
+        };
+        for &(tile, inner, outer) in nukes {
+            let (x, y) = (self.to_x(tile as i32) as f32, self.to_y(tile as i32) as f32);
+            let (ri, ro) = (inner as f32 * scale, outer as f32 * scale);
+            let Some(disc) = PathBuilder::from_circle(x, y, ri) else { continue };
+            self.canvas.fill_path(&disc, &red(alpha - 0.6), FillRule::Winding, Transform::identity(), None);
+            let edge = Stroke { width: stroke_w, ..Default::default() };
+            self.canvas.stroke_path(&disc, &red(alpha), &edge, Transform::identity(), None);
+            let Some(ring) = PathBuilder::from_circle(x, y, ro) else { continue };
+            let dash = tiny_skia::StrokeDash::new(vec![12.0 * scale, 6.0 * scale], t * 20.0 * scale);
+            let ring_stroke = Stroke { width: stroke_w, dash, ..Default::default() };
+            self.canvas.stroke_path(&ring, &red(alpha), &ring_stroke, Transform::identity(), None);
+        }
+    }
+
     /// Names: the engine's placement, sized like the client's name pass.
     fn draw_names(&mut self, labels: &[Label]) {
-        let s = &self.settings;
         let (scale, u, out_w) = (self.scale, self.u, self.out_w as f64);
         for n in labels {
+            let s = &self.settings;
             let base = n.size.floor().max(1.0);
             let name_size = (base * s.name_scale_factor).floor().max(4.0);
             let name_scale = (base * 0.25).min(s.name_scale_cap);
@@ -564,6 +677,7 @@ impl Renderer {
             // The troop line sits 1.1 baselines below the name (name.vert.glsl);
             // the font's baseline is 36/48 of its size.
             let lines = [(&n.name, y, em), (&n.troops, y + em * 0.75 * 1.1, em * s.troop_size_multiplier)];
+            let mut name_x = None;
             for (text, ly, size) in lines {
                 // ctx.font = `${size.toFixed(1)}px ...`
                 let size10 = (size * 10.0).round() as u32;
@@ -572,6 +686,7 @@ impl Renderer {
                 // Keep the text inside the video; the game would let you pan to it.
                 let half = self.font.measure(&line, font_size) as f64 / 2.0 + 2.0 * u;
                 let x = (n.x * scale).max(half).min(half.max(out_w - half));
+                name_x.get_or_insert(x);
                 let ((ix, fx), (iy, fy)) = (quarter(x - (half - 2.0 * u)), quarter(ly));
                 let key = TextKey { text: text.clone(), size10, owner: n.owner, fx, fy };
                 let frame = self.frame_no;
@@ -594,6 +709,9 @@ impl Renderer {
                 p.used = frame;
                 self.canvas.draw_pixmap(ix + p.dx, iy + p.dy, p.pixmap.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
             }
+            if n.status != 0 {
+                self.draw_status(n.status, name_x.unwrap_or(n.x * scale), y, em);
+            }
         }
     }
 
@@ -603,7 +721,7 @@ impl Renderer {
     }
 
     /// Draws the current state; returns the frame as RGBA.
-    pub fn draw(&mut self, units: &[i32], labels: &[Label], progress: f64) -> &[u8] {
+    pub fn draw(&mut self, units: &[i32], labels: &[Label], nukes: &[(u32, u16, u16)], progress: f64) -> &[u8] {
         let mut lap = std::time::Instant::now();
         let mut step = |r: &mut Renderer, name: &'static str| {
             if let Some(p) = &mut r.profile {
@@ -623,6 +741,7 @@ impl Renderer {
         let bytes = unsafe { std::slice::from_raw_parts(self.base.as_ptr() as *const u8, self.base.len() * 4) };
         self.canvas.data_mut().copy_from_slice(bytes);
         step(self, "copy map");
+        self.draw_nuke_targets(nukes);
         // Boats and trains, then structures, then missiles on top (as UnitPass).
         for pass in 0..3 {
             for u in units.chunks_exact(4) {

@@ -13,6 +13,8 @@ pub static THEME: &str = include_str!(concat!(env!("OUT_DIR"), "/default-theme.j
 pub static RENDER_SETTINGS: &str = include_str!(concat!(env!("OUT_DIR"), "/render-settings.json"));
 pub static ICON_ATLAS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/icon-atlas.png"));
 pub static UNIT_ATLAS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/unit-atlas.png"));
+/// Status icons above names (crown, traitor, ...): 256 px cells, 3 columns, 16 px padding.
+pub static STATUS_ATLAS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/status-atlas.png"));
 pub static FONT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/overpass-bold.ttf"));
 /// The OpenFrontIO commit the assets came from (empty if unknown).
 pub static ENGINE_COMMIT: &str = env!("OPENFRONT_ENGINE_COMMIT");

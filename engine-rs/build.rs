@@ -46,6 +46,7 @@ fn main() {
     copy(res.join("tribeNameThemes.json"), "tribeNameThemes.json");
     copy(res.join("atlases/icon-atlas.png"), "icon-atlas.png");
     copy(res.join("atlases/unit-atlas.png"), "unit-atlas.png");
+    copy(res.join("atlases/status-atlas.png"), "status-atlas.png");
     let gl = engine.join("src/client/render/gl");
     copy(gl.join("default-theme.json"), "default-theme.json");
     copy(gl.join("render-settings.json"), "render-settings.json");

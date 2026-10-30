@@ -123,6 +123,8 @@ struct DrawMsg {
     tiles: Vec<u32>,
     units: Arc<Vec<i32>>,
     labels: Arc<Vec<Label>>,
+    /// Nukes in flight: target tile and blast radii.
+    nukes: Arc<Vec<(u32, u16, u16)>>,
     /// How many video frames show it.
     repeat: u32,
 }
@@ -287,6 +289,7 @@ fn run() -> Result<(), String> {
     let mut last_print = sim_start;
     let mut sent = 0u64;
     let mut last: (Arc<Vec<i32>>, Arc<Vec<Label>>) = (Arc::new(Vec::new()), Arc::new(Vec::new()));
+    let mut last_nukes: Arc<Vec<(u32, u16, u16)>> = Arc::new(Vec::new());
     let mut stopped = false;
     let send = |msg: DrawMsg, sim: &mut Span| -> bool {
         let w0 = Instant::now();
@@ -317,16 +320,19 @@ fn run() -> Result<(), String> {
                     x: n.x,
                     y: n.y,
                     size: n.size,
+                    status: f.status.iter().find(|s| s.0 as u32 == n.small_id).map_or(0, |s| s.1),
                 }
             })
             .collect();
         last = (Arc::new(f.units), Arc::new(labels));
+        last_nukes = Arc::new(f.nuke_targets);
         let msg = DrawMsg {
             progress: f.tick as f64 / total_ticks as f64,
             styles,
             tiles: f.tiles,
             units: last.0.clone(),
             labels: last.1.clone(),
+            nukes: last_nukes.clone(),
             repeat: f.repeat,
         };
         sent += f.repeat as u64;
@@ -365,7 +371,15 @@ fn run() -> Result<(), String> {
     // Frames past the last tick, then the hold, repeat the final state.
     let rest = (frames + hold_frames).saturating_sub(sent);
     if rest > 0 && !stopped {
-        let msg = DrawMsg { progress: 1.0, styles: Vec::new(), tiles: Vec::new(), units: last.0, labels: last.1, repeat: rest as u32 };
+        let msg = DrawMsg {
+            progress: 1.0,
+            styles: Vec::new(),
+            tiles: Vec::new(),
+            units: last.0,
+            labels: last.1,
+            nukes: last_nukes.clone(),
+            repeat: rest as u32,
+        };
         send(msg, &mut sim);
     }
     drop(to_draw);
@@ -469,7 +483,7 @@ fn draw_thread(
             r.set_style(id, s);
         }
         r.apply_tiles(&msg.tiles);
-        let frame = Arc::new(r.draw(&msg.units, &msg.labels, msg.progress).to_vec());
+        let frame = Arc::new(r.draw(&msg.units, &msg.labels, &msg.nukes, msg.progress).to_vec());
         span.busy += d0.elapsed();
         span.end = Some(Instant::now());
         let w0 = Instant::now();
@@ -484,6 +498,11 @@ fn draw_thread(
     if let Some(p) = &r.profile {
         let rows: Vec<String> = p.iter().map(|(k, d)| format!("{k} {:.0} ms", d.as_secs_f64() * 1000.0)).collect();
         eprintln!("draw profile: {}", rows.join(", "));
+        let (nuke_frames, icons) = r.overlay_counts;
+        eprintln!(
+            "overlays: {nuke_frames} frames with nuke targets; icons drawn: crown {}, traitor {}, disconnected {}, nuke {}, doomsday {}",
+            icons[0], icons[1], icons[2], icons[8], icons[10]
+        );
     }
     Ok(span)
 }

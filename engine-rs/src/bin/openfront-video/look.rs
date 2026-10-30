@@ -482,6 +482,8 @@ pub struct Settings {
     pub name_scale_cap: f64,
     pub troop_size_multiplier: f64,
     pub outline_width: f64,
+    /// How far above the name the status icons sit, in name heights.
+    pub status_row_offset: f64,
     pub name_shade_nation: f64,
     pub name_shade_bot: f64,
 }
@@ -515,6 +517,7 @@ impl Settings {
             name_scale_cap: f(&name["nameScaleCap"]),
             troop_size_multiplier: f(&name["troopSizeMultiplier"]),
             outline_width: f(&name["outlineWidth"]),
+            status_row_offset: f(&name["statusRowOffset"]),
             name_shade_nation: f(&name["nameShadeNation"]),
             name_shade_bot: f(&name["nameShadeBot"]),
         }
