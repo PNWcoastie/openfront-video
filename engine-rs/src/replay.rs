@@ -110,6 +110,8 @@ pub fn setup(record: &Value, res: &dyn Resources) -> (Game, Vec<Vec<Value>>) {
         overtime_enabled: gc["overtime"]["enabled"].as_bool().unwrap_or(false),
         overtime_start_minutes: gc["overtime"]["startMinutes"].as_f64().unwrap_or(30.0),
         max_timer_minutes: gc["maxTimerValue"].as_f64(),
+        humans_vs_nations: is_team && gc["playerTeams"] == "Humans Vs Nations",
+        is_public: gc["gameType"] == "Public",
         doomsday_speed: (gc["doomsdayClock"]["enabled"].as_bool() == Some(true))
             .then(|| gc["doomsdayClock"]["speed"].as_str().unwrap_or("normal").to_string()),
     };
@@ -139,15 +141,23 @@ pub fn setup(record: &Value, res: &dyn Resources) -> (Game, Vec<Vec<Value>>) {
     let nations = if gc["nations"] == "disabled" {
         Vec::new()
     } else {
-        assert!(!is_team, "nations in team games are not ported yet");
         let public = gc["gameType"] == "Public";
-        create_nations(&gc["nations"], &manifest, compact, public, &mut random)
+        let hvn = is_team && gc["playerTeams"] == "Humans Vs Nations";
+        create_nations(&gc["nations"], &manifest, compact, public, hvn.then_some(humans.len()), &mut random)
     };
+    // Team spawn areas only steer random spawn points (nations, random spawn).
+    assert!(
+        !is_team
+            || (nations.is_empty() && !config.random_spawn)
+            || manifest["teamGameSpawnAreas"].as_object().is_none_or(|a| a.is_empty()),
+        "maps with team spawn areas are not ported yet"
+    );
     // resolveTeamsList: a team count, or Duos/Trios/Quads (players per team).
     let teams = if is_team {
         let total = humans.len() + nations.len();
         Some(match &gc["playerTeams"] {
-            Value::Number(n) => game::TeamSetup { count: n.as_u64().unwrap() as usize, duos_trios_quads: false },
+            Value::Number(n) => game::TeamSetup { count: n.as_u64().unwrap() as usize, duos_trios_quads: false, humans_vs_nations: false },
+            Value::String(s) if s == "Humans Vs Nations" => game::TeamSetup { count: 2, duos_trios_quads: false, humans_vs_nations: true },
             Value::String(s) => {
                 let per_team = match s.as_str() {
                     "Duos" => 2,
@@ -155,7 +165,7 @@ pub fn setup(record: &Value, res: &dyn Resources) -> (Game, Vec<Vec<Value>>) {
                     "Quads" => 4,
                     other => panic!("team mode {other} is not ported yet"),
                 };
-                game::TeamSetup { count: total.div_ceil(per_team).max(2), duos_trios_quads: true }
+                game::TeamSetup { count: total.div_ceil(per_team).max(2), duos_trios_quads: true, humans_vs_nations: false }
             }
             other => panic!("team setting {other} is not ported yet"),
         })
@@ -362,7 +372,14 @@ pub fn create_exec(game: &Game, intent: &Value) -> Exec {
 /// nations (the manifest's shuffled, then its additionalNations, then
 /// generated names); "default" takes the manifest's, or a shuffled quarter
 /// of them on a public compact map. Compact maps halve the coordinates.
-fn create_nations(setting: &Value, manifest: &Value, compact: bool, public: bool, random: &mut PseudoRandom) -> Vec<game::NationInfo> {
+fn create_nations(
+    setting: &Value,
+    manifest: &Value,
+    compact: bool,
+    public: bool,
+    humans_vs_nations: Option<usize>,
+    random: &mut PseudoRandom,
+) -> Vec<game::NationInfo> {
     let list = |k: &str| manifest[k].as_array().cloned().unwrap_or_default();
     let scale = |v: i64| if compact { v.div_euclid(2) } else { v };
     let nation = |n: &Value, random: &mut PseudoRandom| game::NationInfo {
@@ -370,7 +387,13 @@ fn create_nations(setting: &Value, manifest: &Value, compact: bool, public: bool
         info: nation_info(n["name"].as_str().unwrap().to_string(), random),
     };
     let manifest_nations = list("nations");
-    let Some(target) = setting.as_f64() else {
+    // Public Humans vs Nations: as many nations as humans.
+    let target = match (setting.as_f64(), humans_vs_nations) {
+        (Some(n), _) => Some(n),
+        (None, Some(humans)) if public => Some(humans as f64),
+        _ => None,
+    };
+    let Some(target) = target else {
         assert_eq!(setting, "default", "an unknown nations setting");
         if public && compact {
             // getCompactMapNationCount: a quarter, at least one.
@@ -519,6 +542,10 @@ pub struct Frame {
     /// Active units as [code, tile, owner, underConstruction] quads.
     pub units: Vec<i32>,
     pub names: Vec<NameView>,
+    /// Status icon bits (game::STATUS_*) of alive players that have any, by small ID.
+    pub status: Vec<(u16, u8)>,
+    /// Nukes in flight: target tile and blast radii (inner, outer).
+    pub nuke_targets: Vec<(u32, u16, u16)>,
 }
 
 /// Plays every turn and hands over the state at each of `frames` video
@@ -643,7 +670,16 @@ impl FrameStream {
                 })
             })
             .collect();
-        Frame { tick, repeat, new_players, tiles, units: game.frame_units(), names }
+        Frame {
+            tick,
+            repeat,
+            new_players,
+            tiles,
+            units: game.frame_units(),
+            names,
+            status: game.frame_status(),
+            nuke_targets: game.frame_nuke_targets(),
+        }
     }
 }
 

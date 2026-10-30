@@ -90,6 +90,8 @@ pub struct Player {
     pub units_constructed: HashMap<&'static str, u32>,
     pub last_delete_unit_tick: i64,
     pub last_embargo_all_tick: i64,
+    /// Lifetime gold income (PlayerImpl.goldEarned): everything addGold added.
+    pub gold_earned: i64,
     /// The tick the Doomsday Clock marked this player (-1: not marked).
     pub marked_doomsday_tick: i64,
 }
@@ -144,6 +146,8 @@ pub struct Unit {
     pub destroyer: Option<usize>,
     /// A MIRV's target player captured at launch (Unit.targetPlayer).
     pub mirv_target: Option<usize>,
+    /// Unit.reachedTarget: a nuke that detonated (not intercepted).
+    pub reached_target: bool,
 }
 
 pub const TRANSPORT_SHIP: &str = "Transport";
@@ -183,6 +187,9 @@ pub struct Config {
     pub max_timer_minutes: Option<f64>,
     /// The Doomsday Clock's speed preset, when it is on.
     pub doomsday_speed: Option<String>,
+    /// Humans on one team, nations on the other.
+    pub humans_vs_nations: bool,
+    pub is_public: bool,
 }
 
 impl Config {
@@ -511,12 +518,24 @@ impl Game {
         }
         if g.config.is_team_mode {
             let setup = teams.expect("team setup");
-            g.player_teams = resolve_teams_list(setup.count);
-            let max_team_size = humans.len().div_ceil(g.player_teams.len());
-            let teams = g.player_teams.clone();
-            for (info, team) in assign_teams(&humans, &teams, setup.duos_trios_quads, max_team_size) {
-                if let Some(team) = team {
-                    g.add_player(info, Some(team));
+            if setup.humans_vs_nations {
+                g.player_teams = vec!["Humans".to_string(), "Nations".to_string()];
+                for h in humans {
+                    g.add_player(h, Some("Humans".to_string()));
+                }
+                for n in nations {
+                    g.add_player(n, Some("Nations".to_string()));
+                }
+            } else {
+                // Humans and nations are dealt into the teams together.
+                g.player_teams = resolve_teams_list(setup.count);
+                let all: Vec<PlayerInfo> = humans.into_iter().chain(nations).collect();
+                let max_team_size = all.len().div_ceil(g.player_teams.len());
+                let teams = g.player_teams.clone();
+                for (info, team) in assign_teams(&all, &teams, setup.duos_trios_quads, max_team_size) {
+                    if let Some(team) = team {
+                        g.add_player(info, Some(team));
+                    }
                 }
             }
         } else {
@@ -580,6 +599,7 @@ impl Game {
             units_constructed: HashMap::new(),
             last_delete_unit_tick: -1,
             last_embargo_all_tick: -1,
+            gold_earned: 0,
             marked_doomsday_tick: -1,
         };
         self.players_by_id.insert(player.info.id.clone(), idx);
@@ -1358,7 +1378,7 @@ impl Game {
         let inc = self.troop_increase_rate(p);
         self.add_troops(p, inc);
         let gold = self.gold_addition_rate(p);
-        self.players[p].gold += gold;
+        self.add_gold(p, gold);
         for al in self.players[p].alliances.clone() {
             if self.alliances[al].expires_at <= self.ticks {
                 self.expire_alliance(al);
@@ -1859,7 +1879,7 @@ impl Game {
             c.gold
         };
         if !skip_gold {
-            self.players[conqueror].gold += captured;
+            self.add_gold(conqueror, captured);
             self.remove_gold(conquered, gold);
         }
     }
@@ -2478,6 +2498,8 @@ fn js_sign(x: f64) -> f64 {
 pub struct TeamSetup {
     pub count: usize,
     pub duos_trios_quads: bool,
+    /// Humans on one team, nations on the other.
+    pub humans_vs_nations: bool,
 }
 
 /// TeamAssignment.resolveTeamsList for a team count.
@@ -2718,6 +2740,7 @@ impl Game {
             train_engine: false,
             destroyer: None,
             mirv_target: None,
+            reached_target: false,
         });
         self.grid_seq += 1;
         if type_name == TRAIN {
@@ -5131,9 +5154,9 @@ impl Game {
         let gold = crate::detmath::js_max(5000.0, base - visited * 5000.0);
         let gold = (gold * self.config.gold_multiplier).floor() as i64;
         if owner != station_owner {
-            self.players[station_owner].gold += gold;
+            self.add_gold(station_owner, gold);
         }
-        self.players[owner].gold += gold;
+        self.add_gold(owner, gold);
         te.trade_stops += 1;
     }
 
@@ -6112,11 +6135,11 @@ impl Game {
         let gold = (base * self.config.gold_multiplier).floor() as i64;
         let ship_owner = self.units[ship].owner;
         if te.was_captured {
-            self.players[ship_owner].gold += gold;
+            self.add_gold(ship_owner, gold);
         } else {
             let (src, dst) = (self.units[te.src_port].owner, self.units[te.dst_port].owner);
-            self.players[src].gold += gold;
-            self.players[dst].gold += gold;
+            self.add_gold(src, gold);
+            self.add_gold(dst, gold);
         }
     }
 
@@ -6231,7 +6254,7 @@ impl Game {
             if self.can_donate(sender, recipient, true) && amount > 0.0 {
                 let removed = self.remove_gold(sender, amount as i64);
                 if removed != 0 {
-                    self.players[recipient].gold += removed;
+                    self.add_gold(recipient, removed);
                     self.players[sender].sent_donations.push((recipient, self.ticks));
                     // calculateRelationUpdate (getGoldChunkSize)
                     let chunk = self.by_difficulty([2_500.0, 5_000.0, 12_500.0, 25_000.0]);
@@ -7201,6 +7224,7 @@ impl Game {
             }
         }
         ne.active = false;
+        self.units[nuke].reached_target = true;
         self.delete_unit(nuke);
     }
 
@@ -7715,6 +7739,13 @@ impl Game {
 // ── What the video needs: name placement (NameBoxCalculator) and units as
 // render.ts draws them ──
 
+/// Status icon bits in frame_status.
+pub const STATUS_CROWN: u8 = 1;
+pub const STATUS_TRAITOR: u8 = 2;
+pub const STATUS_DISCONNECTED: u8 = 4;
+pub const STATUS_NUKE: u8 = 8;
+pub const STATUS_DOOMSDAY: u8 = 16;
+
 /// render.ts STRUCTURES order; structure codes start at 16.
 const RENDER_STRUCTURES: [&str; 6] = [CITY, PORT, FACTORY, DEFENSE_POST, SAM_LAUNCHER, MISSILE_SILO];
 
@@ -7822,6 +7853,76 @@ impl Game {
     }
 
     /// Active units as render.ts collectUnits builds them: [code, tile, owner, underConstruction].
+    /// The client's status icons for each alive player (PlayerStatus.ts,
+    /// replay mode): STATUS_* bits by small ID. Only players with a bit set.
+    pub fn frame_status(&self) -> Vec<(u16, u8)> {
+        // Crown: the alive player with the most tiles (the first on ties).
+        let mut crown = None;
+        let mut max_tiles = 0;
+        for p in &self.players {
+            if p.is_alive() && p.tiles.len() > max_tiles {
+                max_tiles = p.tiles.len();
+                crown = Some(p.small_id);
+            }
+        }
+        let mut nuking: Vec<u16> = Vec::new();
+        for p in &self.players {
+            for &u in &p.units {
+                let unit = &self.units[u];
+                if unit.active && matches!(unit.type_name, ATOM_BOMB | HYDROGEN_BOMB | "MIRV" | MIRV_WARHEAD) && !nuking.contains(&p.small_id) {
+                    nuking.push(p.small_id);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for (i, p) in self.players.iter().enumerate() {
+            if !p.is_alive() {
+                continue;
+            }
+            let mut bits = 0u8;
+            if crown == Some(p.small_id) {
+                bits |= STATUS_CROWN;
+            }
+            if self.is_traitor(i) {
+                bits |= STATUS_TRAITOR;
+            }
+            if p.is_disconnected {
+                bits |= STATUS_DISCONNECTED;
+            }
+            if nuking.contains(&p.small_id) {
+                bits |= STATUS_NUKE;
+            }
+            if self.in_doomsday(i) {
+                bits |= STATUS_DOOMSDAY;
+            }
+            if bits != 0 {
+                out.push((p.small_id, bits));
+            }
+        }
+        out
+    }
+
+    /// NukeTelegraphs: the target and blast radii (inner, outer) of every
+    /// nuke in flight that has launched (a MIRV warhead waits before it does).
+    pub fn frame_nuke_targets(&self) -> Vec<(u32, u16, u16)> {
+        let mut out = Vec::new();
+        for p in &self.players {
+            for &u in &p.units {
+                let unit = &self.units[u];
+                if !unit.active || !matches!(unit.type_name, ATOM_BOMB | HYDROGEN_BOMB | MIRV_WARHEAD) {
+                    continue;
+                }
+                let Some(target) = unit.target_tile else { continue };
+                if unit.nuke.as_ref().is_some_and(|n| n.wait_ticks > 0) {
+                    continue;
+                }
+                let (inner, outer) = Self::nuke_magnitude(unit.type_name);
+                out.push((target, inner as u16, outer as u16));
+            }
+        }
+        out
+    }
+
     pub fn frame_units(&self) -> Vec<i32> {
         let mut out = Vec::new();
         for p in &self.players {
@@ -7866,6 +7967,15 @@ pub struct NationInfo {
     pub spawn_cell: Option<(i64, i64)>,
 }
 
+struct BotSurroundings {
+    bot: usize,
+    borders_us: bool,
+    /// Touches water, the map edge, free land or anyone but us and bots we may attack.
+    open: bool,
+    /// The other bots it borders, in discovery order.
+    bots: Vec<usize>,
+}
+
 pub struct NationExec {
     active: bool,
     random: PseudoRandom,
@@ -7882,6 +7992,8 @@ pub struct NationExec {
     last_emoji_sent: Vec<(usize, u32)>,
     game_over: bool,
     bot_attack_troops_sent: f64,
+    /// Our landed beachheads already followed up by land, while they last.
+    followed_landings: Vec<usize>,
     boat_routes: Option<Vec<(usize, Option<BoatRoute>)>>,
     land_neighbors: Option<Vec<usize>>,
     structures: NationStructureState,
@@ -7914,6 +8026,7 @@ impl Game {
             last_emoji_sent: Vec::new(),
             game_over: false,
             bot_attack_troops_sent: 0.0,
+            followed_landings: Vec::new(),
             boat_routes: None,
             land_neighbors: None,
             structures: NationStructureState::default(),
@@ -7977,7 +8090,7 @@ impl Game {
                 ne.spawn_exec_added = true;
                 return;
             };
-            assert!(self.players[p].team.is_none(), "nations in team games are not ported yet");
+            // Team spawn areas are refused at setup, so the manifest cell stands.
             // randomSpawnLand
             let mut found = None;
             let (w, h) = (self.map.width as f64, self.map.height as f64);
@@ -8130,6 +8243,12 @@ impl Game {
         self.players[me].last_embargo_all_tick = self.ticks as i64;
     }
 
+    /// PlayerImpl.addGold: also counts toward lifetime income.
+    fn add_gold(&mut self, p: usize, gold: i64) {
+        self.players[p].gold += gold;
+        self.players[p].gold_earned += gold;
+    }
+
     /// One of four values by difficulty: Easy, Medium, Hard, Impossible.
     fn by_difficulty<T: Copy>(&self, v: [T; 4]) -> T {
         match self.config.difficulty.as_str() {
@@ -8141,10 +8260,10 @@ impl Game {
         }
     }
 
-    /// Nation AI is ported for Easy and Medium only.
+    /// Nation AI is ported for Easy, Medium and Hard.
     fn assert_nation_difficulty(&self) {
         assert!(
-            matches!(self.config.difficulty.as_str(), "Easy" | "Medium"),
+            matches!(self.config.difficulty.as_str(), "Easy" | "Medium" | "Hard"),
             "{} nations are not ported yet",
             self.config.difficulty
         );
@@ -8346,12 +8465,14 @@ impl Game {
         if let Some(w) = self.winner.clone() {
             ne.game_over = true;
             let winner = self.player_index(&w);
-            if winner == Some(p) {
+            if winner == Some(p) || self.players[p].team.as_ref() == Some(&w) {
                 if chance(ne, 2.0) {
                     self.emoji_send(ne, None, &["👑", "🥇", "😎", "💪", "😀"]);
                 }
+            } else if self.config.is_team_mode {
+                // Every nation congratulates when another team won.
+                self.emoji_send(ne, None, &["👏"]);
             } else {
-                assert!(!self.config.is_team_mode, "team games are not ported for nations");
                 if let Some(w) = winner {
                     let mut nations: Vec<usize> =
                         self.alive_players().into_iter().filter(|&q| self.players[q].info.player_type == PlayerType::Nation).collect();
@@ -8539,10 +8660,11 @@ impl Game {
     fn alliance_decision(&mut self, ne: &mut NationExec, other: usize, is_response: bool) -> bool {
         let p = ne.player.unwrap();
         self.assert_nation_difficulty();
-        let easy = self.config.difficulty == "Easy";
+        let d = self.config.difficulty.clone();
+        let (easy, hard) = (d == "Easy", d == "Hard");
         let chance = |ne: &mut NationExec, n: f64| ne.random.next_int(0.0, n) == 0.0;
         // isConfused
-        if chance(ne, if easy { 10.0 } else { 20.0 }) {
+        if chance(ne, self.by_difficulty([10.0, 20.0, 40.0, f64::INFINITY])) {
             return chance(ne, 2.0);
         }
         if self.is_traitor(other) && ne.random.next_int(0.0, 100.0) >= 10.0 {
@@ -8551,11 +8673,25 @@ impl Game {
             }
             return false;
         }
+        // hasTooManyAlliances (Hard): the other has allied with half the field.
+        if hard {
+            let total = self.alive_players().into_iter().filter(|&q| self.players[q].info.player_type != PlayerType::Bot).count() as f64;
+            let theirs = self.players[other].alliances.len() as f64 - if self.is_allied_with(other, p) { 1.0 } else { 0.0 };
+            if theirs >= total * 0.5 {
+                return false;
+            }
+        }
         if self.find_runaway_leader() == Some(other) {
             return false;
         }
-        // isAlliancePartnerThreat (Easy nations see no threats)
-        if !easy && self.players[other].troops_f() > self.players[p].troops_f() * 2.5 {
+        // isAlliancePartnerThreat: Easy sees none; Medium much more troops;
+        // Hard more troops and twice the max troops.
+        let threat = match d.as_str() {
+            "Easy" => false,
+            "Medium" => self.players[other].troops_f() > self.players[p].troops_f() * 2.5,
+            _ => self.players[other].troops_f() > self.players[p].troops_f() && self.max_troops(other) > self.max_troops(p) * 2.0,
+        };
+        if threat {
             if !is_response && chance(ne, 6.0) {
                 self.emoji_send(ne, Some(other), &["🙏", "🥺"]);
             }
@@ -8564,29 +8700,59 @@ impl Game {
             }
             return true;
         }
+        // shouldRejectInTeamGame
+        if self.config.is_team_mode && ne.random.next_int(0.0, 100.0) < self.by_difficulty([25.0, 50.0, 75.0, 101.0]) {
+            return false;
+        }
         if self.relation(p, other) < 2 {
             if is_response && chance(ne, 3.0) {
                 self.emoji_send(ne, Some(other), &["❓", "🤡"]);
             }
             return false;
         }
-        if self.relation(p, other) == 3 {
+        // isAlliancePartnerFriendly (Hard: 83% of the time)
+        if self.relation(p, other) == 3 && (!hard || ne.random.next_int(0.0, 100.0) >= 17.0) {
             if chance(ne, 3.0) {
                 self.emoji_send(ne, Some(other), &["🤝"]);
             }
             return true;
         }
-        // checkAlreadyEnoughAlliances (Easy nations never have enough)
-        if !easy && self.players[p].alliances.len() as f64 >= ne.random.next_int(4.0, 6.0) {
+        // checkAlreadyEnoughAlliances
+        let enough = match d.as_str() {
+            "Easy" => false,
+            "Medium" => self.players[p].alliances.len() as f64 >= ne.random.next_int(4.0, 6.0),
+            _ => {
+                // Hard: don't ally with all our neighbors (when there are 2+).
+                let bordering: Vec<usize> = self
+                    .nearby(p)
+                    .into_iter()
+                    .flatten()
+                    .filter(|&n| self.players[n].info.player_type != PlayerType::Bot)
+                    .collect();
+                let friends = bordering.iter().filter(|&&o| self.is_friendly(p, o, false)).count();
+                if bordering.len() >= 2 && bordering.contains(&other) {
+                    bordering.len() <= friends + 1
+                } else {
+                    self.players[p].alliances.len() as f64 >= ne.random.next_int(3.0, 5.0)
+                }
+            }
+        };
+        if enough {
             return false;
         }
-        // isEarlygame: Easy accepts 90% in the first 5 minutes, Medium 70% in the first 3
-        let (early, reject) = if easy { (3000.0, 10.0) } else { (1800.0, 30.0) };
+        // isEarlygame: Easy accepts 90% in the first 5 minutes, Medium 70% and Hard 50% in the first 3
+        let (early, reject) = self.by_difficulty([(3000.0, 10.0), (1800.0, 30.0), (1800.0, 50.0), (600.0, 70.0)]);
         if (self.ticks as f64) < early + self.config.num_spawn_phase_turns() as f64 && ne.random.next_int(0.0, 100.0) >= reject {
             return true;
         }
         // isAlliancePartnerSimilarlyStrong
-        let (troop_range, tile_range) = if easy { ((60.0, 70.0), (70.0, 80.0)) } else { ((70.0, 80.0), (80.0, 90.0)) };
+        let (troop_range, tile_range) = self.by_difficulty([
+            ((60.0, 70.0), (70.0, 80.0)),
+            ((70.0, 80.0), (80.0, 90.0)),
+            ((75.0, 85.0), (85.0, 95.0)),
+            ((80.0, 90.0), (90.0, 100.0)),
+        ]);
+        let _ = easy;
         let my_total = self.players[p].troops_f() + self.outgoing_troops(p);
         let other_total = self.players[other].troops_f() + self.outgoing_troops(other);
         let troop_threshold = my_total * (ne.random.next_int(troop_range.0, troop_range.1) / 100.0);
@@ -8594,21 +8760,78 @@ impl Game {
         other_total > troop_threshold || ((self.players[other].tiles.len() as f64) > tile_threshold && other_total > my_total * 0.5)
     }
 
-    /// maybeBetray (Easy and Medium; Easy nations don't betray humans for being weak,
-    /// nor traitors or a lone neighbor)
-    fn maybe_betray(&mut self, ne: &mut NationExec, other: usize, friends: usize, enemies: usize) -> bool {
+    /// NationUtils.findJuiciestTarget: the most structures (not defense posts or
+    /// silos), the emptiest troops and the most land, each normalized.
+    fn find_juiciest_target(&self, candidates: &[usize]) -> Option<usize> {
+        if candidates.is_empty() {
+            return None;
+        }
+        let stats: Vec<(usize, f64, f64, f64)> = candidates
+            .iter()
+            .map(|&q| {
+                let structures: u32 = self.players[q]
+                    .units
+                    .iter()
+                    .map(|&u| &self.units[u])
+                    .filter(|u| is_structure(u.type_name) && u.type_name != DEFENSE_POST && u.type_name != MISSILE_SILO)
+                    .map(|u| u.level)
+                    .sum();
+                let max = self.max_troops(q);
+                let gap = if max > 0.0 { 1.0 - self.players[q].troops_f() / max } else { 0.0 };
+                (q, structures as f64, gap, self.players[q].tiles.len() as f64)
+            })
+            .collect();
+        let norm = |v: f64, f: fn(&(usize, f64, f64, f64)) -> f64| {
+            let vals: Vec<f64> = stats.iter().map(f).collect();
+            let (min, max) = (vals.iter().cloned().fold(f64::INFINITY, f64::min), vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max));
+            if max > min { (v - min) / (max - min) } else { 0.0 }
+        };
+        let mut best = None;
+        let mut best_score = f64::NEG_INFINITY;
+        for s in &stats {
+            let score = norm(s.1, |s| s.1) + norm(s.2, |s| s.2) + norm(s.3, |s| s.3);
+            if score > best_score {
+                best_score = score;
+                best = Some(s.0);
+            }
+        }
+        best
+    }
+
+    fn outgoing_plus_troops(&self, q: usize) -> f64 {
+        self.players[q].troops_f() + self.outgoing_troops(q)
+    }
+
+    /// maybeBetray. Hard betrays its juiciest ally when that's safe; Easy and
+    /// Medium betray very weak allies (Easy not humans); all but Easy betray
+    /// traitors not much stronger, and a lone neighbor much weaker.
+    fn maybe_betray(&mut self, ne: &mut NationExec, other: usize, juiciest: Option<usize>, friends: &[usize], enemies: &[usize]) -> bool {
         let p = ne.player.unwrap();
         let Some(al) = self.alliance_with(p, other) else { return false };
-        let easy = self.config.difficulty == "Easy";
+        let d = self.config.difficulty.clone();
+        let easy = d == "Easy";
         let (mine, theirs) = (self.players[p].troops_f(), self.players[other].troops_f());
         let human = self.players[other].info.player_type == PlayerType::Human;
-        let betray = (!(easy && human) && mine >= theirs * 10.0)
+        let betray = (d == "Hard" && juiciest == Some(other) && self.safe_to_betray(p, other, friends, enemies))
+            || (matches!(d.as_str(), "Easy" | "Medium") && !(easy && human) && mine >= theirs * 10.0)
             || (!easy && self.is_traitor(other) && theirs < mine * 1.2)
-            || (!easy && friends + enemies == 1 && theirs * 3.0 < mine);
+            || (!easy && friends.len() + enemies.len() == 1 && theirs * 3.0 < mine);
         if betray {
             self.break_alliance(p, al);
         }
         betray
+    }
+
+    /// isSafeToBetray: the target, our non-allied neighbors and (unless the
+    /// target is a traitor) our other allies hold under a third of our troops.
+    fn safe_to_betray(&self, p: usize, target: usize, friends: &[usize], enemies: &[usize]) -> bool {
+        let others: Vec<usize> = if self.is_traitor(target) {
+            Vec::new()
+        } else {
+            friends.iter().copied().filter(|&f| f != target && self.is_allied_with(p, f)).collect()
+        };
+        let threat: f64 = std::iter::once(target).chain(enemies.iter().copied()).chain(others).map(|q| self.outgoing_plus_troops(q)).sum();
+        threat < self.players[p].troops_f() * 0.33
     }
 
     // ── Embargoes ──
@@ -8634,9 +8857,15 @@ impl Game {
     fn nation_handle_embargoes_to_hostile(&mut self, ne: &mut NationExec) {
         let p = ne.player.unwrap();
         let hard = matches!(self.config.difficulty.as_str(), "Hard" | "Impossible");
-        assert!(!self.config.is_team_mode, "team games are not ported for nations");
         for other in self.alive_players() {
             if other == p {
+                continue;
+            }
+            // Team games, Hard and up: no trade with anyone off the team (bots aside).
+            if self.config.is_team_mode && hard && self.players[other].info.player_type != PlayerType::Bot && !self.is_on_same_team(p, other) {
+                if !self.has_embargo_against(p, other) {
+                    self.add_embargo(p, other, false);
+                }
                 continue;
             }
             let rel = self.relation(p, other);
@@ -8660,13 +8889,169 @@ impl Game {
         self.add_execution(e);
     }
 
-    fn nation_follow_up_landings(&mut self, _ne: &mut NationExec) {
-        // Medium nations don't land beachheads.
+    /// Hard & Impossible boats are beachheads: the moment one lands (its attack
+    /// starts at the landing tile), attack its target by land from there, once.
+    fn nation_follow_up_landings(&mut self, ne: &mut NationExec) {
+        if !self.lands_beachheads() {
+            return;
+        }
+        let p = ne.player.unwrap();
+        let attacks = self.players[p].outgoing.clone();
+        ne.followed_landings.retain(|a| attacks.contains(a));
+        for a in attacks {
+            let Some(landing) = self.attacks[a].source_tile else { continue };
+            if ne.followed_landings.contains(&a) {
+                continue;
+            }
+            ne.followed_landings.push(a);
+            let target = self.attacks[a].target;
+            if !self.holds_land_next_to(target, landing) {
+                continue;
+            }
+            self.nation_send_land_attack(ne, target, None, target);
+        }
+    }
+
+    fn holds_land_next_to(&self, owner: Neighbor, tile: u32) -> bool {
+        let mut nb = [0u32; 4];
+        let n = self.map.neighbors4(tile, &mut nb);
+        nb[..n].iter().any(|&t| self.map.is_land(t) && !self.map.is_impassable(t) && self.owner_index(t) == owner)
+    }
+
+    fn lands_beachheads(&self) -> bool {
+        matches!(self.config.difficulty.as_str(), "Hard" | "Impossible")
+    }
+
+    /// troopSendCap: Hard & Impossible keep back a share of their strongest
+    /// hostile neighbor's troops, unless answering incoming attacks.
+    fn troop_send_cap(&self, p: usize, ignore: Option<usize>) -> f64 {
+        let mut cap = self.neighbor_troop_cap(p, ignore);
+        let incoming = self.incoming_attacks(p);
+        if !incoming.is_empty() {
+            cap = cap.max(self.sum_troops(&incoming));
+        }
+        cap
+    }
+
+    fn neighbor_troop_cap(&self, p: usize, ignore: Option<usize>) -> f64 {
+        if self.config.is_team_mode {
+            return f64::INFINITY;
+        }
+        let retain = match self.config.difficulty.as_str() {
+            "Hard" => 0.75,
+            "Impossible" => 0.9,
+            _ => return f64::INFINITY,
+        };
+        let mut max = 0.0;
+        for n in self.nearby(p).into_iter().flatten() {
+            if Some(n) == ignore || self.is_friendly(p, n, false) || self.players[n].info.player_type == PlayerType::Bot {
+                continue;
+            }
+            if self.players[n].troops_f() > max {
+                max = self.players[n].troops_f();
+            }
+        }
+        if max == 0.0 {
+            return f64::INFINITY;
+        }
+        (self.players[p].troops_f() - (max * retain).ceil()).max(0.0)
+    }
+
+    /// expansionTroopCap: troopSendCap, but free land is throttled, not frozen.
+    fn expansion_troop_cap(&self, p: usize) -> f64 {
+        let cap = self.troop_send_cap(p, None);
+        if cap > 0.0 { cap } else { (self.players[p].troops_f() * 0.05).ceil() }
+    }
+
+    /// isAttackTooWeak: Hard & Impossible FFA nations don't send under 20% of the target's troops.
+    fn is_attack_too_weak(&self, p: usize, troops: f64, target: usize) -> bool {
+        if self.config.is_team_mode || !self.incoming_attacks(p).is_empty() {
+            return false;
+        }
+        self.lands_beachheads() && troops < self.players[target].troops_f() * 0.2
+    }
+
+    /// Hard & Impossible: top up what already attacks the bot, or wait until we can send it all.
+    fn nation_bot_attack_troops(&self, p: usize, bot: usize, max: f64) -> f64 {
+        match self.config.difficulty.as_str() {
+            "Easy" => max,
+            "Medium" => {
+                let mut troops = self.players[bot].troops_f() * 4.0;
+                if troops > max {
+                    troops = if max < self.players[bot].troops_f() * 2.0 { 0.0 } else { max };
+                }
+                troops
+            }
+            _ => {
+                let troops = self.bot_attack_troops_needed(p, bot) * 1.3 - self.our_stack_against(p, bot);
+                if troops <= max { troops } else { 0.0 }
+            }
+        }
+    }
+
+    /// Keeps the attack at its cheapest loss rate until the bot collapses below 100 tiles.
+    fn bot_attack_troops_needed(&self, p: usize, bot: usize) -> f64 {
+        let stack = (self.players[bot].troops_f() / 0.6).max(1.0);
+        let tiles = (self.players[bot].tiles.len() as f64 - 100.0).max(0.0);
+        stack.max(tiles * self.bot_tile_loss(p, bot, stack))
+    }
+
+    /// Troops lost per tile at that stack; Hard assumes highland.
+    fn bot_tile_loss(&self, p: usize, bot: usize, stack: f64) -> f64 {
+        self.assert_nation_difficulty();
+        let a = &self.players[p];
+        let dp = &self.players[bot];
+        let mut mag = 100.0;
+        if matches!(a.info.player_type, PlayerType::Human | PlayerType::Nation) && dp.info.player_type == PlayerType::Bot {
+            mag *= 0.7;
+        }
+        let large_attacker_bonus = 1.0 - 0.7 * territory_sigmoid(a.tiles.len() as f64);
+        let large_defender_bonus = 1.0 - 0.3 * territory_sigmoid(dp.tiles.len() as f64);
+        let traitor_loss_mod = if self.is_traitor(bot) { 0.5 } else { 1.0 };
+        let defender_troops = dp.troops_f();
+        let defender_loss = defender_troops / dp.tiles.len() as f64;
+        mag * traitor_loss_mod
+            * within(defender_troops / stack, 0.6, 2.0)
+            * (0.463 * large_attacker_bonus * large_defender_bonus + 0.0039 * defender_loss)
+    }
+
+    /// Land attacks on the same target merge, so these troops join the next one,
+    /// while the target's attacks on us cancel out against it.
+    fn our_stack_against(&self, p: usize, target: usize) -> f64 {
+        let mut troops = 0.0;
+        for &a in &self.players[p].outgoing {
+            if self.attacks[a].target == Some(target) && self.attacks[a].source_tile.is_none() {
+                troops += self.attacks[a].troops;
+            }
+        }
+        for a in self.incoming_attacks(p) {
+            if self.attacks[a].attacker == target {
+                troops -= self.attacks[a].troops;
+            }
+        }
+        troops
+    }
+
+    /// A 1% boat, if the land attack following its landing would be worth making now.
+    fn nation_send_beachhead(&mut self, ne: &mut NationExec, target: Neighbor, landing: u32) -> bool {
+        let Some(troops) = self.nation_attack_troops(ne, target, None, target) else { return false };
+        let p = ne.player.unwrap();
+        let boat = (self.players[p].troops_f() / 100.0).floor().max(1.0);
+        if target.is_some_and(|t| self.players[t].info.player_type == PlayerType::Bot) {
+            ne.bot_attack_troops_sent += boat - troops;
+        }
+        let e = self.new_transport(p, landing as f64, Some(boat));
+        self.add_execution(e);
+        true
+    }
+
+    fn max_boat_route(&self) -> f64 {
+        self.by_difficulty([f64::INFINITY, f64::INFINITY, 300.0, 500.0])
     }
 
     fn nation_should_attack(&mut self, ne: &mut NationExec, target: Neighbor) -> bool {
         let Some(o) = target else { return true };
-        if self.players[o].info.player_type != PlayerType::Human || self.is_traitor(o) {
+        if self.players[o].info.player_type != PlayerType::Human || self.is_traitor(o) || self.config.humans_vs_nations {
             return true;
         }
         match self.config.difficulty.as_str() {
@@ -8735,26 +9120,28 @@ impl Game {
     }
 
     /// calculateAttackTroops (nation override). `send` is the non-bot troop rule.
-    fn nation_attack_troops(&mut self, ne: &mut NationExec, target: Neighbor, send: Option<f64>) -> Option<f64> {
+    /// `opponent` is a player we take on on purpose: it doesn't count toward the
+    /// troop cap's threats, and troops already attacking it count toward the too-weak check.
+    fn nation_attack_troops(&mut self, ne: &mut NationExec, target: Neighbor, send: Option<f64>, opponent: Option<usize>) -> Option<f64> {
         let p = ne.player.unwrap();
         let reserve = self.nation_reserve_troops(ne, target);
         let is_bot = target.is_some_and(|t| self.players[t].info.player_type == PlayerType::Bot);
         let mine = self.players[p].troops_f();
-        let troops = if is_bot {
-            // calculateBotAttackTroops: Easy sends everything above the reserve
-            let t = target.unwrap();
-            let max = mine - reserve - ne.bot_attack_troops_sent;
-            let mut troops = if self.config.difficulty == "Easy" { max } else { self.players[t].troops_f() * 4.0 };
-            if troops > max {
-                troops = if max < self.players[t].troops_f() * 2.0 { 0.0 } else { max };
-            }
-            troops
+        let mut troops = if is_bot {
+            self.nation_bot_attack_troops(p, target.unwrap(), mine - reserve - ne.bot_attack_troops_sent)
         } else {
             send.unwrap_or(mine - reserve)
         };
-        // troopSendCap / expansionTroopCap: no cap below Hard.
+        let cap = if target.is_some() { self.troop_send_cap(p, opponent) } else { self.expansion_troop_cap(p) };
+        troops = troops.min(cap);
         if troops < 1.0 {
             return None;
+        }
+        if let Some(t) = target {
+            let pile_on = if opponent == Some(t) { self.incoming_troops(t) } else { 0.0 };
+            if self.is_attack_too_weak(p, troops + pile_on, t) {
+                return None;
+            }
         }
         if let Some(t) = target {
             self.emoji_maybe_send_attack(ne, t);
@@ -8765,8 +9152,8 @@ impl Game {
         Some(troops)
     }
 
-    fn nation_send_land_attack(&mut self, ne: &mut NationExec, target: Neighbor, send: Option<f64>, _opponent: Option<usize>) -> bool {
-        let Some(troops) = self.nation_attack_troops(ne, target, send) else { return false };
+    fn nation_send_land_attack(&mut self, ne: &mut NationExec, target: Neighbor, send: Option<f64>, opponent: Option<usize>) -> bool {
+        let Some(troops) = self.nation_attack_troops(ne, target, send, opponent) else { return false };
         let p = ne.player.unwrap();
         let id = target.map(|t| self.players[t].info.id.clone());
         let e = self.new_attack(Some(troops), p, id);
@@ -8792,16 +9179,22 @@ impl Game {
         out
     }
 
-    /// NationAttackBehavior.sail (Medium checks both shores, no pathfinding).
+    /// NationAttackBehavior.sail: Easy doesn't look, Medium checks both shores,
+    /// Hard & Impossible pathfind (past 20 tiles).
     fn nation_sail(&mut self, p: usize, launch: u32, target: u32, warships: &[usize]) -> (f64, Option<usize>) {
         let landing = self.target_transport_tile(p, target).unwrap_or(target);
         let direct = self.map.manhattan_dist(launch, landing) as f64;
         if self.config.difficulty == "Easy" {
             return (direct, None);
         }
-        self.assert_nation_difficulty();
-        let route = [launch, landing];
-        let length = direct;
+        let path = if self.config.difficulty == "Medium" || direct <= 20.0 {
+            None
+        } else {
+            self.water.find_path(&self.map, &[launch], landing)
+        };
+        let pathed = path.is_some();
+        let route = path.unwrap_or_else(|| vec![launch, landing]);
+        let length = if pathed { route.len() as f64 } else { direct };
         let range: i64 = 150;
         let (mut min_x, mut max_x, mut min_y, mut max_y) = (i64::MAX, i64::MIN, i64::MAX, i64::MIN);
         for &t in &route {
@@ -8817,12 +9210,13 @@ impl Game {
             if wx < min_x - range || wx > max_x + range || wy < min_y - range || wy > max_y + range {
                 continue;
             }
-            for &t in &route {
+            for (i, &t) in route.iter().enumerate() {
                 if self.dist2(wt, t) > range * range {
                     continue;
                 }
                 // Without a path the warship can fire as soon as we launch.
-                if 4.0 * length >= self.map.manhattan_dist(wt, t) as f64 - 10.0 {
+                let ticks_left = length - if pathed { i as f64 } else { 0.0 };
+                if 4.0 * ticks_left >= self.map.manhattan_dist(wt, t) as f64 - 10.0 {
                     return (length, Some(w));
                 }
                 break;
@@ -8913,12 +9307,19 @@ impl Game {
 
     fn nation_send_boat_attack(&mut self, ne: &mut NationExec, target: usize) -> bool {
         let Some(route) = self.nation_boat_route(ne, target) else { return false };
+        let p = ne.player.unwrap();
+        if self.lands_beachheads() {
+            // A beachhead boat is cheap enough to risk past a warship, one at a time.
+            if route.blocker.is_some() && self.unit_count(p, TRANSPORT_SHIP) > 0 {
+                return false;
+            }
+            return self.nation_send_beachhead(ne, Some(target), route.landing);
+        }
         if route.blocker.is_some() {
             return false;
         }
-        let p = ne.player.unwrap();
         let troops_now = self.players[p].troops_f() / 5.0;
-        let Some(troops) = self.nation_attack_troops(ne, Some(target), Some(troops_now)) else { return false };
+        let Some(troops) = self.nation_attack_troops(ne, Some(target), Some(troops_now), None) else { return false };
         let e = self.new_transport(p, route.landing as f64, Some(troops));
         self.add_execution(e);
         true
@@ -8954,8 +9355,11 @@ impl Game {
                 if self.nation_sail(p, launch, tile, &warships).1.is_some() {
                     continue;
                 }
-                // sendExpansionBoat (no expansion cap below Hard)
-                let troops = self.players[p].troops_f() / 5.0;
+                // sendExpansionBoat
+                if self.lands_beachheads() {
+                    return self.nation_send_beachhead(ne, None, tile);
+                }
+                let troops = (self.players[p].troops_f() / 5.0).min(self.expansion_troop_cap(p));
                 if troops < 1.0 {
                     return false;
                 }
@@ -8978,25 +9382,53 @@ impl Game {
         if self.nation_borders_by_land(ne, target) {
             return true;
         }
-        // maxBoatRoute: no limit below Hard
-        self.nation_boat_route(ne, target).is_some_and(|r| r.blocker.is_none())
+        let max = self.max_boat_route();
+        self.nation_boat_route(ne, target).is_some_and(|r| r.blocker.is_none() && r.length <= max)
     }
 
     fn nation_maybe_attack(&mut self, ne: &mut NationExec) {
         self.assert_nation_difficulty();
         ne.boat_routes = Some(Vec::new());
         self.nation_choose_attack(ne);
-        ne.land_neighbors = None;
-        ne.boat_routes = None;
-        // clearBlockedLane: Hard and Impossible only.
+        let p = ne.player.unwrap();
+        let land_front = ne.land_neighbors.take().unwrap_or_default().iter().any(|&n| !self.is_friendly(p, n, false));
+        let routes = ne.boat_routes.take().unwrap_or_default();
+        self.nation_clear_blocked_lane(ne, &routes, land_front);
+    }
+
+    /// Hard & Impossible send warships at whatever blocks the juiciest target they couldn't reach.
+    fn nation_clear_blocked_lane(&mut self, ne: &mut NationExec, routes: &[(usize, Option<BoatRoute>)], land_front: bool) {
+        if !self.lands_beachheads() {
+            return;
+        }
+        let p = ne.player.unwrap();
+        let max = self.max_boat_route();
+        let ffa = !self.config.is_team_mode;
+        let mut blocked: Vec<(usize, usize)> = Vec::new();
+        for &(target, route) in routes {
+            let Some(route) = route else { continue };
+            let Some(blocker) = route.blocker else { continue };
+            if (!land_front || route.length <= max) && (!ffa || self.players[target].troops_f() < self.players[p].troops_f()) {
+                blocked.push((target, blocker));
+            }
+        }
+        let keys: Vec<usize> = blocked.iter().map(|b| b.0).collect();
+        if let Some(target) = self.find_juiciest_target(&keys) {
+            let blocker = blocked.iter().find(|b| b.0 == target).unwrap().1;
+            self.clear_sea_lane(p, blocker);
+        }
     }
 
     fn nation_holds_boats_under_attack(&mut self, ne: &mut NationExec) -> bool {
         if self.nation_find_incoming_attack_player(ne.player.unwrap()).is_none() {
             return false;
         }
-        // Easy never holds its boats back; Medium half the time.
-        self.config.difficulty != "Easy" && ne.random.next_int(0.0, 2.0) == 0.0
+        // Easy never holds its boats back; Medium half the time; Hard & Impossible always.
+        match self.config.difficulty.as_str() {
+            "Easy" => false,
+            "Medium" => ne.random.next_int(0.0, 2.0) == 0.0,
+            _ => true,
+        }
     }
 
     fn nation_choose_attack(&mut self, ne: &mut NationExec) {
@@ -9071,8 +9503,17 @@ impl Game {
         if self.nation_sail(p, launch, dst, &warships).1.is_some() {
             return;
         }
-        let troops = self.players[p].troops_f() / 5.0;
+        let owner = self.owner_index(dst);
+        if self.lands_beachheads() {
+            self.nation_send_beachhead(ne, owner, dst);
+            return;
+        }
+        let cap = if owner.is_some() { self.troop_send_cap(p, None) } else { self.expansion_troop_cap(p) };
+        let troops = (self.players[p].troops_f() / 5.0).min(cap);
         if troops < 1.0 {
+            return;
+        }
+        if owner.is_some_and(|o| self.is_attack_too_weak(p, troops, o)) {
             return;
         }
         let e = self.new_transport(p, dst as f64, Some(troops));
@@ -9133,6 +9574,12 @@ impl Game {
 
     fn nation_attack_best_target(&mut self, ne: &mut NationExec, friends: &[usize], enemies: &[usize]) {
         let p = ne.player.unwrap();
+        let d = self.config.difficulty.clone();
+        // Hard & Impossible: answer attacks right away, even below the reserve and trigger ratios.
+        if self.lands_beachheads() && self.nation_retaliate(ne) {
+            return;
+        }
+        self.nation_annex_walled_in_bots(ne);
         // Bots go first when they hold structures, and with high starting gold
         // (measured without the cities built in a rush).
         let expand_first = self.high_starting_gold(p)
@@ -9144,92 +9591,185 @@ impl Game {
         if self.players[p].troops_f() / self.max_troops(p) < ne.reserve_ratio {
             return;
         }
-        let easy = self.config.difficulty == "Easy";
-        // Medium answers attacks before the trigger ratio; Easy only in its strategy list.
-        if !easy && self.nation_retaliate(ne) {
+        // Medium answers attacks without saving up to the trigger ratio first.
+        if d == "Medium" && self.nation_retaliate(ne) {
             return;
         }
         let trigger = self.players[p].troops_f() / self.max_troops(p) >= ne.trigger_ratio;
         if !trigger && ne.random.next_int(0.0, 10.0) != 0.0 {
             return;
         }
+        let order: &[&str] = match d.as_str() {
+            "Easy" => &["nuked", "bots", "retaliate", "assist", "betray", "hated", "weakest"],
+            "Medium" => &["bots", "nuked", "assist", "betray", "hated", "afk", "traitor", "crown", "weakest", "island", "donate"],
+            "Hard" => &[
+                "bots", "assist", "betray", "nuked", "traitor", "afk", "hated", "veryWeak", "juicy", "victim", "crown", "weakest", "island",
+                "donate",
+            ],
+            _ => &[
+                "bots", "veryWeak", "betray", "assist", "victim", "crown", "traitor", "juicy", "afk", "nuked", "hated", "weakest", "island",
+                "donate",
+            ],
+        };
+        let mut groups: Option<Vec<Vec<usize>>> = None;
+        for &strategy in order {
+            if self.nation_strategy(ne, strategy, &mut groups, friends, enemies) {
+                return;
+            }
+        }
+    }
+
+    fn nation_strategy(
+        &mut self,
+        ne: &mut NationExec,
+        strategy: &str,
+        groups: &mut Option<Vec<Vec<usize>>>,
+        friends: &[usize],
+        enemies: &[usize],
+    ) -> bool {
+        let p = ne.player.unwrap();
         let ffa = !self.config.is_team_mode;
         let my = self.players[p].troops_f();
-        if easy {
-            // Easy: nuked, bots, retaliate, assist, betray, hated, weakest
-            if self.nation_bordering_nuked_territory(p) && self.nation_send_attack(ne, None, false) {
-                return;
-            }
-            if self.nation_attack_bots(ne) || self.nation_retaliate(ne) || self.nation_assist_allies(ne) {
-                return;
-            }
-            if self.nation_betray_and_attack(ne, friends, enemies) || self.nation_attack_hated(ne) {
-                return;
-            }
-            let weakest = self.nation_pick(ne, enemies, |g, e| e.iter().copied().find(|&x| !ffa || g.players[x].troops_f() < my));
-            if let Some(t) = weakest {
-                self.nation_send_attack(ne, Some(t), false);
-            }
-            return;
-        }
-        // Medium: bots, nuked, assist, betray, hated, afk, traitor, crown, weakest, island, donate
-        if self.nation_attack_bots(ne) {
-            return;
-        }
-        if self.nation_bordering_nuked_territory(p) && self.nation_send_attack(ne, None, false) {
-            return;
-        }
-        if self.nation_assist_allies(ne) {
-            return;
-        }
-        if self.nation_betray_and_attack(ne, friends, enemies) {
-            return;
-        }
-        if self.nation_attack_hated(ne) {
-            return;
-        }
-        // afk
-        let afk = self.nation_pick(ne, enemies, |g, e| {
-            e.iter().copied().find(|&x| g.players[x].is_disconnected && (!ffa || g.players[x].troops_f() < my * 3.0))
-        });
-        if let Some(t) = afk {
-            if self.nation_send_attack(ne, Some(t), false) {
-                return;
-            }
-        }
-        // traitor
-        if !self.config.disable_alliances {
-            let traitor = self.nation_pick(ne, enemies, |g, e| {
-                e.iter().copied().find(|&x| g.is_traitor(x) && (!ffa || g.players[x].troops_f() < my * 1.2))
-            });
-            if let Some(t) = traitor {
-                if self.nation_send_attack(ne, Some(t), false) {
-                    return;
+        let attack = |g: &mut Game, ne: &mut NationExec, t: Option<usize>| t.is_some_and(|t| g.nation_send_attack(ne, Some(t), false));
+        match strategy {
+            "retaliate" => self.nation_retaliate(ne),
+            "bots" => self.nation_attack_bots(ne),
+            "assist" => self.nation_assist_allies(ne),
+            "betray" => self.nation_betray_and_attack(ne, friends, enemies),
+            "hated" => self.nation_attack_hated(ne),
+            "nuked" => self.nation_bordering_nuked_territory(p) && self.nation_send_attack(ne, None, false),
+            "traitor" => {
+                if self.config.disable_alliances {
+                    return false;
                 }
+                let t = self.nation_pick_in(ne, groups, enemies, |g, e| {
+                    e.iter().copied().find(|&x| g.is_traitor(x) && (!ffa || g.players[x].troops_f() < my * 1.2))
+                });
+                attack(self, ne, t)
             }
-        }
-        // crown
-        if let Some(leader) = self.nation_find_crown_target(p, enemies) {
-            if self.nation_should_attack(ne, Some(leader)) && self.nation_send_land_attack(ne, Some(leader), None, Some(leader)) {
-                return;
+            "afk" => {
+                let t = self.nation_pick_in(ne, groups, enemies, |g, e| {
+                    e.iter().copied().find(|&x| g.players[x].is_disconnected && (!ffa || g.players[x].troops_f() < my * 3.0))
+                });
+                attack(self, ne, t)
             }
-        }
-        // weakest
-        let weakest = self.nation_pick(ne, enemies, |g, e| e.iter().copied().find(|&x| !ffa || g.players[x].troops_f() < my));
-        if let Some(t) = weakest {
-            if self.nation_send_attack(ne, Some(t), false) {
-                return;
+            "veryWeak" => {
+                let t = self.nation_pick_in(ne, groups, enemies, |g, e| {
+                    e.iter().copied().find(|&x| {
+                        g.players[x].troops_f() < g.max_troops(x) * 0.15 && (!ffa || g.players[x].troops_f() < my * 1.2)
+                    })
+                });
+                attack(self, ne, t)
             }
-        }
-        // island
-        if self.nation_pick(ne, enemies, |_, e| e.first().copied()).is_none() {
-            if let Some(enemy) = self.nation_find_nearest_island_enemy(ne) {
-                if self.nation_send_attack(ne, Some(enemy), false) {
-                    return;
+            "juicy" => {
+                let t = self.nation_pick_in(ne, groups, enemies, |g, e| {
+                    let candidates: Vec<usize> = e.iter().copied().filter(|&x| g.players[x].troops_f() <= my * 0.75).collect();
+                    g.find_juiciest_target(&candidates)
+                });
+                attack(self, ne, t)
+            }
+            "victim" => {
+                let t = self.nation_pick_in(ne, groups, enemies, |g, e| {
+                    e.iter().copied().find(|&x| {
+                        !(ffa && g.players[x].troops_f() > my * 1.2) && g.incoming_troops(x) > g.players[x].troops_f() * 0.5
+                    })
+                });
+                attack(self, ne, t)
+            }
+            "crown" => match self.nation_find_crown_target(p, enemies) {
+                Some(leader) => self.nation_should_attack(ne, Some(leader)) && self.nation_send_land_attack(ne, Some(leader), None, Some(leader)),
+                None => false,
+            },
+            "weakest" => {
+                let t = self.nation_pick_in(ne, groups, enemies, |g, e| e.iter().copied().find(|&x| !ffa || g.players[x].troops_f() < my));
+                attack(self, ne, t)
+            }
+            "island" => {
+                if self.nation_pick_in(ne, groups, enemies, |_, e| e.first().copied()).is_some() {
+                    return false;
                 }
+                let enemy = self.nation_find_nearest_island_enemy(ne);
+                attack(self, ne, enemy)
+            }
+            "donate" => self.nation_donate_troops(ne),
+            _ => unreachable!(),
+        }
+    }
+
+    /// donateTroops: team games, not public ones (to balance HvN).
+    fn nation_donate_troops(&mut self, _ne: &mut NationExec) -> bool {
+        if !self.config.is_team_mode || self.config.is_public || !self.config.donate_troops || self.config.difficulty == "Easy" {
+            return false;
+        }
+        panic!("nations donating troops in private team games is not ported yet");
+    }
+
+    /// Target groups, tried in order: Hard & Impossible without a land front weigh
+    /// every enemy within boat range across the water alongside the bordering ones.
+    fn nation_target_groups(&mut self, ne: &mut NationExec, enemies: &[usize]) -> Vec<Vec<usize>> {
+        let p = ne.player.unwrap();
+        let land_front = enemies.iter().any(|&e| self.nation_borders_by_land(ne, e));
+        let by_troops = |g: &Game, v: &mut Vec<usize>| v.sort_by(|&a, &b| g.players[a].troops.cmp(&g.players[b].troops));
+        match self.config.difficulty.as_str() {
+            "Impossible" if land_front => {
+                let mut over = self.overseas_targets(p, enemies);
+                by_troops(self, &mut over);
+                vec![enemies.to_vec(), over]
+            }
+            "Hard" | "Impossible" if !land_front => {
+                let mut all = enemies.to_vec();
+                all.extend(self.overseas_targets(p, enemies));
+                by_troops(self, &mut all);
+                vec![all]
+            }
+            _ => vec![enemies.to_vec()],
+        }
+    }
+
+    /// Enemies across the water whose main territory is within boat range of ours.
+    fn overseas_targets(&self, p: usize, enemies: &[usize]) -> Vec<usize> {
+        if self.unit_count(p, TRANSPORT_SHIP) >= 3 {
+            return Vec::new();
+        }
+        let range = self.max_boat_route();
+        let ours = self.players[p].largest_cluster_box;
+        let ffa = !self.config.is_team_mode;
+        let gap = |a: Option<[i64; 4]>, b: Option<[i64; 4]>| -> f64 {
+            let (Some(a), Some(b)) = (a, b) else { return 0.0 };
+            let dx = 0.max(a[0] - b[2]).max(b[0] - a[2]);
+            let dy = 0.max(a[1] - b[3]).max(b[1] - a[3]);
+            (dx + dy) as f64
+        };
+        self.alive_players()
+            .into_iter()
+            .filter(|&q| {
+                q != p
+                    && self.players[q].info.player_type != PlayerType::Bot
+                    && !self.is_friendly(p, q, false)
+                    && !enemies.contains(&q)
+                    && (!ffa || self.players[q].troops_f() < self.players[p].troops_f())
+                    && gap(ours, self.players[q].largest_cluster_box) <= range
+            })
+            .collect()
+    }
+
+    /// getAttackStrategies' pick over the target groups.
+    fn nation_pick_in(
+        &mut self,
+        ne: &mut NationExec,
+        groups: &mut Option<Vec<Vec<usize>>>,
+        enemies: &[usize],
+        find: impl Fn(&Game, &[usize]) -> Option<usize>,
+    ) -> Option<usize> {
+        if groups.is_none() {
+            *groups = Some(self.nation_target_groups(ne, enemies));
+        }
+        for group in groups.clone().unwrap() {
+            if let Some(t) = self.nation_pick(ne, &group, &find) {
+                return Some(t);
             }
         }
-        // donate: team games only
+        None
     }
 
     /// maybeBetrayAndAttack: betray the first friend worth betraying and attack it.
@@ -9237,8 +9777,11 @@ impl Game {
         if self.config.disable_alliances {
             return false;
         }
+        // findJuiciestAlly: once per call, not per friend.
+        let allies: Vec<usize> = friends.iter().copied().filter(|&f| self.is_allied_with(ne.player.unwrap(), f)).collect();
+        let juiciest = self.find_juiciest_target(&allies);
         for &friend in friends {
-            if self.maybe_betray(ne, friend, friends.len(), enemies.len()) {
+            if self.maybe_betray(ne, friend, juiciest, friends, enemies) {
                 return self.nation_send_attack(ne, Some(friend), true);
             }
         }
@@ -9258,8 +9801,199 @@ impl Game {
     }
 
     fn nation_retaliate(&mut self, ne: &mut NationExec) -> bool {
-        let Some(attacker) = self.nation_find_incoming_attack_player(ne.player.unwrap()) else { return false };
+        let p = ne.player.unwrap();
+        let Some(attacker) = self.nation_find_incoming_attack_player(p) else { return false };
+        if self.lands_beachheads() && !self.config.is_team_mode && self.shares_border_with(p, self.players[attacker].small_id) {
+            return self.nation_send_retaliation(ne, attacker);
+        }
         self.nation_send_attack(ne, Some(attacker), true)
+    }
+
+    /// sendRetaliation: cancel the attacker's incoming troops, and push into its
+    /// land when we can also match its home army.
+    fn nation_send_retaliation(&mut self, ne: &mut NationExec, attacker: usize) -> bool {
+        let p = ne.player.unwrap();
+        let incoming: f64 = self.incoming_attacks(p).iter().filter(|&&a| self.attacks[a].attacker == attacker).map(|&a| self.attacks[a].troops).sum();
+        let pressing: f64 =
+            self.players[p].outgoing.iter().filter(|&&a| self.attacks[a].target == Some(attacker)).map(|&a| self.attacks[a].troops).sum();
+        let troops = self.players[p].troops_f();
+        let max = self.max_troops(p);
+        let spare = (troops - max * ne.expand_ratio).min(self.neighbor_troop_cap(p, Some(attacker)));
+        let above_reserve = troops - max * ne.reserve_ratio;
+        let counter = incoming + (self.players[attacker].troops_f() - pressing).max(0.0);
+        let send = if spare >= counter { counter.max(above_reserve.min(spare)) } else { incoming.min(spare.max(above_reserve)) };
+        self.nation_send_land_attack(ne, Some(attacker), Some(send), Some(attacker))
+    }
+
+    fn nation_neighboring_bots(&self, p: usize) -> Vec<usize> {
+        self.nearby(p)
+            .into_iter()
+            .flatten()
+            .filter(|&n| !self.is_friendly(p, n, false) && self.players[n].info.player_type == PlayerType::Bot)
+            .collect()
+    }
+
+    /// annexWalledInBots: a 1% attack makes the engine hand over a bot only we border.
+    fn nation_annex_walled_in_bots(&mut self, ne: &mut NationExec) {
+        if !self.lands_beachheads() {
+            return;
+        }
+        let p = ne.player.unwrap();
+        let bots = self.nation_neighboring_bots(p);
+        if bots.is_empty() {
+            return;
+        }
+        let troops = (self.players[p].troops_f() / 100.0).floor();
+        if troops < 1.0 {
+            return;
+        }
+        for bot in self.walled_in_bots(p, &bots) {
+            let e = self.new_attack(Some(troops), p, Some(self.players[bot].info.id.clone()));
+            self.add_execution(e);
+        }
+    }
+
+    fn attacked_by(&self, p: usize) -> Vec<usize> {
+        let mut out = Vec::new();
+        for &a in &self.players[p].outgoing {
+            if let Some(t) = self.attacks[a].target {
+                if !out.contains(&t) {
+                    out.push(t);
+                }
+            }
+        }
+        out
+    }
+
+    fn owns_structures(&self, p: usize) -> bool {
+        self.players[p].units.iter().any(|&u| is_structure(self.units[u].type_name))
+    }
+
+    /// BotAnnexation.walledInBots: bots that border only us and aren't under our attack yet.
+    fn walled_in_bots(&self, p: usize, bots: &[usize]) -> Vec<usize> {
+        let attacking = self.attacked_by(p);
+        bots.iter()
+            .copied()
+            .filter(|&b| !attacking.contains(&b) && self.bot_scan(p, b, true, Some(&[])).is_some_and(|s| s.borders_us))
+            .collect()
+    }
+
+    /// BotScanner.scan: what a bot's territory touches. Gives up (None) once the bot
+    /// turns out open if `closed_only`, or borders a bot outside `within`.
+    fn bot_scan(&self, p: usize, bot: usize, closed_only: bool, within: Option<&[usize]>) -> Option<BotSurroundings> {
+        let us = self.players[p].small_id;
+        let me = self.players[bot].small_id;
+        let mut s = BotSurroundings { bot, borders_us: false, open: false, bots: Vec::new() };
+        let mut nb = [0u32; 4];
+        for tile in self.players[bot].border_tiles.values() {
+            if self.map.is_ocean_shore(tile) || self.map.is_on_edge_of_map(tile) {
+                s.open = true;
+                if closed_only {
+                    return None;
+                }
+                continue;
+            }
+            let n = self.map.neighbors4(tile, &mut nb);
+            for &t in &nb[..n] {
+                let id = self.map.owner_id(t);
+                if id == me {
+                    continue;
+                }
+                if id == us {
+                    s.borders_us = true;
+                    continue;
+                }
+                let other = if id == 0 {
+                    None
+                } else {
+                    self.owner_index(t).filter(|&o| self.players[o].info.player_type == PlayerType::Bot && !self.is_friendly(p, o, false))
+                };
+                match other {
+                    None => {
+                        s.open = true;
+                        if closed_only {
+                            return None;
+                        }
+                    }
+                    Some(o) => {
+                        if within.is_some_and(|w| !w.contains(&o)) {
+                            return None;
+                        }
+                        if !s.bots.contains(&o) {
+                            s.bots.push(o);
+                        }
+                    }
+                }
+            }
+        }
+        Some(s)
+    }
+
+    /// BotAnnexation.planBotAttacks: a checkerboard of bots across our front and the
+    /// row behind it is left to be annexed for free; the bots walling them in go first.
+    fn plan_bot_attacks(&self, p: usize, bots: &[usize]) -> Vec<usize> {
+        let mut region: Vec<BotSurroundings> = bots.iter().map(|&b| self.bot_scan(p, b, false, None).unwrap()).collect();
+        let get = |region: &Vec<BotSurroundings>, b: usize| region.iter().position(|s| s.bot == b);
+        let front: Vec<usize> = bots.iter().copied().filter(|&b| region[get(&region, b).unwrap()].borders_us).collect();
+        let mut behind: Vec<usize> = Vec::new();
+        for &bot in &front {
+            let others = region[get(&region, bot).unwrap()].bots.clone();
+            for other in others {
+                if get(&region, other).is_some() || behind.contains(&other) {
+                    continue;
+                }
+                behind.push(other);
+                if let Some(s) = self.bot_scan(p, other, true, None) {
+                    region.push(s);
+                }
+            }
+        }
+        let attacking = self.attacked_by(p);
+        let mut candidates: Vec<&BotSurroundings> = region
+            .iter()
+            .filter(|s| !s.open && !s.bots.is_empty() && !attacking.contains(&s.bot) && !self.owns_structures(s.bot))
+            .collect();
+        candidates.sort_by(|a, b| self.players[b.bot].tiles.len().cmp(&self.players[a.bot].tiles.len()));
+        let mut kept: Vec<usize> = Vec::new();
+        let mut next_to_kept: Vec<usize> = Vec::new();
+        let mut walled_in: Vec<(usize, f64)> = Vec::new();
+        for s in candidates {
+            if next_to_kept.contains(&s.bot) {
+                continue;
+            }
+            kept.push(s.bot);
+            let share = self.players[s.bot].tiles.len() as f64 / s.bots.len() as f64;
+            for &other in &s.bots {
+                if !next_to_kept.contains(&other) {
+                    next_to_kept.push(other);
+                }
+                match walled_in.iter_mut().find(|w| w.0 == other) {
+                    Some(w) => w.1 += share,
+                    None => walled_in.push((other, share)),
+                }
+            }
+        }
+        let value = |b: usize| {
+            let extra = walled_in.iter().find(|w| w.0 == b).map_or(0.0, |w| w.1);
+            (self.players[b].tiles.len() as f64 + extra) / self.players[b].troops_f().max(1.0)
+        };
+        let by_value = |a: &usize, b: &usize| value(*b).partial_cmp(&value(*a)).unwrap_or(std::cmp::Ordering::Equal);
+        let mut targets: Vec<usize> = bots
+            .iter()
+            .copied()
+            .filter(|&b| {
+                let s = &region[get(&region, b).unwrap()];
+                let walled = s.borders_us && !s.open && s.bots.is_empty();
+                !kept.contains(&b) && !walled
+            })
+            .collect();
+        targets.sort_by(by_value);
+        if !targets.iter().any(|&b| region[get(&region, b).unwrap()].borders_us) {
+            let mut more: Vec<usize> = front.iter().copied().filter(|b| kept.contains(b)).collect();
+            more.sort_by(by_value);
+            targets.extend(more);
+        }
+        targets
     }
 
     fn nation_has_neighboring_bot_with_structures(&self, p: usize) -> bool {
@@ -9272,26 +10006,33 @@ impl Game {
 
     fn nation_attack_bots(&mut self, ne: &mut NationExec) -> bool {
         let p = ne.player.unwrap();
-        let mut bots: Vec<usize> = self
-            .nearby(p)
-            .into_iter()
-            .flatten()
-            .filter(|&n| !self.is_friendly(p, n, false) && self.players[n].info.player_type == PlayerType::Bot)
-            .collect();
+        let mut bots = self.nation_neighboring_bots(p);
         if bots.is_empty() {
             return false;
         }
         ne.bot_attack_troops_sent = 0.0;
-        let density = |g: &Game, b: usize| g.players[b].troops_f() / g.players[b].tiles.len() as f64;
-        bots.sort_by(|&a, &b| density(self, a).partial_cmp(&density(self, b)).unwrap_or(std::cmp::Ordering::Equal));
-        let owns = |g: &Game, b: usize| g.players[b].units.iter().any(|&u| is_structure(g.units[u].type_name)) as u8;
-        bots.sort_by(|&a, &b| owns(self, b).cmp(&owns(self, a)));
-        // getBotAttackMaxParallelism: Easy 1, Medium 1 or 2
-        let n = if self.config.difficulty == "Easy" || ne.random.next_int(0.0, 2.0) == 0.0 { 1 } else { 2 };
-        for &bot in bots.iter().take(n) {
+        let annexes = self.lands_beachheads();
+        if annexes {
+            bots = self.plan_bot_attacks(p, &bots);
+        } else {
+            let density = |g: &Game, b: usize| g.players[b].troops_f() / g.players[b].tiles.len() as f64;
+            bots.sort_by(|&a, &b| density(self, a).partial_cmp(&density(self, b)).unwrap_or(std::cmp::Ordering::Equal));
+        }
+        bots.sort_by(|&a, &b| (self.owns_structures(b) as u8).cmp(&(self.owns_structures(a) as u8)));
+        // getBotAttackMaxParallelism
+        let n = match self.config.difficulty.as_str() {
+            "Easy" => 1,
+            "Medium" => if ne.random.next_int(0.0, 2.0) == 0.0 { 1 } else { 2 },
+            "Hard" => 3,
+            _ => 100,
+        };
+        let reduced: Vec<usize> = bots.into_iter().take(n).collect();
+        for &bot in &reduced {
             self.nation_send_attack(ne, Some(bot), false);
         }
+        // Hard & Impossible only top up running attacks, so those count as well.
         ne.bot_attack_troops_sent > 0.0
+            || (annexes && self.players[p].outgoing.iter().any(|&a| self.attacks[a].target.is_some_and(|t| reduced.contains(&t))))
     }
 
     fn nation_bordering_nuked_territory(&self, p: usize) -> bool {
@@ -9405,7 +10146,13 @@ impl Game {
         sorted.sort_by_key(|e| e.1);
         let mut reachable = Vec::new();
         for (q, _) in sorted {
-            if self.nation_can_reach(ne, q) {
+            // Beachhead boats sail any distance, even past a warship: nothing nearer is left.
+            let ok = if self.lands_beachheads() {
+                self.nation_borders_by_land(ne, q) || self.nation_boat_route(ne, q).is_some()
+            } else {
+                self.nation_can_reach(ne, q)
+            };
+            if ok {
                 reachable.push(q);
                 if reachable.len() >= 2 {
                     break;
@@ -9423,10 +10170,7 @@ impl Game {
 
     // ── Hard & Impossible only (Medium nations never do these) ──
 
-    /// Strikes (nukes followed up by attacks) are Hard & Impossible only.
-    fn nation_follow_up_strikes(&mut self, _ne: &mut NationExec) {}
-    /// Countering warship infestations is Hard & Impossible only.
-    fn nation_counter_warship_infestation(&mut self, _ne: &mut NationExec) {}
+
 }
 
 // ── Nation structures (NationStructureBehavior, NationStructurePlacement,
@@ -9650,7 +10394,10 @@ impl Game {
 
     fn save_up_target(&self, ne: &mut NationExec) -> i64 {
         let p = ne.player.unwrap();
-        assert!(!self.config.is_team_mode, "team games are not ported for nations");
+        // Team games save up a limited amount, synced with the nuke behavior.
+        if self.config.is_team_mode {
+            return self.unit_cost(p, HYDROGEN_BOMB);
+        }
         let tick = self.ticks;
         let worth = match ne.structures.mirv_memo {
             Some((t, w)) if t == tick => w,
@@ -9668,7 +10415,7 @@ impl Game {
 
     fn levels_due(&self, p: usize, t: &str, city_count: u32, coastal: bool) -> i64 {
         let mut ratio = match t {
-            PORT => 0.75,
+            PORT => if self.config.is_team_mode && self.config.difficulty != "Easy" { 1.0 } else { 0.75 },
             FACTORY => 0.75,
             SAM_LAUNCHER => self.by_difficulty([0.15, 0.2, 0.25, 0.3]),
             MISSILE_SILO => 0.2,
@@ -9693,9 +10440,17 @@ impl Game {
         let p = ne.player.unwrap();
         let real = self.unit_cost(p, t);
         let save_up = self.save_up_target(ne);
-        // isSaveUpWithinReach: no horizon on Medium
         if save_up == 0 || self.players[p].gold >= save_up {
             return real;
+        }
+        // isSaveUpWithinReach: Hard only saves for what 5 minutes of income buys.
+        if let Some(horizon) = self.by_difficulty([None, None, Some(5.0), Some(6.0)]) {
+            let missing = (save_up - self.players[p].gold) as f64;
+            let minutes = (self.ticks as f64 / 600.0).max(1.0);
+            let per_minute = 2.0 * self.players[p].gold_earned as f64 / minutes;
+            if missing > per_minute * horizon {
+                return real;
+            }
         }
         // CITIES_BEFORE_SAVING
         if self.structure_city_count(p) < self.by_difficulty([0, 3, 4, 5]) {
@@ -9786,7 +10541,9 @@ impl Game {
                 return true;
             }
         }
-        // maybeBuildProactiveDefensePost: Hard and Impossible only.
+        if self.maybe_build_proactive_defense_post(ne) {
+            return true;
+        }
         for t in [PORT, FACTORY, SAM_LAUNCHER, MISSILE_SILO] {
             if t == PORT && !coastal {
                 continue;
@@ -9960,7 +10717,8 @@ impl Game {
     }
 
     fn try_build_defense_post(&mut self, ne: &mut NationExec) -> bool {
-        if self.config.difficulty == "Easy" || ne.random.next_int(0.0, 2.0) != 0.0 {
+        let medium = self.config.difficulty == "Medium";
+        if self.config.difficulty == "Easy" || (medium && ne.random.next_int(0.0, 2.0) != 0.0) {
             return false;
         }
         let p = ne.player.unwrap();
@@ -9972,8 +10730,12 @@ impl Game {
         if ours <= 0.0 || self.sum_troops(&attacks) / ours < 0.35 {
             return false;
         }
+        let ratio = self.sum_troops(&attacks) / ours;
+        // Hard: one post per 0.4 of incoming-to-own troops, set further back the heavier it is.
+        let allowed = if medium { 1 } else { (ratio / 0.4).ceil() as usize };
+        let scaled = if medium { 0.0 } else { ratio.min(2.0) };
         let range = 30.0;
-        let min_dist = range * (2.0 / 3.0);
+        let min_dist = range * (2.0 / 3.0 + scaled / 3.0);
         let max_dist = min_dist + range * 0.5;
         // getAttackFrontTiles
         let mut land: Vec<usize> = Vec::new();
@@ -9994,23 +10756,72 @@ impl Game {
             }
         }
         front.shrink_to_fit();
-        // countDefensePostsNearFront
-        let posts = self.player_units_of(p, DEFENSE_POST);
-        if !front.is_empty() {
-            let r2 = max_dist * max_dist;
-            let near = posts.iter().any(|&d| front.iter().any(|&f| self.dist2(self.units[d].tile, f) as f64 <= r2));
-            if near {
-                return false;
+        if self.count_posts_near_front(p, &front, max_dist, allowed) >= allowed {
+            return false;
+        }
+        self.build_defense_post_behind(ne, &front, min_dist, max_dist)
+    }
+
+    /// countDefensePostsNearFront: our posts within `range` of any front tile, up to `cap`.
+    fn count_posts_near_front(&self, p: usize, front: &[u32], range: f64, cap: usize) -> usize {
+        if front.is_empty() {
+            return 0;
+        }
+        let r2 = range * range;
+        let mut count = 0;
+        for d in self.player_units_of(p, DEFENSE_POST) {
+            if front.iter().any(|&f| self.dist2(self.units[d].tile, f) as f64 <= r2) {
+                count += 1;
+                if count >= cap {
+                    return count;
+                }
             }
         }
-        // buildDefensePostBehind
+        count
+    }
+
+    fn build_defense_post_behind(&mut self, ne: &mut NationExec, front: &[u32], min_dist: f64, max_dist: f64) -> bool {
+        let p = ne.player.unwrap();
         if self.players[p].gold < self.unit_cost(p, DEFENSE_POST) {
             return false;
         }
-        let Some(tile) = self.find_defense_post_tile(ne, &front, min_dist, max_dist) else { return false };
+        let Some(tile) = self.find_defense_post_tile(ne, front, min_dist, max_dist) else { return false };
         let e = self.new_construction(p, DEFENSE_POST, tile as f64, true, None);
         self.add_execution(e);
         true
+    }
+
+    /// maybeBuildProactiveDefensePost (Hard): a post facing hostile neighbors at
+    /// least as strong as us, before they attack.
+    fn maybe_build_proactive_defense_post(&mut self, ne: &mut NationExec) -> bool {
+        let Some(ratio) = self.by_difficulty([None, None, Some(1.0), Some(0.5)]) else { return false };
+        let p = ne.player.unwrap();
+        let cities = self.structure_city_count(p) as f64;
+        if cities < 2.0 || self.player_units_of(p, DEFENSE_POST).len() as f64 >= cities * 0.5 {
+            return false;
+        }
+        if self.players[p].gold < self.unit_cost(p, DEFENSE_POST) {
+            return false;
+        }
+        let min_troops = self.players[p].troops_f() * ratio;
+        let mut threats: Vec<usize> = Vec::new();
+        for n in self.nearby(p).into_iter().flatten() {
+            if self.players[n].info.player_type == PlayerType::Bot || self.is_friendly(p, n, false) {
+                continue;
+            }
+            if self.relation(p, n) == 0 && self.players[n].troops_f() >= min_troops && !threats.contains(&n) {
+                threats.push(n);
+            }
+        }
+        if threats.is_empty() {
+            return false;
+        }
+        let range = 30.0;
+        let front = self.border_tiles_facing(p, &threats);
+        if self.count_posts_near_front(p, &front, range * 1.5, threats.len()) >= threats.len() {
+            return false;
+        }
+        self.build_defense_post_behind(ne, &front, range * 0.5, range)
     }
 
     fn border_tiles_facing(&self, p: usize, players: &[usize]) -> Vec<u32> {
@@ -10492,6 +11303,146 @@ impl Game {
         }
     }
 
+    fn hostile_warships_near(&self, p: usize, tile: u32) -> usize {
+        self.nearby_units(tile, 130, &[WARSHIP]).into_iter().filter(|&(u, _)| self.can_attack_player_afk(self.units[u].owner, p, true)).count()
+    }
+
+    fn can_build_warship_at(&self, p: usize, tile: u32) -> bool {
+        self.unit_cost(p, WARSHIP) <= self.players[p].gold && self.players[p].is_alive() && self.warship_spawn(p, tile).is_some()
+    }
+
+    /// clearSeaLane: send a squad at the fleet blocking our boats, all at once or
+    /// not at all (Hard as many ships as they have, Impossible one more).
+    fn clear_sea_lane(&mut self, p: usize, blocker: usize) {
+        let target = self.units[blocker].tile;
+        let fleet = self.hostile_warships_near(p, target) as i64;
+        let wanted = match self.config.difficulty.as_str() {
+            "Hard" => fleet,
+            "Impossible" => fleet + 1,
+            _ => return,
+        };
+        let covering = self.warships_covering(p, target);
+        let component = self.water_component(target);
+        let mut spare: Vec<usize> = self
+            .player_units_of(p, WARSHIP)
+            .into_iter()
+            .filter(|&w| {
+                !covering.contains(&w)
+                    && self.ws(w).mode == WarshipMode::Patrolling
+                    && self.water_component(self.units[w].tile) == component
+                    && self.hostile_warships_near(p, self.ws(w).patrol_tile) == 0
+            })
+            .collect();
+        spare.sort_by_key(|&w| self.map.manhattan_dist(self.units[w].tile, target));
+        let recruits: Vec<usize> = spare.into_iter().take((wanted - covering.len() as i64).max(0) as usize).collect();
+        let builds = wanted - covering.len() as i64 - recruits.len() as i64;
+        if builds > 0 {
+            if self.player_units_of(p, WARSHIP).len() as i64 + builds > 10 {
+                return;
+            }
+            // Each ship we own raises the price of the next.
+            let total: i64 = (0..builds).map(|i| self.unit_cost_extra(p, WARSHIP, i as f64)).sum();
+            if self.players[p].gold < total || !self.can_build_warship_at(p, target) {
+                return;
+            }
+        }
+        for w in recruits {
+            self.ws_mut(w).patrol_tile = target;
+        }
+        for _ in 0..builds.max(0) {
+            let e = self.new_construction(p, WARSHIP, target as f64, true, None);
+            self.add_execution(e);
+        }
+    }
+
+    /// counterWarshipInfestation: one of the 3 richest nations (of its team) sends
+    /// a warship at an enemy hoarding them.
+    fn nation_counter_warship_infestation(&mut self, ne: &mut NationExec) {
+        let p = ne.player.unwrap();
+        if !self.lands_beachheads() {
+            return;
+        }
+        let total: usize = (0..self.players.len()).map(|q| self.player_units_of(q, WARSHIP).len()).sum();
+        if total <= 10
+            || self.unit_cost(p, WARSHIP) > self.players[p].gold
+            || self.player_units_of(p, PORT).is_empty()
+            || self.player_units_of(p, WARSHIP).len() >= 10
+        {
+            return;
+        }
+        let team = self.players[p].team.clone();
+        let mut rich: Vec<usize> = self
+            .alive_players()
+            .into_iter()
+            .filter(|&q| self.players[q].info.player_type != PlayerType::Human && (team.is_none() || self.players[q].team == team))
+            .collect();
+        rich.sort_by(|&a, &b| self.players[b].gold.cmp(&self.players[a].gold));
+        if !rich.iter().take(3).any(|&q| q == p) {
+            return;
+        }
+        let target = if team.is_some() {
+            // Teams with more than 15 warships, in order of first appearance.
+            let mut teams: Vec<(String, usize, Vec<usize>)> = Vec::new();
+            for q in self.alive_players() {
+                if self.is_friendly(p, q, false) || q == p {
+                    continue;
+                }
+                let Some(t) = self.players[q].team.clone() else { continue };
+                let count = self.player_units_of(q, WARSHIP).len();
+                match teams.iter_mut().find(|e| e.0 == t) {
+                    Some(e) => {
+                        e.1 += count;
+                        e.2.push(q);
+                    }
+                    None => teams.push((t, count, vec![q])),
+                }
+            }
+            let mut found = None;
+            for (_, count, members) in teams {
+                if count <= 15 {
+                    continue;
+                }
+                let mut most: Option<usize> = None;
+                for q in members {
+                    let c = self.player_units_of(q, WARSHIP).len();
+                    if c > most.map_or(0, |m| self.player_units_of(m, WARSHIP).len()) {
+                        most = Some(q);
+                    }
+                }
+                if let Some(m) = most {
+                    let ships = self.player_units_of(m, WARSHIP);
+                    if ships.len() > 3 {
+                        found = Some(ships[ne.random.next_int(0.0, ships.len() as f64) as usize]);
+                        break;
+                    }
+                }
+            }
+            found
+        } else {
+            let mut found = None;
+            for q in self.alive_players() {
+                if self.is_friendly(p, q, false) || q == p {
+                    continue;
+                }
+                let ships = self.player_units_of(q, WARSHIP);
+                if ships.len() > 10 {
+                    found = Some(ships[ne.random.next_int(0.0, ships.len() as f64) as usize]);
+                    break;
+                }
+            }
+            found
+        };
+        let Some(ship) = target else { return };
+        let tile = self.units[ship].tile;
+        if !self.can_build_warship_at(p, tile) {
+            self.maybe_move_warship(p, tile);
+            return;
+        }
+        let e = self.new_construction(p, WARSHIP, tile as f64, true, None);
+        self.add_execution(e);
+        self.emoji_send(ne, None, &["⛵"]);
+    }
+
     fn warships_covering(&self, p: usize, tile: u32) -> Vec<usize> {
         let component = self.water_component(tile);
         self.player_units_of(p, WARSHIP)
@@ -10524,8 +11475,9 @@ impl Game {
             self.maybe_move_warship(p, tile);
             return;
         }
-        self.assert_nation_difficulty();
-        if ne.random.next_int(0.0, 100.0) < 15.0 {
+        // Easy never retaliates; Medium 15% of the time, Hard 50%, Impossible 80%.
+        let Some(chance) = self.by_difficulty([None, Some(15.0), Some(50.0), Some(80.0)]) else { return };
+        if ne.random.next_int(0.0, 100.0) < chance {
             if self.unit_cost(p, WARSHIP) > self.players[p].gold || !self.players[p].is_alive() || self.warship_spawn(p, tile).is_none() {
                 self.maybe_move_warship(p, tile);
                 return;
@@ -10538,13 +11490,24 @@ impl Game {
     }
 }
 
-// ── NationNukeBehavior (Medium, FFA) and NationNukePlanning helpers ──
+// ── NationNukeBehavior and NationNukePlanning helpers ──
 
 #[derive(Default)]
 pub struct NationNukeState {
     recent: Vec<(u32, u32, &'static str)>,
     atom_perceived: i64,
     hydro_perceived: i64,
+    atom_last_launch: Option<u32>,
+    hydro_last_launch: Option<u32>,
+    /// Hard & Impossible: nukes in flight we follow up with an attack when they land.
+    strikes: Vec<Strike>,
+}
+
+struct Strike {
+    target: usize,
+    tile: u32,
+    tick: u32,
+    nuke: Option<usize>,
 }
 
 impl Game {
@@ -10665,24 +11628,302 @@ impl Game {
         self.unit_cost(p, "MIRV") + self.unit_cost(p, HYDROGEN_BOMB)
     }
 
-    /// getPerceivedNukeCost (Medium: no forgetting, no heavy-attack exception)
+    /// getPerceivedNukeCost: each launch makes the next nuke of its type feel pricier.
     fn perceived_nuke_cost(&self, ne: &NationExec, t: &str) -> i64 {
         let p = ne.player.unwrap();
         let real = self.unit_cost(p, t);
-        let pays_real = self.alive_players().len() == 2 || self.players[p].gold > self.mirv_save_up_target_for(p);
-        if pays_real || !self.is_mirv_worth_saving_for(p) {
+        if self.pays_real_nuke_price(p) {
+            return real;
+        }
+        // Easy & Medium keep the price up for good, so only while a MIRV is worth saving for.
+        if !self.forgets_nuke_prices() && !self.is_mirv_worth_saving_for(p) {
             return real;
         }
         self.inflated_nuke_cost(ne, t)
     }
 
+    fn pays_real_nuke_price(&self, p: usize) -> bool {
+        if self.alive_players().len() == 2 {
+            return true;
+        }
+        // Team games save up a limited amount, synced with the structure behavior.
+        if self.config.is_team_mode && self.players[p].gold > self.unit_cost(p, HYDROGEN_BOMB) {
+            return true;
+        }
+        if self.players[p].gold > self.mirv_save_up_target_for(p) {
+            return true;
+        }
+        // Hard & Impossible go all-in on nukes under heavy attack.
+        self.lands_beachheads() && self.incoming_troops(p) >= self.players[p].troops_f()
+    }
+
+    /// Hard & Impossible in FFA: the perceived price falls back to the real one within minutes.
+    fn forgets_nuke_prices(&self) -> bool {
+        self.lands_beachheads() && !self.config.is_team_mode
+    }
+
     fn inflated_nuke_cost(&self, ne: &NationExec, t: &str) -> i64 {
         let real = self.unit_cost(ne.player.unwrap(), t);
-        let perceived = if t == ATOM_BOMB { ne.nukes.atom_perceived } else { ne.nukes.hydro_perceived };
+        let (perceived, last) =
+            if t == ATOM_BOMB { (ne.nukes.atom_perceived, ne.nukes.atom_last_launch) } else { (ne.nukes.hydro_perceived, ne.nukes.hydro_last_launch) };
         if perceived <= real {
-            real
+            return real;
+        }
+        if !self.forgets_nuke_prices() {
+            return perceived;
+        }
+        let left = match last {
+            None => 0,
+            Some(l) => 3000 - (self.ticks as i64 - l as i64),
+        };
+        if left <= 0 {
+            return real;
+        }
+        real + (perceived - real) * left / 3000
+    }
+
+    /// isSaveUpWithinReach: Hard only saves for what 5 minutes of income buys.
+    fn is_save_up_within_reach(&self, p: usize, target: i64) -> bool {
+        let missing = (target - self.players[p].gold) as f64;
+        let Some(horizon) = self.by_difficulty([None, None, Some(5.0), Some(6.0)]) else { return true };
+        if missing <= 0.0 {
+            return true;
+        }
+        let minutes = (self.ticks as f64 / 600.0).max(1.0);
+        missing <= 2.0 * self.players[p].gold_earned as f64 / minutes * horizon
+    }
+
+    fn is_saving_for_mirv(&self, p: usize) -> bool {
+        self.forgets_nuke_prices()
+            && !self.pays_real_nuke_price(p)
+            && self.is_mirv_worth_saving_for(p)
+            && self.is_save_up_within_reach(p, self.mirv_save_up_target_for(p))
+    }
+
+    /// isHittingUs: attacking us, or a bomb flying at our land.
+    fn is_hitting_us(&self, p: usize, other: usize) -> bool {
+        if self.incoming_attacks(p).iter().any(|&a| self.attacks[a].attacker == other) {
+            return true;
+        }
+        self.player_units_of_types(other, &[ATOM_BOMB, HYDROGEN_BOMB, "MIRV", MIRV_WARHEAD])
+            .iter()
+            .any(|&u| self.units[u].target_tile.is_some_and(|t| self.owner_index(t) == Some(p)))
+    }
+
+    /// strikeTroops: above the reserve, and within troopSendCap without target.
+    fn strike_troops(&self, ne: &NationExec, target: usize) -> f64 {
+        let p = ne.player.unwrap();
+        (self.players[p].troops_f() - self.max_troops(p) * ne.reserve_ratio).min(self.troop_send_cap(p, Some(target)))
+    }
+
+    /// canStrike: the attack right after our nuke could send enough troops in by land.
+    fn can_strike(&self, ne: &NationExec, target: usize) -> bool {
+        let p = ne.player.unwrap();
+        self.players[target].info.player_type != PlayerType::Bot
+            && !self.is_friendly(p, target, false)
+            && self.strike_troops(ne, target) >= self.players[target].troops_f() * 0.5
+            && self.shares_border_with(p, self.players[target].small_id)
+    }
+
+    /// followUpStrikes: attack a strike's target the moment its bomb, or its MIRV's last warhead, lands.
+    fn nation_follow_up_strikes(&mut self, ne: &mut NationExec) {
+        let p = ne.player.unwrap();
+        if self.lands_beachheads() && self.unit_count(p, "MIRV") > 0 {
+            // Our MIRVs at bordering players are strikes too.
+            for mirv in self.player_units_of(p, "MIRV") {
+                if ne.nukes.strikes.iter().any(|s| s.nuke == Some(mirv)) {
+                    continue;
+                }
+                let (Some(target), Some(tile)) = (self.units[mirv].mirv_target, self.units[mirv].target_tile) else { continue };
+                if self.is_friendly(p, target, false) || !self.shares_border_with(p, self.players[target].small_id) {
+                    continue;
+                }
+                ne.nukes.strikes.push(Strike { target, tile, tick: self.ticks, nuke: Some(mirv) });
+            }
+        }
+        if ne.nukes.strikes.is_empty() {
+            return;
+        }
+        let mut pending: Vec<Strike> = Vec::new();
+        let mut i = 0;
+        while i < ne.nukes.strikes.len() {
+            if ne.nukes.strikes[i].nuke.is_none() {
+                let tile = ne.nukes.strikes[i].tile;
+                let found = self
+                    .player_units_of_types(p, &[ATOM_BOMB, HYDROGEN_BOMB])
+                    .into_iter()
+                    .find(|&n| self.units[n].target_tile == Some(tile) && !ne.nukes.strikes.iter().any(|s| s.nuke == Some(n)));
+                ne.nukes.strikes[i].nuke = found;
+            }
+            let st = &ne.nukes.strikes[i];
+            let (target, tile, tick, nuke) = (st.target, st.tile, st.tick, st.nuke);
+            i += 1;
+            let keep = Strike { target, tile, tick, nuke };
+            let Some(n) = nuke else {
+                if self.ticks - tick <= 10 {
+                    pending.push(keep);
+                }
+                continue;
+            };
+            if self.units[n].active {
+                pending.push(keep);
+                continue;
+            }
+            if self.units[n].type_name == "MIRV" {
+                // A MIRV deletes itself when it splits into warheads.
+                if self.unit_count(p, MIRV_WARHEAD) > 0 {
+                    pending.push(keep);
+                    continue;
+                }
+            } else if !self.units[n].reached_target {
+                // Intercepted bombs leave the target's troops alone.
+                continue;
+            }
+            if self.players[target].is_alive() && !self.is_friendly(p, target, false) && self.shares_border_with(p, self.players[target].small_id) {
+                self.nation_send_land_attack(ne, Some(target), None, Some(target));
+            }
+        }
+        ne.nukes.strikes = pending;
+    }
+
+    /// isTrajectoryInterceptableBySam: whether an enemy SAM covers the bomb's flight
+    /// outside its untargetable mid-air stretch.
+    fn is_trajectory_interceptable_by_sam(&self, p: usize, spawn: u32, target: u32) -> bool {
+        let pts = self.parabola_points(spawn, target, true);
+        let trajectory: Vec<u32> = Curve::new(pts, 10.0).points.iter().map(|&q| self.curve_tile(q)).collect();
+        if trajectory.is_empty() {
+            return false;
+        }
+        let r2 = 150i64 * 150;
+        let (mut start, mut end): (i64, i64) = (-1, -1);
+        for (i, &t) in trajectory.iter().enumerate() {
+            if start == -1 {
+                if self.dist2(t, spawn) > r2 {
+                    if self.dist2(t, target) < r2 {
+                        break;
+                    }
+                    start = i as i64;
+                }
+            } else if self.dist2(t, target) < r2 {
+                end = i as i64;
+                break;
+            }
+        }
+        let mut i: i64 = 0;
+        while (i as usize) < trajectory.len() {
+            if start != -1 && end != -1 && i == start {
+                i = end;
+                continue;
+            }
+            let t = trajectory[i as usize];
+            for (sam, d2) in self.nearby_units(t, 150, &[SAM_LAUNCHER]) {
+                let owner = self.units[sam].owner;
+                if owner == p || self.is_friendly(p, owner, false) {
+                    continue;
+                }
+                let range = Self::sam_range(self.units[sam].level);
+                if d2 as f64 <= range * range {
+                    return true;
+                }
+            }
+            i += 1;
+        }
+        false
+    }
+
+    fn structure_levels(&self, p: usize) -> u32 {
+        self.players[p].units.iter().map(|&u| &self.units[u]).filter(|u| is_structure(u.type_name)).map(|u| u.level).sum()
+    }
+
+    /// findTeammateFightTarget: the enemy attacking our teammates hardest, else the one they attack hardest.
+    fn find_teammate_fight_target(&self, p: usize) -> Option<usize> {
+        if !self.config.is_team_mode || self.config.difficulty == "Easy" {
+            return None;
+        }
+        let mates: Vec<usize> = self.alive_players().into_iter().filter(|&q| q != p && self.is_on_same_team(p, q)).collect();
+        let is_enemy = |q: usize| self.players[q].info.player_type != PlayerType::Bot && !self.is_friendly(p, q, false);
+        let mut best = None;
+        let mut best_troops = 0.0;
+        for &m in &mates {
+            for a in self.incoming_attacks(m) {
+                let attacker = self.attacks[a].attacker;
+                if is_enemy(attacker) && self.attacks[a].troops > best_troops {
+                    best = Some(attacker);
+                    best_troops = self.attacks[a].troops;
+                }
+            }
+        }
+        if best.is_some() {
+            return best;
+        }
+        for &m in &mates {
+            for &a in &self.players[m].outgoing {
+                if let Some(t) = self.attacks[a].target {
+                    if is_enemy(t) && self.attacks[a].troops > best_troops {
+                        best = Some(t);
+                        best_troops = self.attacks[a].troops;
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    /// findStrongestTeamTarget: a player of the team with the most land (not ours).
+    fn find_strongest_team_target(&self, ne: &mut NationExec) -> Option<usize> {
+        if !self.config.is_team_mode {
+            return None;
+        }
+        let p = ne.player.unwrap();
+        let players = self.alive_players();
+        if players.len() <= 1 {
+            return None;
+        }
+        let mut teams: Vec<(String, usize, Vec<usize>)> = Vec::new();
+        for &q in &players {
+            let Some(t) = self.players[q].team.clone() else { continue };
+            let tiles = self.players[q].tiles.len();
+            match teams.iter_mut().find(|e| e.0 == t) {
+                Some(e) => {
+                    e.1 += tiles;
+                    e.2.push(q);
+                }
+                None => teams.push((t, tiles, vec![q])),
+            }
+        }
+        teams.sort_by(|a, b| b.1.cmp(&a.1));
+        if teams.is_empty() {
+            return None;
+        }
+        let mut strongest = 0;
+        if self.players[p].team.as_ref() == Some(&teams[0].0) {
+            if teams.len() > 1 {
+                strongest = 1;
+            } else {
+                return None;
+            }
+        }
+        let valid: Vec<usize> = teams[strongest].2.iter().copied().filter(|&q| !self.is_friendly(p, q, false)).collect();
+        if valid.is_empty() {
+            return None;
+        }
+        // Hard & Impossible: one of the three players with the most structure levels.
+        if self.lands_beachheads() {
+            let mut most: Vec<(usize, u32)> = valid.iter().map(|&q| (q, self.structure_levels(q))).filter(|e| e.1 > 0).collect();
+            most.sort_by(|a, b| b.1.cmp(&a.1));
+            most.truncate(3);
+            if !most.is_empty() {
+                return Some(most[ne.random.next_int(0.0, most.len() as f64) as usize].0);
+            }
+        }
+        if ne.random.next_int(0.0, 2.0) == 0.0 {
+            let mut best = valid[0];
+            for &q in &valid[1..] {
+                best = if self.max_troops(best) > self.max_troops(q) { best } else { q };
+            }
+            Some(best)
         } else {
-            perceived
+            Some(valid[ne.random.next_int(0.0, valid.len() as f64) as usize])
         }
     }
 
@@ -10694,18 +11935,27 @@ impl Game {
             return;
         }
         let Some(target) = self.find_best_nuke_target(ne) else { return };
-        // Easy never strikes; Medium when it's attacking the target.
-        let strike = self.config.difficulty != "Easy"
-            && self.players[p].outgoing.iter().any(|&a| self.attacks[a].target == Some(target) && self.attacks[a].troops > 0.0);
+        // chooseNukeTarget: Easy never strikes; Medium when it's attacking the target;
+        // Hard & Impossible when the follow-up attack would be strong enough.
+        let strike = match self.config.difficulty.as_str() {
+            "Easy" => false,
+            "Medium" => self.players[p].outgoing.iter().any(|&a| self.attacks[a].target == Some(target) && self.attacks[a].troops > 0.0),
+            _ => self.can_strike(ne, target),
+        };
         if self.players[target].info.player_type == PlayerType::Bot || self.is_on_same_team(p, target) || !self.nation_should_attack(ne, Some(target)) {
             return;
         }
-        // nukeTypesToTry: a hydrogen bomb, else an atom bomb.
+        // While saving up for a MIRV, Hard & Impossible only nuke back at players hitting them, with atom bombs.
+        let saving = self.is_saving_for_mirv(p);
+        if saving && !self.is_hitting_us(p, target) {
+            return;
+        }
+        // nukeTypesToTry: a hydrogen bomb first; Hard & Impossible also an atom bomb.
         let mut types: Vec<&'static str> = Vec::new();
-        if self.players[p].gold >= self.perceived_nuke_cost(ne, HYDROGEN_BOMB) {
+        if !saving && self.players[p].gold >= self.perceived_nuke_cost(ne, HYDROGEN_BOMB) {
             types.push(HYDROGEN_BOMB);
         }
-        if types.is_empty() && self.players[p].gold >= self.perceived_nuke_cost(ne, ATOM_BOMB) {
+        if (types.is_empty() || self.lands_beachheads()) && self.players[p].gold >= self.perceived_nuke_cost(ne, ATOM_BOMB) {
             types.push(ATOM_BOMB);
         }
         if types.is_empty() {
@@ -10727,13 +11977,25 @@ impl Game {
         for t in types {
             if let Some(tile) = self.find_best_nuke_tile(ne, t, target, &candidates, &silos, &structures, strike) {
                 self.send_nation_nuke(ne, tile, t, target);
+                if strike && self.lands_beachheads() {
+                    ne.nukes.strikes.push(Strike { target, tile, tick: self.ticks, nuke: None });
+                }
                 return;
             }
         }
     }
 
-    fn find_best_nuke_target(&self, ne: &NationExec) -> Option<usize> {
+    fn find_best_nuke_target(&self, ne: &mut NationExec) -> Option<usize> {
         let p = ne.player.unwrap();
+        // Hard & Impossible with only 2 players left target the other one.
+        if self.lands_beachheads() {
+            let alive = self.alive_players();
+            if alive.len() == 2 {
+                if let Some(&other) = alive.iter().find(|&&q| q != p) {
+                    return Some(other);
+                }
+            }
+        }
         if let Some(a) = self.nation_find_incoming_attack_player(p) {
             return Some(a);
         }
@@ -10749,13 +12011,38 @@ impl Game {
                 }
             }
         }
-        // findStrikeTarget (Easy: none; Medium: a player we're attacking about as strong as us)
+        // In teams, back up teammates in their fights before starting our own.
+        if let Some(t) = self.find_teammate_fight_target(p) {
+            return Some(t);
+        }
+        // findStrikeTarget: Medium a player we're attacking about as strong as us,
+        // Hard the strongest such neighbor it can follow up on.
         let mine = self.players[p].troops_f();
-        let strike_targets = if self.config.difficulty == "Easy" { &[][..] } else { &self.players[p].outgoing[..] };
-        for &a in strike_targets {
-            if let Some(t) = self.attacks[a].target {
-                if self.players[t].info.player_type != PlayerType::Bot && !self.is_friendly(p, t, false) && self.players[t].troops_f() >= mine * 0.5 {
-                    return Some(t);
+        let candidate =
+            |t: usize| self.players[t].info.player_type != PlayerType::Bot && !self.is_friendly(p, t, false) && self.players[t].troops_f() >= mine * 0.5;
+        match self.config.difficulty.as_str() {
+            "Easy" => {}
+            "Medium" => {
+                for &a in &self.players[p].outgoing {
+                    if let Some(t) = self.attacks[a].target {
+                        if candidate(t) {
+                            return Some(t);
+                        }
+                    }
+                }
+            }
+            _ => {
+                let mut best: Option<usize> = None;
+                for o in self.nearby(p).into_iter().flatten() {
+                    if !candidate(o) || best.is_some_and(|b| self.players[o].troops_f() <= self.players[b].troops_f()) {
+                        continue;
+                    }
+                    if self.can_strike(ne, o) {
+                        best = Some(o);
+                    }
+                }
+                if best.is_some() {
+                    return best;
                 }
             }
         }
@@ -10784,7 +12071,10 @@ impl Game {
             }
             return Some(other);
         }
-        self.find_ffa_crown_target(p)
+        if let Some(c) = self.find_ffa_crown_target(p) {
+            return Some(c);
+        }
+        self.find_strongest_team_target(ne)
     }
 
     fn find_ffa_crown_target(&self, p: usize) -> Option<usize> {
@@ -10865,6 +12155,7 @@ impl Game {
         strike: bool,
     ) -> Option<u32> {
         let p = ne.player.unwrap();
+        let hard = self.lands_beachheads();
         let (inner, outer) = Self::nuke_magnitude(t);
         let target_small = self.players[target].small_id;
         let mut scored: Vec<(u32, f64)> = Vec::new();
@@ -10872,14 +12163,17 @@ impl Game {
             let mut bbox = self.bounding_box_tiles(tile, outer);
             bbox.extend(self.bounding_box_tiles(tile, outer.div_euclid(2)));
             for b in bbox {
-                // isValidNukeTile (Medium: only the target's own land)
-                if self.map.owner_id(b) != target_small {
+                // isValidNukeTile: Easy & Medium only the target's own land; Hard & Impossible
+                // also free land and anyone who isn't a teammate or ally.
+                if self.map.owner_id(b) == target_small {
+                    continue;
+                }
+                let hard_ok = hard && self.owner_index(b).is_none_or(|o| !self.is_friendly(p, o, true));
+                if !hard_ok {
                     continue 'outer;
                 }
             }
-            if self.nuke_spawn(p, tile, t).is_none() {
-                continue;
-            }
+            let Some(spawn) = self.nuke_spawn(p, tile, t) else { continue };
             // Above Easy, skip spots already being nuked or where the blast would be mostly wasted.
             let mut coverage = 0.0;
             if self.config.difficulty != "Easy" {
@@ -10904,6 +12198,10 @@ impl Game {
                 continue;
             }
             }
+            // Hard & Impossible avoid trajectories enemy SAMs can intercept.
+            if hard && self.is_trajectory_interceptable_by_sam(p, spawn, tile) {
+                continue;
+            }
             let value = self.nuke_tile_score(ne, tile, silos, structures, t);
             if value < 0.0 {
                 continue;
@@ -10911,7 +12209,8 @@ impl Game {
             scored.push((tile, value + coverage * 50_000.0));
         }
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let margin = if strike { 0 } else { 0 }; // strike margins are Hard & Impossible only
+        // Keep a strike's blast off our front, so it survives for the follow-up attack.
+        let margin = if strike { 10 } else { 0 };
         scored.iter().find(|&&(tile, _)| !self.blast_hits_friendly_land(p, tile, t, margin)).map(|s| s.0)
     }
 
@@ -11011,8 +12310,10 @@ impl Game {
         let perceived = self.inflated_nuke_cost(ne, t);
         if t == ATOM_BOMB {
             ne.nukes.atom_perceived = perceived * 150 / 100;
+            ne.nukes.atom_last_launch = Some(tick);
         } else {
             ne.nukes.hydro_perceived = perceived * 125 / 100;
+            ne.nukes.hydro_last_launch = Some(tick);
         }
         let p = ne.player.unwrap();
         let e = self.new_nuke(t, p, tile, true);

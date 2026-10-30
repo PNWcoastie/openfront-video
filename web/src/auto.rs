@@ -82,7 +82,6 @@ fn parse_time(v: &Value) -> Option<DateTime<Utc>> {
 /// Whether the renderer can do this game and it's worth doing.
 fn wanted(g: &Value, min_players: u64) -> bool {
     g["rankedType"].as_str().unwrap_or("unranked") == "unranked"
-        && g["playerTeams"].as_str() != Some("Humans Vs Nations")
         && g["numPlayers"].as_u64().unwrap_or(0) >= min_players
 }
 

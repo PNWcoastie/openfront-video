@@ -118,7 +118,7 @@ For the test game the video is identical frame for frame to the TypeScript rende
 | 5 s, 1280x1280 | 36.7 s (2.13 s/min) | 20.4 s (1.18 s/min) |
 
 engine-rs is only verified on this game (engine commit `9f4a28f`); anything it hasn't
-ported yet, such as nations, stops it with "... is not ported yet".
+ported yet, such as Impossible nations, stops it with "... is not ported yet".
 
 ## openfront-video: one self-contained binary
 
@@ -150,6 +150,9 @@ an encoding thread. Drawing uses tiny-skia, and text is shaped with rustybuzz, s
 kerning matches the canvas. Text lines and unit sprites are drawn once per quarter-pixel
 offset and then copied in. Frames look the same as render.ts's, up to anti-aliasing
 and encoder differences, including team colors, player cosmetics and fallout.
+On top of what render.ts drew, it shows the game client's status icons above names
+(crown for the largest player, traitor, disconnected, nuke in flight, doomsday skull,
+from `status-atlas.png`) and the red blast-radius circles at nuke targets.
 `OPENFRONT_DRAW_PROFILE=1` times the drawing steps.
 
 The video is H.264 from OpenH264 (BSD-licensed), compiled in, with BT.709 colors. It's
@@ -244,7 +247,7 @@ With `AUTO_RENDER=1` (the default) the server also renders public games without
 waiting to be asked. Every `AUTO_POLL_SECS` (60) it lists public games from
 `api.openfront.io/public/games`. That listing filters by start time, so it looks back
 `AUTO_LOOKBACK_MINS` (180), since a game can run for about three hours. It queues
-games that have ended and that it can render: unranked, not Humans vs Nations, at
+games that have ended and that it can render: unranked, with at
 least `AUTO_MIN_PLAYERS` (10) players.
 
 About ten public games end every minute, more than one machine renders. So the queue
