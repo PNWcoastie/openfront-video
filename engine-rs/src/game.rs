@@ -431,6 +431,8 @@ pub struct Game {
     pub players: Vec<Player>,
     players_by_id: HashMap<String, usize>,
     pub player_teams: Vec<String>,
+    /// Map manifest teamGameSpawnAreas: per team count, one [x, y, width, height] per team.
+    pub team_spawn_areas: Vec<(String, Vec<[i64; 4]>)>,
     pub ticks: u32,
     start_tick: Option<u32>,
     pub execs: Vec<Exec>,
@@ -478,6 +480,7 @@ impl Game {
             players: Vec::new(),
             players_by_id: HashMap::new(),
             player_teams: Vec::new(),
+            team_spawn_areas: Vec::new(),
             ticks: 0,
             start_tick: None,
             execs: Vec::new(),
@@ -638,6 +641,15 @@ impl Game {
     }
 
     // ── Players: teams, friendship, troops, gold ──
+
+    /// GameImpl.teamSpawnArea
+    fn team_spawn_area(&self, p: usize) -> Option<[i64; 4]> {
+        let team = self.players[p].team.as_ref()?;
+        let key = self.player_teams.len().to_string();
+        let areas = &self.team_spawn_areas.iter().find(|a| a.0 == key)?.1;
+        let i = self.player_teams.iter().position(|t| t == team)?;
+        areas.get(i).copied()
+    }
 
     fn is_on_same_team(&self, a: usize, b: usize) -> bool {
         if a == b {
@@ -1317,12 +1329,17 @@ impl Game {
             let tiles = self.spawn_tiles(center, false)?;
             return if tiles.is_empty() { None } else { Some((center, tiles)) };
         }
-        // Team spawn areas: none apply in the ported games (see the README).
+        let area = self.player_index(&s.info.id).and_then(|p| self.team_spawn_area(p));
         let mut tries = 0;
         while tries < Self::MAX_SPAWN_TRIES {
             tries += 1;
-            let cx = s.random.next_int(0.0, self.map.width as f64) as u32;
-            let cy = s.random.next_int(0.0, self.map.height as f64) as u32;
+            let (cx, cy) = match area {
+                Some([x, y, w, h]) => {
+                    let cx = s.random.next_int(x as f64, (x + w) as f64);
+                    (cx as u32, s.random.next_int(y as f64, (y + h) as f64) as u32)
+                }
+                None => (s.random.next_int(0.0, self.map.width as f64) as u32, s.random.next_int(0.0, self.map.height as f64) as u32),
+            };
             let center = self.map.ref_at(cx, cy);
             if !self.map.is_land(center) || self.map.has_owner(center) || self.map.is_border(center) {
                 continue;
@@ -8090,7 +8107,15 @@ impl Game {
                 ne.spawn_exec_added = true;
                 return;
             };
-            // Team spawn areas are refused at setup, so the manifest cell stands.
+            // Outside its team's spawn area, the nation spawns randomly within it instead.
+            if let Some([x, y, w, h]) = self.team_spawn_area(p) {
+                if !(cx >= x && cx < x + w && cy >= y && cy < y + h) {
+                    let e = self.new_spawn(ne.nation.info.clone(), None, false);
+                    self.add_execution(e);
+                    ne.spawn_exec_added = true;
+                    return;
+                }
+            }
             // randomSpawnLand
             let mut found = None;
             let (w, h) = (self.map.width as f64, self.map.height as f64);
@@ -10533,8 +10558,9 @@ impl Game {
         let city_count = self.structure_city_count(p);
         let coastal = ne.structures.shared.is_some();
         // On crowded maps the first structure is a port (a factory if landlocked)
-        // instead of a city. Team spawn areas are not ported (no nations in team games).
-        if !ne.structures.built_crowded_first && self.is_high_nation_density() {
+        // instead of a city; so does a nation starting in a team spawn area (not Easy).
+        let in_area = self.config.difficulty != "Easy" && self.team_spawn_area(p).is_some();
+        if !ne.structures.built_crowded_first && (self.is_high_nation_density() || in_area) {
             let first = if coastal { PORT } else { FACTORY };
             if self.maybe_spawn_structure(ne, first) {
                 ne.structures.built_crowded_first = true;

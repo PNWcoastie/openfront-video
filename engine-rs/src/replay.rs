@@ -145,13 +145,6 @@ pub fn setup(record: &Value, res: &dyn Resources) -> (Game, Vec<Vec<Value>>) {
         let hvn = is_team && gc["playerTeams"] == "Humans Vs Nations";
         create_nations(&gc["nations"], &manifest, compact, public, hvn.then_some(humans.len()), &mut random)
     };
-    // Team spawn areas only steer random spawn points (nations, random spawn).
-    assert!(
-        !is_team
-            || (nations.is_empty() && !config.random_spawn)
-            || manifest["teamGameSpawnAreas"].as_object().is_none_or(|a| a.is_empty()),
-        "maps with team spawn areas are not ported yet"
-    );
     // resolveTeamsList: a team count, or Duos/Trios/Quads (players per team).
     let teams = if is_team {
         let total = humans.len() + nations.len();
@@ -174,6 +167,23 @@ pub fn setup(record: &Value, res: &dyn Resources) -> (Game, Vec<Vec<Value>>) {
     };
     let nation_infos: Vec<PlayerInfo> = nations.iter().map(|n| n.info.clone()).collect();
     let mut game = Game::new(config, map, mini_map, humans, nation_infos, teams);
+    // Team spawn areas by team count, halved on compact maps (TerrainMapLoader).
+    if let Some(areas) = manifest["teamGameSpawnAreas"].as_object() {
+        let half = |v: i64| if compact { v.div_euclid(2) } else { v };
+        for (key, list) in areas {
+            let rects = list
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|a| {
+                    let f = |k: &str| a[k].as_f64().unwrap() as i64;
+                    let (w, h) = (half(f("width")), half(f("height")));
+                    [half(f("x")), half(f("y")), if compact { w.max(1) } else { w }, if compact { h.max(1) } else { h }]
+                })
+                .collect();
+            game.team_spawn_areas.push((key.clone(), rects));
+        }
+    }
 
     // GameRunner.init
     if !game.config.is_singleplayer {
