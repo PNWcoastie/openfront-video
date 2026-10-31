@@ -32,8 +32,18 @@ const LOG = process.env.LOG ?? "./embedtest.log";
 const DELAYS = [0, 5, 10, 15, 30, 60, 120, 240];
 const MODES = ["slow", "chunked", "page"];
 
-const video = fs.readFileSync(VIDEO);
 const recent = [];
+// Without the video the server still starts, and says what's missing.
+let video = Buffer.alloc(0);
+let problem = "";
+try {
+  video = fs.readFileSync(VIDEO);
+  if (TYPE === "video/webm" && video.subarray(0, 4).toString("hex") !== "1a45dfa3") {
+    problem = `${VIDEO} isn't a WebM file (${video.length} bytes, starts with ${JSON.stringify(video.subarray(0, 16).toString("latin1"))}); the download probably got an HTML page`;
+  }
+} catch (e) {
+  problem = `can't read ${VIDEO}: ${e.message}`;
+}
 
 function log(line) {
   const l = `${new Date().toISOString()} ${line}`;
@@ -97,6 +107,7 @@ function index(res) {
   res.end(`<!doctype html><meta charset="utf-8"><title>embed test</title>
 <style>body{font:15px/1.5 system-ui;margin:24px;background:#16181d;color:#ddd}a{color:#7cb7ff}</style>
 <h1>Discord embed timing test</h1>
+${problem ? `<p style="color:#ff8080"><b>Problem:</b> ${esc(problem)}</p>` : ""}
 <p>Fresh links on every reload. Video: ${esc(VIDEO)}, ${(video.length / 1e6).toFixed(1)} MB.
 slow = video trickles over N s with Content-Length; chunked = trickles with no length;
 page = the page is held N s. Log: <a href="/log">/log</a></p>${rows}`);
@@ -227,4 +238,7 @@ http
     res.writeHead(404);
     res.end("not found");
   })
-  .listen(PORT, () => log(`embed test on :${PORT}, ${PUBLIC}, video ${VIDEO} (${video.length} bytes)`));
+  .listen(PORT, () => {
+    log(`embed test on :${PORT}, ${PUBLIC}, video ${VIDEO} (${video.length} bytes)`);
+    if (problem) log(`PROBLEM: ${problem}`);
+  });
