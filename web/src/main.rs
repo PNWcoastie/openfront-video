@@ -13,7 +13,11 @@
 //!
 //! Settings (environment): PORT (8080), DATA_DIR (./data), PUBLIC_URL
 //! (https://openfront.video), OPENFRONT_VIDEO_BIN (openfront-video),
-//! MAX_RENDERS (1), EMBED_WAIT_SECS (25), VIDEO_WAIT_SECS (120).
+//! MAX_RENDERS (1), EMBED_WAIT_SECS (25), VIDEO_WAIT_SECS (120), and the
+//! TypeScript fallback's (see engines.rs).
+//!
+//! Games from engine versions openfront-video doesn't follow render with
+//! render.ts and the TypeScript engine at the version they were played on.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -34,6 +38,7 @@ use tower_http::services::ServeFile;
 
 mod auto;
 mod cleanup;
+mod engines;
 mod slots;
 mod stats;
 
@@ -73,6 +78,8 @@ struct App {
     auto_status: Mutex<stats::AutoStatus>,
     /// When the server started (Unix seconds).
     started: u64,
+    /// TypeScript renders for games from engine versions the Rust build doesn't follow.
+    engines: Option<engines::Engines>,
 }
 
 enum Status {
@@ -177,34 +184,70 @@ impl App {
         let t0 = Instant::now();
         println!("render {id}: started{}", if auto { " (auto)" } else { "" });
         let tmp = |ext: &str| self.dir.join(format!(".{id}.tmp.{ext}"));
-        let mut cmd = tokio::process::Command::new(&self.bin);
-        cmd.arg(id)
-            .arg("--out")
-            .arg(tmp("mp4"))
-            .arg("--thumbnail")
-            .arg(tmp("png"))
-            .arg("--meta")
-            .arg(tmp("json"))
-            // Auto renders skip games from other engine versions right away.
-            .args(if auto { &["--same-engine"][..] } else { &[][..] })
-            .stdin(std::process::Stdio::null())
-            .kill_on_drop(true);
-        // Dropping the output future on preemption kills the renderer (kill_on_drop).
+        let work = async {
+            let mut cmd = tokio::process::Command::new(&self.bin);
+            cmd.arg(id)
+                .arg("--out")
+                .arg(tmp("mp4"))
+                .arg("--thumbnail")
+                .arg(tmp("png"))
+                .arg("--meta")
+                .arg(tmp("json"))
+                // Games from other engine versions stop right away (exit code 4): they
+                // go to the TypeScript engine, or are skipped by auto renders without it.
+                .args(if auto || self.engines.is_some() { &["--same-engine"][..] } else { &[][..] })
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true);
+            let out = tokio::time::timeout(RENDER_TIMEOUT, cmd.output()).await?;
+            let (Some(engines), Ok(out)) = (&self.engines, &out) else { return Ok(out) };
+            if out.status.code() != Some(4) {
+                return Ok(Ok(out.clone()));
+            }
+            let err = String::from_utf8_lossy(&out.stderr);
+            let Some(commit) = err.split("played on engine version ").nth(1).and_then(|r| r.split(',').next()) else {
+                return Ok(Ok(out.clone()));
+            };
+            println!("render {id}: played on engine {}, rendering with the TypeScript engine", &commit[..commit.len().min(9)]);
+            let lease = match engines.get(commit).await {
+                Ok(l) => l,
+                Err(e) => return Ok(Err(std::io::Error::other(e))),
+            };
+            let mut ts = tokio::process::Command::new("node");
+            ts.current_dir(&lease.dir)
+                .arg("--import")
+                .arg("tsx")
+                .arg(&engines.render_ts)
+                .arg(id)
+                .arg("--engine")
+                .arg(&lease.dir)
+                .arg("--out")
+                .arg(tmp("mp4"))
+                .arg("--thumbnail")
+                .arg(tmp("png"))
+                .arg("--meta")
+                .arg(tmp("json"))
+                .args(["--no-cache", "--strict"])
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true);
+            // The TypeScript engine is about twice as slow.
+            tokio::time::timeout(RENDER_TIMEOUT * 2, ts.output()).await
+        };
+        // Dropping the work on preemption kills the renderer (kill_on_drop).
         let result = tokio::select! {
-            r = tokio::time::timeout(RENDER_TIMEOUT, cmd.output()) => Some(r),
+            r = work => Some(r),
             _ = preempted => None,
         };
         let outcome = match result {
             None => Outcome::Preempted,
             Some(result) => match result {
             Err(_) => Outcome::Failed("the render took too long".into()),
-            Ok(Err(e)) => Outcome::Failed(format!("couldn't start the renderer: {e}")),
+            Ok(Err(e)) => Outcome::Failed(format!("couldn't render: {e}")),
             Ok(Ok(out)) if out.status.code() == Some(3) => Outcome::NotFound,
             Ok(Ok(out)) if !out.status.success() => {
                 // The renderer's last line says why ("error: ...", "... is not ported yet").
                 let err = String::from_utf8_lossy(&out.stderr);
                 let line = err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("the renderer failed");
-                let line = line.trim_start_matches("error: ").trim_start_matches("openfront-video stopped: ");
+                let line = line.trim_start_matches("error: ").trim_start_matches("Error: ").trim_start_matches("openfront-video stopped: ");
                 Outcome::Failed(line.to_string())
             }
             Ok(Ok(_)) => {
@@ -499,6 +542,7 @@ async fn main() {
         events: stats::EventLog::open(&dir_for_events),
         auto_status: Mutex::new(stats::AutoStatus::default()),
         started: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+        engines: engines::Engines::from_env(&dir_for_events),
     });
     cleanup::start(app.clone());
     if env_or("AUTO_RENDER", "1") != "0" {

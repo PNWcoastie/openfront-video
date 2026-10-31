@@ -8,3 +8,7 @@
 !web/Cargo.toml
 !web/Cargo.lock
 !web/src
+# render.ts, the TypeScript fallback, and its one package
+!render.ts
+!package.json
+!package-lock.json

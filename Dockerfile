@@ -42,16 +42,23 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cd web && cargo build --release --locked \
  && cp target/release/openfront-web /out/
 
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/* \
+# Node, git and ffmpeg run render.ts, the TypeScript fallback for games from
+# engine versions the Rust build doesn't follow: the server checks that version
+# out into /data/engines and renders with it (web/src/engines.rs).
+FROM node:24-bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git ffmpeg && rm -rf /var/lib/apt/lists/* \
  && useradd --system --create-home --uid 10001 openfront \
  && mkdir /data && chown openfront /data
+WORKDIR /app
+COPY package.json package-lock.json render.ts ./
+RUN npm ci --omit=dev --no-audit --no-fund
 COPY --from=build /out/openfront-video /out/openfront-web /usr/local/bin/
 USER openfront
 ENV PORT=8080 \
     DATA_DIR=/data \
     PUBLIC_URL=https://openfront.video \
     OPENFRONT_VIDEO_BIN=/usr/local/bin/openfront-video \
+    RENDER_TS=/app/render.ts \
     MAX_RENDERS=2
 VOLUME /data
 EXPOSE 8080

@@ -30,6 +30,8 @@
  *   --resim            simulate again even if the game is cached
  *   --threads <n>      drawing threads (cached games: default a third of the CPU cores, at most 6;
  *                      --rust: default 2)
+ *   --meta <file>      also write the game's and video's details as JSON (as openfront-video does)
+ *   --thumbnail <file> also save the last frame as a PNG
  *   --rust <exe>       simulate with engine-rs (the Rust port, built with cargo build --release)
  *                      instead of the TypeScript engine; doesn't read or write the cache
  */
@@ -89,6 +91,8 @@ interface Options {
   /** Whether --threads was given. */
   threadsSet?: boolean;
   rust?: string;
+  meta?: string;
+  thumbnail?: string;
 }
 
 function parseArgs(argv: string[]): Options {
@@ -136,6 +140,8 @@ function parseArgs(argv: string[]): Options {
       case "--resim": opts.resim = true; break;
       case "--threads": opts.threads = Math.max(1, Math.round(num())); opts.threadsSet = true; break;
       case "--rust": opts.rust = next(); break;
+      case "--meta": opts.meta = next(); break;
+      case "--thumbnail": opts.thumbnail = next(); break;
       case "-h":
       case "--help":
         say(fs.readFileSync(new URL(import.meta.url), "utf8").split("*/")[0]);
@@ -2560,9 +2566,37 @@ async function main() {
     say("");
     reportSpeed(total, info.duration);
     reportHashes(hashes);
+    writeExtras(opts, out, {
+      gameID: info.gameID,
+      map: info.config.gameMap,
+      mode: info.config.gameMode,
+      players: info.players.length,
+      durationSeconds: info.duration,
+      ticks: totalTicks,
+      width: outW,
+      height: outH,
+      videoSeconds: (frames + holdFrames) / opts.fps,
+      bytes: size,
+      renderSeconds: total / 1000,
+      hashesChecked: hashes.checked,
+      hashMismatches: hashes.mismatches,
+    });
   } catch (e) {
     cache?.discard();
     throw e;
+  }
+}
+
+/** --meta and --thumbnail (the last frame, taken from the video). */
+function writeExtras(opts: Options, video: string, meta: Record<string, unknown>) {
+  if (opts.meta) fs.writeFileSync(opts.meta, JSON.stringify(meta, null, 2));
+  if (opts.thumbnail) {
+    const r = spawnSync(
+      opts.ffmpeg,
+      ["-v", "error", "-y", "-sseof", "-0.5", "-i", video, "-update", "1", "-frames:v", "1", opts.thumbnail],
+      { encoding: "utf8" },
+    );
+    if (r.status !== 0) throw new Error(`couldn't save the thumbnail: ${r.stderr || r.error}`);
   }
 }
 

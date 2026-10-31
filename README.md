@@ -274,7 +274,23 @@ auto-refreshing pages. Neither ID is required; without them there are no ads.
 Settings (environment): `PORT` (8080), `DATA_DIR` (`/data` in the image),
 `PUBLIC_URL` (`https://openfront.video`, used for the absolute URLs in the tags),
 `MAX_RENDERS` (2), `EMBED_WAIT_SECS` (25), `VIDEO_WAIT_SECS` (120: how long a video
-request waits for a render in progress), `MAX_STORAGE_GB` (35), `OPENFRONT_VIDEO_BIN`.
+request waits for a render in progress), `MAX_STORAGE_GB` (35), `OPENFRONT_VIDEO_BIN`,
+`RENDER_TS` and `ENGINES_KEEP` (see below).
+
+### Games from other engine versions
+
+The Rust renderer follows the engine versions in `replay::ENGINE_COMMITS`. A game
+played on any other version, an older one or a release newer than the build, goes to
+the TypeScript engine at the exact commit it was played on. `openfront-video
+--same-engine` stops right away with exit code 4 and names the commit. The server then
+makes a checkout of OpenFrontIO at that commit in `/data/engines/<commit>`: a shallow,
+sparse clone plus `npm ci --omit=dev`, about 2 minutes and 1 GB the first time. It
+then renders with `render.ts --engine <checkout> --strict`, which writes the same
+video, thumbnail and details. So a new OpenFront release renders from its first game,
+without a rebuild; port it to Rust later for speed. The `ENGINES_KEEP` (3) most
+recently used checkouts are kept, outside `MAX_STORAGE_GB`. `RENDER_TS` is
+`/app/render.ts` in the image; without it, the fallback is off and such games render
+with the Rust engine anyway, where they may desync. Auto renders skip them in that case.
 
 ### Admin dashboard
 

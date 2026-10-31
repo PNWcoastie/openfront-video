@@ -48,7 +48,8 @@ Options:
   --bitrate <n>      target bitrate in Mbit/s (default: 6)
   --threads <n>      encoder threads (default: 4)
   --strict           stop if the replay desyncs from the archived hashes
-  --same-engine      stop right away if the game was played on another engine version
+  --same-engine      stop right away (exit code 4) if the game was played on another
+                     engine version; the message names its full commit
   --thumbnail <file> also save the last frame as a PNG
   --meta <file>      also write the game's and video's details as JSON
 ";
@@ -177,7 +178,16 @@ fn main() {
         eprintln!("error: {e}");
         // Exit code 3: the API has no such game (yet). The web service treats
         // that as "not finished" rather than as a failure.
-        std::process::exit(if e.starts_with("game ") && e.contains(" not found (") { 3 } else { 1 });
+        // Exit code 4: another engine version (--same-engine); the web service
+        // renders those with the TypeScript engine at that version.
+        let code = if e.starts_with("game ") && e.contains(" not found (") {
+            3
+        } else if e.starts_with("played on engine version ") {
+            4
+        } else {
+            1
+        };
+        std::process::exit(code);
     }
 }
 
@@ -207,11 +217,7 @@ fn run() -> Result<(), String> {
         let known = replay::ENGINE_COMMITS.contains(&played) || played == commit;
         if played != "DEV" && !known {
             if opts.same_engine {
-                return Err(format!(
-                    "played on engine version {}, this build follows {}",
-                    &played[..played.len().min(9)],
-                    &commit[..commit.len().min(9)]
-                ));
+                return Err(format!("played on engine version {played}, this build follows {}", &commit[..commit.len().min(9)]));
             }
             eprintln!(
                 "! this game was played on commit {}, but this build follows {}. The replay will probably desync.",
