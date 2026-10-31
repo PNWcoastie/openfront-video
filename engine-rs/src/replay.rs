@@ -15,10 +15,12 @@ use crate::rng::PseudoRandom;
 
 /// Engine versions the port replays identically. 9f4a28f is the one it was
 /// written against; c144d13 (v35) adds only the onboarding tutorial (behind
-/// `tutorial`, rejected in setup), its map and translations.
+/// `tutorial`, rejected in setup), its map and translations; 7ee9686 (v35) only
+/// changes the tutorial (two nations, a silo, atom bombs and starting troops).
 pub const ENGINE_COMMITS: &[&str] = &[
     "9f4a28f16fae951df0daf727e5e64b34ce8b77d1",
     "c144d134d1503191b4c3fd9a866fc583b9ecea4a",
+    "7ee96860c717b1ea36870cdfa6d4bb1e9bccd6de",
 ];
 
 /// A map's manifest and terrain files.

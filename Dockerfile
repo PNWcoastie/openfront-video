@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends nasm && rm -rf 
 
 # The engine version the Rust port follows; build.rs takes the maps, sprites,
 # font and theme from it. Only those folders are checked out.
-ARG OPENFRONT_COMMIT=c144d134d1503191b4c3fd9a866fc583b9ecea4a
+ARG OPENFRONT_COMMIT=7ee96860c717b1ea36870cdfa6d4bb1e9bccd6de
 WORKDIR /src
 RUN git init -q OpenFrontIO \
  && cd OpenFrontIO \
