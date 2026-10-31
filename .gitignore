@@ -31,3 +31,6 @@ node_modules/
 .idea/
 .DS_Store
 Thumbs.db
+/embedtest/*.webm
+/embedtest/*.mp4
+/embedtest/*.log

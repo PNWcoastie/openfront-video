@@ -33,6 +33,23 @@ services:
     expose:
       - "8080"
 
+  # Discord embed timing test (embedtest/server.mjs) on test.<DOMAIN>. Off unless
+  # started with: docker compose --profile test up -d
+  embedtest:
+    image: node:24-alpine
+    profiles: [test]
+    restart: unless-stopped
+    working_dir: /app
+    command: ["node", "server.mjs"]
+    environment:
+      PUBLIC_URL: https://test.${DOMAIN}
+      VIDEO: /app/test.webm
+      LOG: /app/embedtest.log
+    volumes:
+      - ./embedtest:/app
+    expose:
+      - "8090"
+
   caddy:
     image: caddy:2.10-alpine
     restart: unless-stopped

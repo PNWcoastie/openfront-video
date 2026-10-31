@@ -23,3 +23,14 @@ www.{$DOMAIN} {
 		format console
 	}
 }
+
+# Discord embed timing test (docker compose --profile test). Responses go out
+# as they're written (flush_interval -1), so the slow video really trickles.
+test.{$DOMAIN} {
+	reverse_proxy embedtest:8090 {
+		flush_interval -1
+		transport http {
+			read_timeout 10m
+		}
+	}
+}
