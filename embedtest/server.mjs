@@ -11,10 +11,11 @@
 // (video/webm), VIDEO_WIDTH/VIDEO_HEIGHT (1920x1080), PUBLIC_URL
 // (http://localhost:PORT), LOG (./embedtest.log).
 //
-// Modes, each at 0, 5, 10, 15, 30, 60, 120 and 240 s:
+// Modes, each at 0, 5, 6, 7, 8, 9, 10, 15, 30 and 60 s:
 //   slow     the video trickles over N s, with its real Content-Length and byte ranges
 //   chunked  the video trickles over N s with no length (chunked), ranges ignored
 //   page     the page itself is held N s, then the video comes at full speed
+//   front    the first FRONT_BYTES (1 MB) go out at once, the rest trickles over N s
 // Every link carries a fresh ID, so Discord can't answer from its cache.
 
 import fs from "node:fs";
@@ -29,8 +30,9 @@ const W = Number(process.env.VIDEO_WIDTH ?? 1920);
 const H = Number(process.env.VIDEO_HEIGHT ?? 1080);
 const PUBLIC = (process.env.PUBLIC_URL ?? `http://localhost:${PORT}`).replace(/\/$/, "");
 const LOG = process.env.LOG ?? "./embedtest.log";
-const DELAYS = [0, 5, 10, 15, 30, 60, 120, 240];
-const MODES = ["slow", "chunked", "page"];
+const DELAYS = [0, 5, 6, 7, 8, 9, 10, 15, 30, 60];
+const MODES = ["slow", "chunked", "page", "front"];
+const FRONT = Number(process.env.FRONT_BYTES ?? 1e6);
 
 const recent = [];
 // Without the video the server still starts, and says what's missing.
@@ -110,7 +112,7 @@ function index(res) {
 ${problem ? `<p style="color:#ff8080"><b>Problem:</b> ${esc(problem)}</p>` : ""}
 <p>Fresh links on every reload. Video: ${esc(VIDEO)}, ${(video.length / 1e6).toFixed(1)} MB.
 slow = video trickles over N s with Content-Length; chunked = trickles with no length;
-page = the page is held N s. Log: <a href="/log">/log</a></p>${rows}`);
+page = the page is held N s; front = first ${(FRONT / 1e6).toFixed(1)} MB at once, then trickles. Log: <a href="/log">/log</a></p>${rows}`);
 }
 
 function page(res, mode, id, secs) {
@@ -184,7 +186,10 @@ function trickle(req, res, mode, secs, tag) {
   }
   const t0 = Date.now();
   // Full speed when secs = 0 (or page mode); otherwise the file's rate over `secs`.
-  const rate = mode === "page" || secs === 0 ? Infinity : total / secs; // bytes per second
+  // Bytes due right away; the rest goes out evenly over `secs` (full speed when
+  // secs = 0 or in page mode).
+  const head = mode === "front" ? Math.min(FRONT, end + 1 - start) : 0;
+  const rate = mode === "page" || secs === 0 ? Infinity : (total - head) / secs; // bytes per second
   let pos = start;
   let done = false;
   const finish = (how) => {
@@ -195,7 +200,7 @@ function trickle(req, res, mode, secs, tag) {
   };
   const step = () => {
     if (done) return;
-    const due = rate === Infinity ? end + 1 : Math.min(end + 1, start + Math.floor(((Date.now() - t0) / 1000) * rate));
+    const due = rate === Infinity ? end + 1 : Math.min(end + 1, start + head + Math.floor(((Date.now() - t0) / 1000) * rate));
     if (due > pos) {
       res.write(video.subarray(pos, due));
       pos = due;
@@ -220,11 +225,11 @@ http
       res.writeHead(200, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" });
       return res.end(recent.slice(-500).join("\n") + "\n");
     }
-    if ((m = /^\/t\/(slow|chunked|page)\/([0-9a-f]+)-(\d+)$/.exec(p))) {
+    if ((m = /^\/t\/(slow|chunked|page|front)\/([0-9a-f]+)-(\d+)$/.exec(p))) {
       log(`page  ${m[1]} ${m[3]}s id=${m[2]} ${who(req)}`);
       return page(res, m[1], m[2], Number(m[3]));
     }
-    if ((m = /^\/f\/(slow|chunked|page)\/([0-9a-f]+)-(\d+)\.\w+$/.exec(p))) {
+    if ((m = /^\/f\/(slow|chunked|page|front)\/([0-9a-f]+)-(\d+)\.\w+$/.exec(p))) {
       const tag = `video ${m[1]} ${m[3]}s id=${m[2]} ${who(req)}`;
       log(`${tag} start`);
       return trickle(req, res, m[1], Number(m[3]), tag);
