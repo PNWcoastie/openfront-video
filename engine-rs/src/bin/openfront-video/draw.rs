@@ -3,6 +3,7 @@
 //! progress bar.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 
 use tiny_skia::{
     Color, FillRule, FilterQuality, LineJoin, Paint, PathBuilder, Pixmap, PixmapPaint, Rect, Stroke, Transform,
@@ -10,6 +11,50 @@ use tiny_skia::{
 
 use crate::assets;
 use crate::look::{channels, mix, rgba, Settings, Style, GRAY};
+
+#[derive(Default)]
+struct FxHasher(u64);
+
+impl Hasher for FxHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = self.0;
+        for &b in bytes {
+            h = (h.rotate_left(5) ^ (b as u64)).wrapping_mul(0x517cc1b727220a95);
+        }
+        self.0 = h;
+    }
+    #[inline]
+    fn write_u8(&mut self, i: u8) {
+        self.0 = (self.0.rotate_left(5) ^ (i as u64)).wrapping_mul(0x517cc1b727220a95);
+    }
+    #[inline]
+    fn write_u16(&mut self, i: u16) {
+        self.0 = (self.0.rotate_left(5) ^ (i as u64)).wrapping_mul(0x517cc1b727220a95);
+    }
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.0 = (self.0.rotate_left(5) ^ (i as u64)).wrapping_mul(0x517cc1b727220a95);
+    }
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0.rotate_left(5) ^ i).wrapping_mul(0x517cc1b727220a95);
+    }
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.write_u64(i as u64);
+    }
+    #[inline]
+    fn write_i32(&mut self, i: i32) {
+        self.write_u32(i as u32);
+    }
+}
+
+type FxHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
 /// A name label: the engine's placement and the text to draw.
 pub struct Label {
@@ -105,6 +150,20 @@ fn load_atlas(png: &[u8]) -> Atlas {
     Atlas { w: pixmap.width(), h: pixmap.height(), rgba, pixmap }
 }
 
+const TROOP_CHARS: [u8; 14] = *b"0123456789.KMB";
+
+#[inline]
+fn troop_char_idx(b: u8) -> Option<usize> {
+    match b {
+        b'0'..=b'9' => Some((b - b'0') as usize),
+        b'.' => Some(10),
+        b'K' => Some(11),
+        b'M' => Some(12),
+        b'B' => Some(13),
+        _ => None,
+    }
+}
+
 /// The name font, shaped with rustybuzz (HarfBuzz, as the canvas does) so
 /// kerning matches.
 struct Font {
@@ -112,12 +171,37 @@ struct Font {
     /// Ascender + descender (font units): textBaseline "middle" puts the
     /// baseline half of that below the given y.
     middle: f32,
+    units_per_em: f32,
+    /// Pre-shaped single-glyph metrics for the 14 troop ASCII characters: (glyph_id, x_offset, y_offset, x_advance).
+    troop_glyphs: [(ttf_parser::GlyphId, f32, f32, f32); 14],
+    /// Pairwise x_advance for troop ASCII character pairs (includes GPOS kerning).
+    troop_pair_adv: [[f32; 14]; 14],
+    /// Cached shaped lines for player names and strings.
+    shaped_cache: FxHashMap<String, Shaped>,
 }
 
 /// A shaped line: glyphs with their pen offsets, in font units.
+#[derive(Clone)]
 struct Shaped {
     glyphs: Vec<(ttf_parser::GlyphId, f32, f32)>,
     width: f32,
+}
+
+#[derive(PartialEq, Eq, Hash, Clone, Copy)]
+struct GlyphKey {
+    glyph_id: u16,
+    size10: u32,
+    fx: u8,
+    fy: u8,
+}
+
+struct CachedGlyph {
+    w: u32,
+    h: u32,
+    dx: i32,
+    dy: i32,
+    stroke_alpha: Vec<u8>,
+    fill_alpha: Vec<u8>,
 }
 
 struct Outline<'a> {
@@ -156,10 +240,43 @@ impl Font {
     fn new() -> Font {
         let face = rustybuzz::Face::from_slice(assets::FONT, 0).expect("font");
         let middle = (face.ascender() as f32 + face.descender() as f32) / 2.0;
-        Font { face, middle }
+        let units_per_em = face.units_per_em() as f32;
+        let mut troop_glyphs = [(ttf_parser::GlyphId(0), 0.0, 0.0, 0.0); 14];
+        for (i, &b) in TROOP_CHARS.iter().enumerate() {
+            let s = std::str::from_utf8(std::slice::from_ref(&b)).unwrap();
+            let mut buf = rustybuzz::UnicodeBuffer::new();
+            buf.push_str(s);
+            let out = rustybuzz::shape(&face, &[], buf);
+            if !out.glyph_infos().is_empty() {
+                let info = out.glyph_infos()[0];
+                let pos = out.glyph_positions()[0];
+                troop_glyphs[i] = (
+                    ttf_parser::GlyphId(info.glyph_id as u16),
+                    pos.x_offset as f32,
+                    pos.y_offset as f32,
+                    pos.x_advance as f32,
+                );
+            }
+        }
+        let mut troop_pair_adv = [[0.0f32; 14]; 14];
+        for (i, &b0) in TROOP_CHARS.iter().enumerate() {
+            for (j, &b1) in TROOP_CHARS.iter().enumerate() {
+                let pair = [b0, b1];
+                let s = std::str::from_utf8(&pair).unwrap();
+                let mut buf = rustybuzz::UnicodeBuffer::new();
+                buf.push_str(s);
+                let out = rustybuzz::shape(&face, &[], buf);
+                troop_pair_adv[i][j] = if !out.glyph_positions().is_empty() {
+                    out.glyph_positions()[0].x_advance as f32
+                } else {
+                    troop_glyphs[i].3
+                };
+            }
+        }
+        Font { face, middle, units_per_em, troop_glyphs, troop_pair_adv, shaped_cache: FxHashMap::default() }
     }
 
-    fn shape(&self, text: &str) -> Shaped {
+    fn shape_raw(&self, text: &str) -> Shaped {
         let mut buf = rustybuzz::UnicodeBuffer::new();
         buf.push_str(text);
         let out = rustybuzz::shape(&self.face, &[], buf);
@@ -176,20 +293,92 @@ impl Font {
         Shaped { glyphs, width: pen }
     }
 
-    /// Width of the text at this size, in pixels.
-    fn measure(&self, line: &Shaped, size: f32) -> f32 {
-        line.width * size / self.face.units_per_em() as f32
+    /// Fast troop-string width in font units without rustybuzz, or None if non-troop chars present.
+    #[inline]
+    fn troop_width_units(&self, text: &str) -> Option<f32> {
+        let bytes = text.as_bytes();
+        let mut pen = 0.0f32;
+        let mut prev: Option<usize> = None;
+        for &b in bytes {
+            let idx = troop_char_idx(b)?;
+            if let Some(p) = prev {
+                pen += self.troop_pair_adv[p][idx];
+            }
+            prev = Some(idx);
+        }
+        if let Some(last) = prev {
+            pen += self.troop_glyphs[last].3;
+        }
+        Some(pen)
     }
 
-    /// The text's outline with its left end at x and the "middle" baseline at y.
-    fn path(&self, line: &Shaped, size: f32, x: f32, y: f32) -> Option<tiny_skia::Path> {
-        let s = size / self.face.units_per_em() as f32;
-        let mut pb = PathBuilder::new();
-        let baseline = y + self.middle * s;
-        for &(g, dx, dy) in &line.glyphs {
-            self.face.outline_glyph(g, &mut Outline { pb: &mut pb, x: x + dx * s, y: baseline - dy * s, s });
+    /// Width of `text` at `size` pixels without shaping on cache hits or troop strings.
+    #[inline]
+    fn text_width(&mut self, text: &str, size: f32) -> f32 {
+        let width_units = if let Some(w) = self.troop_width_units(text) {
+            w
+        } else if let Some(shaped) = self.shaped_cache.get(text) {
+            shaped.width
+        } else {
+            let shaped = self.shape_raw(text);
+            let w = shaped.width;
+            self.shaped_cache.insert(text.to_string(), shaped);
+            w
+        };
+        width_units * size / self.units_per_em
+    }
+
+    fn shape(&mut self, text: &str) -> Shaped {
+        if let Some(shaped) = self.shaped_cache.get(text) {
+            return shaped.clone();
         }
-        pb.finish()
+        let bytes = text.as_bytes();
+        if !bytes.is_empty() && bytes.iter().all(|&b| troop_char_idx(b).is_some()) {
+            let mut pen = 0.0f32;
+            let mut glyphs = Vec::with_capacity(bytes.len());
+            for k in 0..bytes.len() {
+                let idx = troop_char_idx(bytes[k]).unwrap();
+                let (gid, x_off, y_off, x_adv) = self.troop_glyphs[idx];
+                if gid.0 != 0 {
+                    glyphs.push((gid, pen + x_off, y_off));
+                    if k + 1 < bytes.len() {
+                        let next_idx = troop_char_idx(bytes[k + 1]).unwrap();
+                        pen += self.troop_pair_adv[idx][next_idx];
+                    } else {
+                        pen += x_adv;
+                    }
+                }
+            }
+            return Shaped { glyphs, width: pen };
+        }
+        let shaped = self.shape_raw(text);
+        self.shaped_cache.insert(text.to_string(), shaped.clone());
+        shaped
+    }
+
+    fn render_glyph(&self, key: GlyphKey, u: f64, outline_width: f64) -> Option<CachedGlyph> {
+        let font_size = key.size10 as f32 / 10.0;
+        let s = font_size / self.units_per_em;
+        let (ox, oy) = (key.fx as f32 / 4.0, key.fy as f32 / 4.0);
+        let mut pb = PathBuilder::new();
+        self.face.outline_glyph(ttf_parser::GlyphId(key.glyph_id), &mut Outline { pb: &mut pb, x: ox, y: oy, s });
+        let path = pb.finish()?;
+        let size = key.size10 as f64 / 10.0;
+        let width = ((1.5 * u).max(size * 0.12) * (outline_width / 1.4)) as f32;
+        let b = path.bounds();
+        let m = width / 2.0 + 2.0;
+        let (dx, dy) = ((b.left() - m).floor() as i32, (b.top() - m).floor() as i32);
+        let (w, h) = (((b.right() + m).ceil() as i32 - dx).max(1) as u32, ((b.bottom() + m).ceil() as i32 - dy).max(1) as u32);
+        let t = Transform::from_translate(-dx as f32, -dy as f32);
+        let white = paint(0xffff_ffff);
+        let stroke = Stroke { width, line_join: LineJoin::Round, ..Default::default() };
+        let mut spx = Pixmap::new(w, h)?;
+        spx.stroke_path(&path, &white, &stroke, t, None);
+        let stroke_alpha: Vec<u8> = spx.data().chunks_exact(4).map(|p| p[3]).collect();
+        let mut fpx = Pixmap::new(w, h)?;
+        fpx.fill_path(&path, &white, FillRule::Winding, t, None);
+        let fill_alpha: Vec<u8> = fpx.data().chunks_exact(4).map(|p| p[3]).collect();
+        Some(CachedGlyph { w, h, dx, dy, stroke_alpha, fill_alpha })
     }
 }
 
@@ -239,6 +428,54 @@ fn quarter(v: f64) -> (i32, u8) {
     (q.div_euclid(4) as i32, q.rem_euclid(4) as u8)
 }
 
+/// Blits a premultiplied `src` Pixmap onto the opaque `canvas` at integer `(dst_x, dst_y)`
+/// and records the clipped destination rectangle for next-frame dirty-rect restoration.
+#[inline]
+fn blit_pixmap(
+    canvas: &mut Pixmap,
+    overlay_rects: &mut Vec<(u16, u16, u16, u16)>,
+    out_w: i32,
+    out_h: i32,
+    dst_x: i32,
+    dst_y: i32,
+    src: &Pixmap,
+) {
+    let sw = src.width() as i32;
+    let sh = src.height() as i32;
+    let x0 = dst_x.max(0);
+    let y0 = dst_y.max(0);
+    let x1 = (dst_x + sw).min(out_w);
+    let y1 = (dst_y + sh).min(out_h);
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    overlay_rects.push((x0 as u16, y0 as u16, x1 as u16, y1 as u16));
+    let cw = out_w as usize;
+    let sw_u = sw as usize;
+    let sx_start = (x0 - dst_x) as usize;
+    let len = (x1 - x0) as usize;
+    let s_data = src.data();
+    let d_data = canvas.data_mut();
+    for y in y0..y1 {
+        let sy = (y - dst_y) as usize;
+        let s_row = &s_data[(sy * sw_u + sx_start) * 4..(sy * sw_u + sx_start + len) * 4];
+        let d_row = &mut d_data[(y as usize * cw + x0 as usize) * 4..(y as usize * cw + x0 as usize + len) * 4];
+        for (sp, dp) in s_row.chunks_exact(4).zip(d_row.chunks_exact_mut(4)) {
+            let sa = sp[3];
+            if sa == 0 {
+                continue;
+            } else if sa == 255 {
+                dp.copy_from_slice(sp);
+            } else {
+                let inv = 255 - sa as u32;
+                dp[0] = sp[0] + ((dp[0] as u32 * inv + 127) / 255) as u8;
+                dp[1] = sp[1] + ((dp[1] as u32 * inv + 127) / 255) as u8;
+                dp[2] = sp[2] + ((dp[2] as u32 * inv + 127) / 255) as u8;
+            }
+        }
+    }
+}
+
 pub struct Renderer {
     w: usize,
     h: usize,
@@ -248,9 +485,10 @@ pub struct Renderer {
     terrain: Vec<u32>,
     owner: Vec<u16>,
     fallout: Vec<u8>,
+    fallout_colors: [u32; 256],
     /// Each tile's color.
     tile_colors: Vec<u32>,
-    styles: HashMap<u16, Style>,
+    styles: Vec<Style>,
     /// Tiles to recolor at the next frame (changed tiles and their neighbors).
     touched: Vec<u32>,
     stamp: Vec<u32>,
@@ -262,26 +500,31 @@ pub struct Renderer {
     col_hi: Vec<i32>,
     row_lo: Vec<i32>,
     row_hi: Vec<i32>,
-    /// The scaled map, without overlays.
-    base: Vec<u32>,
+    /// The scaled map, without overlays (RGBA8 pixels: `out_w * out_h`).
+    base: Vec<[u8; 4]>,
     dirty: Vec<bool>,
     bx_n: usize,
     full_pending: bool,
     canvas: Pixmap,
+    overlay_rects: Vec<(u16, u16, u16, u16)>,
     scale: f64,
     u: f64,
     icon_atlas: Atlas,
     unit_atlas: Atlas,
     status_atlas: Pixmap,
     /// Status icons scaled down, by (atlas cell, size in pixels).
-    status_icons: HashMap<(u32, u32), Pixmap>,
+    status_icons: FxHashMap<(u32, u32), Pixmap>,
     font: Font,
-    unit_sprites: HashMap<(u16, i32), Pixmap>,
-    structure_sprites: HashMap<(u16, i32, bool), Pixmap>,
+    unit_sprites: FxHashMap<(u16, i32), Pixmap>,
+    structure_sprites: FxHashMap<(u16, i32, bool), Pixmap>,
     /// Units and text lines drawn once and copied in at whole pixels, per
     /// quarter-pixel offset; entries unused for a while are dropped.
-    placed_units: HashMap<(u16, i32, u8, u8), Placed>,
-    placed_text: HashMap<TextKey, Placed>,
+    placed_units: FxHashMap<(u16, i32, u8, u8), Placed>,
+    placed_text: FxHashMap<TextKey, Placed>,
+    glyph_cache: FxHashMap<GlyphKey, Option<CachedGlyph>>,
+    glyph_pos_buf: Vec<(i32, i32, GlyphKey)>,
+    structures_buf: Vec<(i32, i32, u16, bool)>,
+    missiles_buf: Vec<(i32, i32, u16)>,
     frame_no: u64,
     /// Frames with nuke targets, and status icons drawn per cell (for OPENFRONT_DRAW_PROFILE).
     pub overlay_counts: (u64, [u64; 12]),
@@ -293,6 +536,17 @@ impl Renderer {
     pub fn new(w: usize, h: usize, out_w: usize, out_h: usize, terrain_bytes: &[u8], settings: Settings) -> Renderer {
         let n = w * h;
         let terrain: Vec<u32> = terrain_bytes.iter().map(|&t| settings.terrain_color(t)).collect();
+        let mut fallout_colors = [0u32; 256];
+        for (idx, fc) in fallout_colors.iter_mut().enumerate() {
+            let noise = idx as f64 / 255.0;
+            let nv = (settings.stale_nuke_base + noise * settings.stale_nuke_variation) * 255.0;
+            let c = |i: usize| (crate::look::js_round(settings.stale_nuke_rgb[i] * 255.0) + nv).min(255.0);
+            *fc = rgba(
+                crate::look::js_round(c(0)) as u32,
+                crate::look::js_round(c(1)) as u32,
+                crate::look::js_round(c(2)) as u32,
+            );
+        }
         let mut src = vec![0u32; out_w * out_h];
         for y in 0..out_h {
             let sy = (((y as f64 + 0.5) * h as f64 / out_h as f64).floor() as usize).min(h - 1);
@@ -328,7 +582,8 @@ impl Renderer {
             terrain,
             owner: vec![0; n],
             fallout: vec![0; n],
-            styles: HashMap::new(),
+            fallout_colors,
+            styles: vec![GRAY; 1],
             touched: Vec::new(),
             stamp: vec![0; n],
             stamp_gen: 1,
@@ -337,22 +592,27 @@ impl Renderer {
             col_hi,
             row_lo,
             row_hi,
-            base: vec![0; out_w * out_h],
+            base: vec![[0; 4]; out_w * out_h],
             dirty: vec![false; bx_n * by_n],
             bx_n,
             full_pending: true,
             canvas: Pixmap::new(out_w as u32, out_h as u32).unwrap(),
+            overlay_rects: Vec::with_capacity(4096),
             scale: out_w as f64 / w as f64,
             u: out_w as f64 / 1280.0,
             icon_atlas: load_atlas(assets::ICON_ATLAS),
             unit_atlas: load_atlas(assets::UNIT_ATLAS),
             status_atlas: Pixmap::decode_png(assets::STATUS_ATLAS).expect("status atlas png"),
-            status_icons: HashMap::new(),
+            status_icons: FxHashMap::default(),
             font: Font::new(),
-            unit_sprites: HashMap::new(),
-            structure_sprites: HashMap::new(),
-            placed_units: HashMap::new(),
-            placed_text: HashMap::new(),
+            unit_sprites: FxHashMap::default(),
+            structure_sprites: FxHashMap::default(),
+            placed_units: FxHashMap::default(),
+            placed_text: FxHashMap::default(),
+            glyph_cache: FxHashMap::default(),
+            glyph_pos_buf: Vec::new(),
+            structures_buf: Vec::new(),
+            missiles_buf: Vec::new(),
             frame_no: 0,
             overlay_counts: (0, [0; 12]),
             profile: std::env::var("OPENFRONT_DRAW_PROFILE").is_ok().then(Vec::new),
@@ -360,27 +620,27 @@ impl Renderer {
     }
 
     pub fn set_style(&mut self, id: u16, s: Style) {
-        self.styles.insert(id, s);
+        let idx = id as usize;
+        if idx >= self.styles.len() {
+            self.styles.resize(idx + 1, GRAY);
+        }
+        self.styles[idx] = s;
     }
 
+    #[inline]
     fn style(&self, id: u16) -> Style {
-        self.styles.get(&id).copied().unwrap_or(GRAY)
+        self.styles.get(id as usize).copied().unwrap_or(GRAY)
     }
 
+    #[inline]
     fn tile_color(&self, r: usize) -> u32 {
         let o = self.owner[r];
         let s = &self.settings;
         if self.fallout[r] != 0 {
             // As territory.frag: any fallout tile, owned or not, is flat green
             // ground brightened by a little per-tile noise.
-            let noise = ((r as u64 * 2654435761) as u32 >> 24) as f64 / 255.0;
-            let n = (s.stale_nuke_base + noise * s.stale_nuke_variation) * 255.0;
-            let c = |i: usize| (crate::look::js_round(s.stale_nuke_rgb[i] * 255.0) + n).min(255.0);
-            return rgba(
-                crate::look::js_round(c(0)) as u32,
-                crate::look::js_round(c(1)) as u32,
-                crate::look::js_round(c(2)) as u32,
-            );
+            let noise_idx = ((r as u64).wrapping_mul(2654435761) as u32 >> 24) as usize;
+            return self.fallout_colors[noise_idx];
         }
         if o == 0 {
             return self.terrain[r];
@@ -450,28 +710,54 @@ impl Renderer {
         self.stamp_gen += 1;
     }
 
-    /// Brings the scaled map up to date where tiles changed.
+    /// Brings the scaled map up to date where tiles changed, and copies dirty
+    /// blocks to the canvas.
     fn update_base(&mut self) {
         if self.full_pending {
             for (px, &s) in self.base.iter_mut().zip(&self.src) {
-                *px = self.tile_colors[s as usize];
+                *px = self.tile_colors[s as usize].to_le_bytes();
             }
+            self.canvas.data_mut().copy_from_slice(self.base.as_flattened());
             self.full_pending = false;
             self.dirty.fill(false);
+            self.overlay_rects.clear();
             return;
         }
+        let out_w = self.out_w;
+        let canvas_bytes = self.canvas.data_mut();
         for (b, d) in self.dirty.iter_mut().enumerate() {
             if !*d {
                 continue;
             }
             *d = false;
             let (x0, y0) = ((b % self.bx_n) * BLOCK, (b / self.bx_n) * BLOCK);
-            let (x1, y1) = ((x0 + BLOCK).min(self.out_w), (y0 + BLOCK).min(self.out_h));
+            let (x1, y1) = ((x0 + BLOCK).min(out_w), (y0 + BLOCK).min(self.out_h));
             for y in y0..y1 {
-                let row = y * self.out_w;
+                let row = y * out_w;
                 for i in row + x0..row + x1 {
-                    self.base[i] = self.tile_colors[self.src[i] as usize];
+                    self.base[i] = self.tile_colors[self.src[i] as usize].to_le_bytes();
                 }
+                let b0 = (row + x0) * 4;
+                let b1 = (row + x1) * 4;
+                canvas_bytes[b0..b1].copy_from_slice(self.base[row + x0..row + x1].as_flattened());
+            }
+        }
+    }
+
+    /// Restores rectangles where overlays were drawn on the previous frame from `self.base`.
+    fn restore_overlays(&mut self) {
+        if self.overlay_rects.is_empty() {
+            return;
+        }
+        let out_w = self.out_w;
+        let canvas_bytes = self.canvas.data_mut();
+        for (x0, y0, x1, y1) in self.overlay_rects.drain(..) {
+            let (x0, y0, x1, y1) = (x0 as usize, y0 as usize, x1 as usize, y1 as usize);
+            for y in y0..y1 {
+                let row = y * out_w;
+                let b0 = (row + x0) * 4;
+                let b1 = (row + x1) * 4;
+                canvas_bytes[b0..b1].copy_from_slice(self.base[row + x0..row + x1].as_flattened());
             }
         }
     }
@@ -575,7 +861,7 @@ impl Renderer {
         }
         let p = self.placed_units.get_mut(&(o, col, fx, fy)).unwrap();
         p.used = frame;
-        self.canvas.draw_pixmap(ix + p.dx, iy + p.dy, p.pixmap.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+        blit_pixmap(&mut self.canvas, &mut self.overlay_rects, self.out_w as i32, self.out_h as i32, ix + p.dx, iy + p.dy, &p.pixmap);
     }
 
     fn draw_structure(&mut self, col: i32, tile: i32, o: u16, building: bool) {
@@ -585,7 +871,7 @@ impl Renderer {
         let half = sprite.width() as f64 / 2.0;
         let x = crate::look::js_round(tx - half) as i32;
         let y = crate::look::js_round(ty - half) as i32;
-        self.canvas.draw_pixmap(x, y, sprite.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+        blit_pixmap(&mut self.canvas, &mut self.overlay_rects, self.out_w as i32, self.out_h as i32, x, y, sprite);
     }
 
     /// A status icon at `size` pixels: the atlas cell's content, halved down
@@ -625,7 +911,7 @@ impl Renderer {
             let x = (cx - total / 2.0 + i as f64 * (size + gap)).round() as i32;
             self.status_icon(cell, size as u32);
             let icon = &self.status_icons[&(cell, size as u32)];
-            self.canvas.draw_pixmap(x, top, icon.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+            blit_pixmap(&mut self.canvas, &mut self.overlay_rects, self.out_w as i32, self.out_h as i32, x, top, icon);
         }
     }
 
@@ -649,6 +935,14 @@ impl Renderer {
         for &(tile, inner, outer) in nukes {
             let (x, y) = (self.to_x(tile as i32) as f32, self.to_y(tile as i32) as f32);
             let (ri, ro) = (inner as f32 * scale, outer as f32 * scale);
+            let r_max = ri.max(ro) + stroke_w + 2.0;
+            let nx0 = (x - r_max).floor().max(0.0) as usize;
+            let ny0 = (y - r_max).floor().max(0.0) as usize;
+            let nx1 = ((x + r_max).ceil().max(0.0) as usize).min(self.out_w);
+            let ny1 = ((y + r_max).ceil().max(0.0) as usize).min(self.out_h);
+            if nx0 < nx1 && ny0 < ny1 {
+                self.overlay_rects.push((nx0 as u16, ny0 as u16, nx1 as u16, ny1 as u16));
+            }
             let Some(disc) = PathBuilder::from_circle(x, y, ri) else { continue };
             self.canvas.fill_path(&disc, &red(alpha - 0.6), FillRule::Winding, Transform::identity(), None);
             let edge = Stroke { width: stroke_w, ..Default::default() };
@@ -663,51 +957,124 @@ impl Renderer {
     /// Names: the engine's placement, sized like the client's name pass.
     fn draw_names(&mut self, labels: &[Label]) {
         let (scale, u, out_w) = (self.scale, self.u, self.out_w as f64);
+        let (out_w_i, out_h_i) = (self.out_w as i32, self.out_h as i32);
+        let (name_scale_factor, name_scale_cap, troop_size_multiplier, outline_width) = (
+            self.settings.name_scale_factor,
+            self.settings.name_scale_cap,
+            self.settings.troop_size_multiplier,
+            self.settings.outline_width,
+        );
         for n in labels {
-            let s = &self.settings;
             let base = n.size.floor().max(1.0);
-            let name_size = (base * s.name_scale_factor).floor().max(4.0);
-            let name_scale = (base * 0.25).min(s.name_scale_cap);
+            let name_size = (base * name_scale_factor).floor().max(4.0);
+            let name_scale = (base * 0.25).min(name_scale_cap);
             let em = name_size * name_scale * scale;
             if em < 6.0 * u {
                 continue; // too small to read
             }
-            let st = self.styles.get(&n.owner).copied().unwrap_or(GRAY);
+            let st = self.style(n.owner);
             let y = n.y * scale;
             // The troop line sits 1.1 baselines below the name (name.vert.glsl);
             // the font's baseline is 36/48 of its size.
-            let lines = [(&n.name, y, em), (&n.troops, y + em * 0.75 * 1.1, em * s.troop_size_multiplier)];
+            let lines = [(&n.name, y, em), (&n.troops, y + em * 0.75 * 1.1, em * troop_size_multiplier)];
             let mut name_x = None;
             for (text, ly, size) in lines {
                 // ctx.font = `${size.toFixed(1)}px ...`
                 let size10 = (size * 10.0).round() as u32;
                 let font_size = size10 as f32 / 10.0;
-                let line = self.font.shape(text);
                 // Keep the text inside the video; the game would let you pan to it.
-                let half = self.font.measure(&line, font_size) as f64 / 2.0 + 2.0 * u;
+                let half = self.font.text_width(text, font_size) as f64 / 2.0 + 2.0 * u;
                 let x = (n.x * scale).max(half).min(half.max(out_w - half));
                 name_x.get_or_insert(x);
                 let ((ix, fx), (iy, fy)) = (quarter(x - (half - 2.0 * u)), quarter(ly));
                 let key = TextKey { text: text.clone(), size10, owner: n.owner, fx, fy };
                 let frame = self.frame_no;
-                if !self.placed_text.contains_key(&key) {
-                    let (ox, oy) = (fx as f32 / 4.0, fy as f32 / 4.0);
-                    let Some(path) = self.font.path(&line, font_size, ox, oy) else { continue };
-                    let width = ((1.5 * u).max(size * 0.12) * (s.outline_width / 1.4)) as f32;
-                    let b = path.bounds();
-                    let m = width / 2.0 + 2.0;
-                    let (dx, dy) = ((b.left() - m).floor() as i32, (b.top() - m).floor() as i32);
-                    let (w, h) = ((b.right() + m).ceil() as i32 - dx, (b.bottom() + m).ceil() as i32 - dy);
-                    let mut px = Pixmap::new(w.max(1) as u32, h.max(1) as u32).unwrap();
-                    let t = Transform::from_translate(-dx as f32, -dy as f32);
-                    let stroke = Stroke { width, line_join: LineJoin::Round, ..Default::default() };
-                    px.stroke_path(&path, &paint(st.fill), &stroke, t, None);
-                    px.fill_path(&path, &paint(st.name_shade), FillRule::Winding, t, None);
-                    self.placed_text.insert(TextKey { text: text.clone(), size10, owner: n.owner, fx, fy }, Placed { pixmap: px, dx, dy, used: frame });
+                if let Some(p) = self.placed_text.get_mut(&key) {
+                    p.used = frame;
+                    blit_pixmap(&mut self.canvas, &mut self.overlay_rects, out_w_i, out_h_i, ix + p.dx, iy + p.dy, &p.pixmap);
+                    continue;
                 }
-                let p = self.placed_text.get_mut(&key).unwrap();
-                p.used = frame;
-                self.canvas.draw_pixmap(ix + p.dx, iy + p.dy, p.pixmap.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+                let line = self.font.shape(text);
+                let (ox, oy) = (fx as f32 / 4.0, fy as f32 / 4.0);
+                let s_em = font_size / self.font.units_per_em;
+                let baseline = oy + self.font.middle * s_em;
+                self.glyph_pos_buf.clear();
+                let (mut min_x, mut min_y, mut max_x, mut max_y) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+                for &(g, gx_font, gy_font) in &line.glyphs {
+                    let gx = ox + gx_font * s_em;
+                    let gy = baseline - gy_font * s_em;
+                    let (g_ix, g_fx) = quarter(gx as f64);
+                    let (g_iy, g_fy) = quarter(gy as f64);
+                    let gkey = GlyphKey { glyph_id: g.0, size10, fx: g_fx, fy: g_fy };
+                    if !self.glyph_cache.contains_key(&gkey) {
+                        let rendered = self.font.render_glyph(gkey, u, outline_width);
+                        self.glyph_cache.insert(gkey, rendered);
+                    }
+                    if let Some(cg) = &self.glyph_cache[&gkey] {
+                        min_x = min_x.min(g_ix + cg.dx);
+                        min_y = min_y.min(g_iy + cg.dy);
+                        max_x = max_x.max(g_ix + cg.dx + cg.w as i32);
+                        max_y = max_y.max(g_iy + cg.dy + cg.h as i32);
+                        self.glyph_pos_buf.push((g_ix, g_iy, gkey));
+                    }
+                }
+                if min_x >= max_x || min_y >= max_y {
+                    continue;
+                }
+                let (pw, ph) = ((max_x - min_x) as usize, (max_y - min_y) as usize);
+                let mut px = Pixmap::new(pw as u32, ph as u32).unwrap();
+                let data = px.data_mut();
+                let [sr, sg, sb] = channels(st.fill);
+                let [fr, fg, fb] = channels(st.name_shade);
+                // Pass 1: composite all glyph outlines first so adjacent strokes never paint over fills.
+                for &(g_ix, g_iy, gkey) in &self.glyph_pos_buf {
+                    let Some(cg) = &self.glyph_cache[&gkey] else { continue };
+                    let (bx, by) = ((g_ix + cg.dx - min_x) as usize, (g_iy + cg.dy - min_y) as usize);
+                    let gw = cg.w as usize;
+                    for row in 0..cg.h as usize {
+                        let src_row = &cg.stroke_alpha[row * gw..(row + 1) * gw];
+                        let dst_row = &mut data[((by + row) * pw + bx) * 4..((by + row) * pw + bx + gw) * 4];
+                        for (sa, dst) in src_row.iter().copied().zip(dst_row.chunks_exact_mut(4)) {
+                            if sa > dst[3] {
+                                let sa32 = sa as u32;
+                                dst[0] = ((sr * sa32 + 127) / 255) as u8;
+                                dst[1] = ((sg * sa32 + 127) / 255) as u8;
+                                dst[2] = ((sb * sa32 + 127) / 255) as u8;
+                                dst[3] = sa;
+                            }
+                        }
+                    }
+                }
+                // Pass 2: composite all glyph fills on top of the outlines.
+                for &(g_ix, g_iy, gkey) in &self.glyph_pos_buf {
+                    let Some(cg) = &self.glyph_cache[&gkey] else { continue };
+                    let (bx, by) = ((g_ix + cg.dx - min_x) as usize, (g_iy + cg.dy - min_y) as usize);
+                    let gw = cg.w as usize;
+                    for row in 0..cg.h as usize {
+                        let src_row = &cg.fill_alpha[row * gw..(row + 1) * gw];
+                        let dst_row = &mut data[((by + row) * pw + bx) * 4..((by + row) * pw + bx + gw) * 4];
+                        for (fa, dst) in src_row.iter().copied().zip(dst_row.chunks_exact_mut(4)) {
+                            if fa == 255 {
+                                dst[0] = fr as u8;
+                                dst[1] = fg as u8;
+                                dst[2] = fb as u8;
+                                dst[3] = 255;
+                            } else if fa > 0 {
+                                let fa32 = fa as u32;
+                                let inv = 255 - fa32;
+                                let src_r = (fr * fa32 + 127) / 255;
+                                let src_g = (fg * fa32 + 127) / 255;
+                                let src_b = (fb * fa32 + 127) / 255;
+                                dst[0] = (src_r + (dst[0] as u32 * inv + 127) / 255) as u8;
+                                dst[1] = (src_g + (dst[1] as u32 * inv + 127) / 255) as u8;
+                                dst[2] = (src_b + (dst[2] as u32 * inv + 127) / 255) as u8;
+                                dst[3] = (fa32 + (dst[3] as u32 * inv + 127) / 255) as u8;
+                            }
+                        }
+                    }
+                }
+                blit_pixmap(&mut self.canvas, &mut self.overlay_rects, out_w_i, out_h_i, ix + min_x, iy + min_y, &px);
+                self.placed_text.insert(key, Placed { pixmap: px, dx: min_x, dy: min_y, used: frame });
             }
             if n.status != 0 {
                 self.draw_status(n.status, name_x.unwrap_or(n.x * scale), y, em);
@@ -737,24 +1104,29 @@ impl Renderer {
         step(self, "recolor tiles");
         self.update_base();
         step(self, "scaled map");
-        // The base map is opaque, so its bytes are already premultiplied.
-        let bytes = unsafe { std::slice::from_raw_parts(self.base.as_ptr() as *const u8, self.base.len() * 4) };
-        self.canvas.data_mut().copy_from_slice(bytes);
+        self.restore_overlays();
         step(self, "copy map");
         self.draw_nuke_targets(nukes);
-        // Boats and trains, then structures, then missiles on top (as UnitPass).
-        for pass in 0..3 {
-            for u in units.chunks_exact(4) {
-                let (code, tile, o) = (u[0], u[1], u[2] as u16);
-                let structure = code >= STRUCTURE_CODE;
-                let missile = !structure && is_missile(code);
-                match pass {
-                    0 if !structure && !missile => self.draw_unit(code, tile, o),
-                    1 if structure => self.draw_structure(code - STRUCTURE_CODE, tile, o, u[3] != 0),
-                    2 if missile => self.draw_unit(code, tile, o),
-                    _ => {}
-                }
+        // Single-pass unit bucketing: draw boats/trains immediately, bucket structures and missiles.
+        self.structures_buf.clear();
+        self.missiles_buf.clear();
+        for u in units.chunks_exact(4) {
+            let (code, tile, o) = (u[0], u[1], u[2] as u16);
+            if code >= STRUCTURE_CODE {
+                self.structures_buf.push((code - STRUCTURE_CODE, tile, o, u[3] != 0));
+            } else if is_missile(code) {
+                self.missiles_buf.push((code, tile, o));
+            } else {
+                self.draw_unit(code, tile, o);
             }
+        }
+        for i in 0..self.structures_buf.len() {
+            let (col, tile, o, building) = self.structures_buf[i];
+            self.draw_structure(col, tile, o, building);
+        }
+        for i in 0..self.missiles_buf.len() {
+            let (code, tile, o) = self.missiles_buf[i];
+            self.draw_unit(code, tile, o);
         }
         step(self, "units and structures");
         self.draw_names(labels);

@@ -9,6 +9,8 @@
 //! QUEUE_FRAMES and waits whenever it is full, so it never runs further ahead
 //! than that.
 
+#![forbid(unsafe_code)]
+
 mod assets;
 mod draw;
 mod encode;
@@ -70,6 +72,9 @@ struct Options {
 }
 
 fn parse_args() -> Result<Options, String> {
+    let default_threads = std::thread::available_parallelism()
+        .map(|n| (n.get() / 2).clamp(1, 4) as u16)
+        .unwrap_or(2);
     let mut o = Options {
         input: String::new(),
         out: None,
@@ -78,7 +83,7 @@ fn parse_args() -> Result<Options, String> {
         width: 1280,
         hold: 2.0,
         bitrate: 6.0,
-        threads: 4,
+        threads: default_threads,
         strict: false,
         same_engine: false,
         thumbnail: None,
@@ -270,21 +275,25 @@ fn run() -> Result<(), String> {
 
     // 3. The drawing and encoding threads
     let (to_draw, draw_rx) = sync_channel::<DrawMsg>(QUEUE_FRAMES);
-    let (to_encode, encode_rx) = sync_channel::<(Arc<Vec<u8>>, u32)>(ENCODE_QUEUE);
+    let (to_encode, encode_rx) = sync_channel::<(Vec<u8>, u32)>(ENCODE_QUEUE);
+    let (buf_tx, buf_rx) = sync_channel::<Vec<u8>>(ENCODE_QUEUE + 2);
+    for _ in 0..=ENCODE_QUEUE {
+        let _ = buf_tx.send(vec![0u8; out_w * out_h * 4]);
+    }
     let encoded = Arc::new(AtomicU64::new(0));
     let draw_settings = Settings::new(&render_settings);
     let drawer = std::thread::Builder::new()
         .name("draw".into())
         .spawn({
             let thumbnail = opts.thumbnail.clone();
-            move || draw_thread(Renderer::new(w, h, out_w, out_h, &terrain, draw_settings), draw_rx, to_encode, thumbnail)
+            move || draw_thread(Renderer::new(w, h, out_w, out_h, &terrain, draw_settings), draw_rx, to_encode, buf_rx, thumbnail)
         })
         .unwrap();
     let writer = encode::VideoWriter::create(&out, out_w, out_h, opts.fps, (opts.bitrate * 1e6) as u32, opts.threads)?;
     let encoded2 = encoded.clone();
     let encoder = std::thread::Builder::new()
         .name("encode".into())
-        .spawn(move || encode_thread(writer, encode_rx, encoded2))
+        .spawn(move || encode_thread(writer, encode_rx, buf_tx, encoded2))
         .unwrap();
 
     // 4. Simulate, handing each frame to the drawing thread
@@ -296,6 +305,7 @@ fn run() -> Result<(), String> {
     let mut sent = 0u64;
     let mut last: (Arc<Vec<i32>>, Arc<Vec<Label>>) = (Arc::new(Vec::new()), Arc::new(Vec::new()));
     let mut last_nukes: Arc<Vec<(u32, u16, u16)>> = Arc::new(Vec::new());
+    let mut status_by_id: Vec<u8> = Vec::new();
     let mut stopped = false;
     let send = |msg: DrawMsg, sim: &mut Span| -> bool {
         let w0 = Instant::now();
@@ -313,12 +323,24 @@ fn run() -> Result<(), String> {
             let (fill, border) = theme.player_colors(&p.id, p.player_type, p.team.as_deref(), &cos);
             styles.push((p.small_id, Style::new(fill, border, p.player_type, &settings)));
         }
+        for &(sid, st_bits) in &f.status {
+            let idx = sid as usize;
+            if idx >= status_by_id.len() {
+                status_by_id.resize(idx + 1, 0);
+            }
+            status_by_id[idx] = st_bits;
+        }
         let labels: Vec<Label> = f
             .names
             .iter()
             .filter(|n| n.size > 0.0 && draw::name_is_readable(n.size, &settings, w as u32))
             .map(|n| {
-                let p = game.players.iter().position(|p| p.small_id as u32 == n.small_id).unwrap();
+                let sid = n.small_id as usize;
+                let p = if sid > 0 && sid <= game.players.len() && game.players[sid - 1].small_id as usize == sid {
+                    sid - 1
+                } else {
+                    game.players.iter().position(|p| p.small_id as u32 == n.small_id).unwrap()
+                };
                 Label {
                     owner: n.small_id as u16,
                     name: game.display_name(p),
@@ -326,10 +348,13 @@ fn run() -> Result<(), String> {
                     x: n.x,
                     y: n.y,
                     size: n.size,
-                    status: f.status.iter().find(|s| s.0 as u32 == n.small_id).map_or(0, |s| s.1),
+                    status: status_by_id.get(sid).copied().unwrap_or(0),
                 }
             })
             .collect();
+        for &(sid, _) in &f.status {
+            status_by_id[sid as usize] = 0;
+        }
         last = (Arc::new(f.units), Arc::new(labels));
         last_nukes = Arc::new(f.nuke_targets);
         let msg = DrawMsg {
@@ -478,22 +503,32 @@ fn run() -> Result<(), String> {
 fn draw_thread(
     mut r: Renderer,
     rx: Receiver<DrawMsg>,
-    tx: SyncSender<(Arc<Vec<u8>>, u32)>,
+    tx: SyncSender<(Vec<u8>, u32)>,
+    buf_rx: Receiver<Vec<u8>>,
     thumbnail: Option<String>,
 ) -> Result<Span, String> {
     let mut span = Span::default();
     for msg in rx {
         span.start.get_or_insert_with(Instant::now);
+        let wb0 = Instant::now();
+        let mut buf = buf_rx.recv().unwrap_or_default();
+        span.waited += wb0.elapsed();
         let d0 = Instant::now();
         for (id, s) in msg.styles {
             r.set_style(id, s);
         }
         r.apply_tiles(&msg.tiles);
-        let frame = Arc::new(r.draw(&msg.units, &msg.labels, &msg.nukes, msg.progress).to_vec());
+        let rgba = r.draw(&msg.units, &msg.labels, &msg.nukes, msg.progress);
+        if buf.len() == rgba.len() {
+            buf.copy_from_slice(rgba);
+        } else {
+            buf.clear();
+            buf.extend_from_slice(rgba);
+        }
         span.busy += d0.elapsed();
         span.end = Some(Instant::now());
         let w0 = Instant::now();
-        if tx.send((frame, msg.repeat)).is_err() {
+        if tx.send((buf, msg.repeat)).is_err() {
             return Err("the encoder stopped".into());
         }
         span.waited += w0.elapsed();
@@ -515,18 +550,18 @@ fn draw_thread(
 
 fn encode_thread(
     mut writer: encode::VideoWriter,
-    rx: Receiver<(Arc<Vec<u8>>, u32)>,
+    rx: Receiver<(Vec<u8>, u32)>,
+    buf_tx: SyncSender<Vec<u8>>,
     encoded: Arc<AtomicU64>,
 ) -> Result<(Span, u64), String> {
     let mut span = Span::default();
     for (frame, repeat) in rx {
         span.start.get_or_insert_with(Instant::now);
         let e0 = Instant::now();
-        for _ in 0..repeat {
-            writer.write(&frame)?;
-            encoded.fetch_add(1, Ordering::Relaxed);
-        }
+        writer.write(&frame, repeat)?;
+        encoded.fetch_add(repeat as u64, Ordering::Relaxed);
         span.busy += e0.elapsed();
+        let _ = buf_tx.send(frame);
     }
     let f0 = Instant::now();
     let written = writer.finish()?;

@@ -1,6 +1,8 @@
 //! engine-lib GameMapImpl: immutable terrain bytes plus a mutable u16 state
 //! per tile (owner in the low 12 bits, fallout at bit 13).
 
+use crate::fxhash::FxHashSet;
+
 #[derive(Debug, PartialEq)]
 pub enum Terrain {
     Plains,
@@ -17,11 +19,15 @@ const MAGNITUDE_MASK: u8 = 0x1f;
 const IMPASSABLE_MAGNITUDE: u8 = 31;
 const PLAYER_ID_MASK: u16 = 0xfff;
 const FALLOUT_BIT: u16 = 13;
+const STATIC_OCEAN_SHORE: u8 = 1 << 0;
+const STATIC_ON_EDGE: u8 = 1 << 1;
+const STATIC_INTERIOR: u8 = 1 << 2;
 
 pub struct GameMap {
     pub width: u32,
     pub height: u32,
     terrain: Vec<u8>,
+    static_flags: Vec<u8>,
     state: Vec<u16>,
     pub num_land_tiles: u32,
     num_tiles_with_fallout: u32,
@@ -30,28 +36,64 @@ pub struct GameMap {
 impl GameMap {
     pub fn new(width: u32, height: u32, terrain: Vec<u8>, num_land_tiles: u32) -> Self {
         assert_eq!(terrain.len(), (width * height) as usize, "terrain size");
-        GameMap {
+        let len = terrain.len();
+        let mut map = GameMap {
             width,
             height,
-            state: vec![0; terrain.len()],
+            state: vec![0; len],
+            static_flags: vec![0; len],
             terrain,
             num_land_tiles,
             num_tiles_with_fallout: 0,
+        };
+        let mut r = 0u32;
+        for y in 0..height {
+            for x in 0..width {
+                let interior = x > 0 && x < width - 1 && y > 0 && y < height - 1;
+                let mut flags = if interior { STATIC_INTERIOR } else { 0 };
+                if map.is_land(r)
+                    && ((x != 0 && map.is_ocean(r - 1))
+                        || (x != width - 1 && map.is_ocean(r + 1))
+                        || (y != 0 && map.is_ocean(r - width))
+                        || (y != height - 1 && map.is_ocean(r + width)))
+                {
+                    flags |= STATIC_OCEAN_SHORE;
+                }
+                if !interior
+                    || map.is_impassable(r - 1)
+                    || map.is_impassable(r + 1)
+                    || map.is_impassable(r - width)
+                    || map.is_impassable(r + width)
+                {
+                    flags |= STATIC_ON_EDGE;
+                }
+                map.static_flags[r as usize] = flags;
+                r += 1;
+            }
         }
+        map
     }
 
+    #[inline]
     pub fn terrain_byte(&self, r: u32) -> u8 {
         self.terrain[r as usize]
     }
 
+    #[inline]
     pub fn num_tiles(&self) -> u32 {
         self.width * self.height
     }
+    #[inline]
     pub fn x(&self, r: u32) -> u32 {
         r % self.width
     }
+    #[inline]
     pub fn y(&self, r: u32) -> u32 {
         r / self.width
+    }
+    #[inline]
+    pub fn xy(&self, r: u32) -> (u32, u32) {
+        (r % self.width, r / self.width)
     }
     pub fn ref_at(&self, x: u32, y: u32) -> u32 {
         assert!(x < self.width && y < self.height, "invalid coordinates {x},{y}");
@@ -103,10 +145,17 @@ impl GameMap {
     }
 
     /// Any 4-neighbor with a different owner (map edges don't count).
+    #[inline]
     pub fn is_border(&self, r: u32) -> bool {
         let w = self.width;
-        let x = r % w;
         let o = self.owner_id(r);
+        if self.static_flags[r as usize] & STATIC_INTERIOR != 0 {
+            return self.owner_id(r - 1) != o
+                || self.owner_id(r + 1) != o
+                || self.owner_id(r - w) != o
+                || self.owner_id(r + w) != o;
+        }
+        let x = self.x(r);
         (x != 0 && self.owner_id(r - 1) != o)
             || (x != w - 1 && self.owner_id(r + 1) != o)
             || (r >= w && self.owner_id(r - w) != o)
@@ -114,9 +163,17 @@ impl GameMap {
     }
 
     /// North, south, west, east (the engine's order).
+    #[inline]
     pub fn neighbors4(&self, r: u32, out: &mut [u32; 4]) -> usize {
         let w = self.width;
-        let x = r % w;
+        if self.static_flags[r as usize] & STATIC_INTERIOR != 0 {
+            out[0] = r - w;
+            out[1] = r + w;
+            out[2] = r - 1;
+            out[3] = r + 1;
+            return 4;
+        }
+        let x = self.x(r);
         let mut n = 0;
         if r >= w {
             out[n] = r - w;
@@ -138,9 +195,21 @@ impl GameMap {
     }
 
     /// West column (NW, W, SW), then N, S, then east column (NE, E, SE).
+    #[inline]
     pub fn neighbors8(&self, r: u32, out: &mut [u32; 8]) -> usize {
         let w = self.width;
-        let x = r % w;
+        if self.static_flags[r as usize] & STATIC_INTERIOR != 0 {
+            out[0] = r - 1 - w;
+            out[1] = r - 1;
+            out[2] = r - 1 + w;
+            out[3] = r - w;
+            out[4] = r + w;
+            out[5] = r + 1 - w;
+            out[6] = r + 1;
+            out[7] = r + 1 + w;
+            return 8;
+        }
+        let x = self.x(r);
         let has_n = r >= w;
         let has_s = r < (self.height - 1) * w;
         let mut n = 0;
@@ -195,26 +264,15 @@ impl GameMap {
     }
 
     /// Land with ocean on a side.
+    #[inline]
     pub fn is_ocean_shore(&self, r: u32) -> bool {
-        if !self.is_land(r) {
-            return false;
-        }
-        let w = self.width;
-        let x = r % w;
-        (x != 0 && self.is_ocean(r - 1))
-            || (x != w - 1 && self.is_ocean(r + 1))
-            || (r >= w && self.is_ocean(r - w))
-            || (r < (self.height - 1) * w && self.is_ocean(r + w))
+        self.static_flags[r as usize] & STATIC_OCEAN_SHORE != 0
     }
 
     /// On the map's edge, or next to impassable terrain.
+    #[inline]
     pub fn is_on_edge_of_map(&self, r: u32) -> bool {
-        let w = self.width;
-        let x = r % w;
-        if x == 0 || x == w - 1 || r < w || r >= (self.height - 1) * w {
-            return true;
-        }
-        self.is_impassable(r - 1) || self.is_impassable(r + 1) || self.is_impassable(r - w) || self.is_impassable(r + w)
+        self.static_flags[r as usize] & STATIC_ON_EDGE != 0
     }
 
     pub fn terrain_type(&self, r: u32) -> Terrain {
@@ -241,7 +299,7 @@ impl GameMap {
     /// returns tiles in the order they were first seen.
     pub fn bfs(&self, tile: u32, filter: impl Fn(&GameMap, u32) -> bool) -> Vec<u32> {
         let mut seen_order = Vec::new();
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = FxHashSet::with_capacity_and_hasher(64, Default::default());
         let mut q = Vec::new();
         if filter(self, tile) {
             seen.insert(tile);
@@ -251,7 +309,7 @@ impl GameMap {
         let w = self.width;
         let south_limit = (self.height - 1) * w;
         while let Some(curr) = q.pop() {
-            let x = curr % w;
+            let x = self.x(curr);
             let mut visit = |n: u32| {
                 if !seen.contains(&n) && filter(self, n) {
                     seen.insert(n);

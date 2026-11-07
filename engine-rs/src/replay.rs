@@ -572,7 +572,12 @@ pub fn play(
 ) -> HashCheck {
     let total = turns.len() as u64;
     let n = (game.map.width * game.map.height) as usize;
-    let mut stream = FrameStream { prev: vec![0u16; n], sent_players: 0, views: HashMap::new() };
+    let mut stream = FrameStream {
+        prev: vec![0u16; n],
+        sent_players: 0,
+        views: Vec::new(),
+        name_versions: Vec::new(),
+    };
     on_frame(game, stream.frame(game, 0, 1));
 
     let due = |nf: u64| if frames < 2 { u64::MAX } else { (nf * total).div_ceil(frames - 1) };
@@ -610,7 +615,8 @@ struct FrameStream {
     /// The raw map state at the last frame.
     prev: Vec<u16>,
     sent_players: usize,
-    views: std::collections::HashMap<usize, (f64, f64, f64)>,
+    views: Vec<Option<(f64, f64, f64)>>,
+    name_versions: Vec<u64>,
 }
 
 impl FrameStream {
@@ -619,21 +625,35 @@ impl FrameStream {
     /// ends and every 30 ticks.
     fn update_names(&mut self, game: &Game, was_spawn: bool) {
         let _p = prof::scope("update_names");
-        let alive: Vec<usize> = (0..game.players.len()).filter(|&p| game.players[p].is_alive()).collect();
+        if self.views.len() < game.players.len() {
+            self.views.resize(game.players.len(), None);
+            self.name_versions.resize(game.players.len(), u64::MAX);
+        }
         if game.in_spawn_phase() {
-            for &p in &alive {
-                if !matches!(game.players[p].info.player_type, PlayerType::Human | PlayerType::Nation) {
+            for (p, player) in game.players.iter().enumerate() {
+                if !player.is_alive() {
+                    continue;
+                }
+                if !matches!(player.info.player_type, PlayerType::Human | PlayerType::Nation) {
                     continue;
                 }
                 if let Some(v) = game.place_spawn_name(p) {
-                    self.views.insert(p, v);
+                    self.views[p] = Some(v);
+                    self.name_versions[p] = u64::MAX;
                 }
             }
         }
         let t = game.ticks;
         if (was_spawn && !game.in_spawn_phase()) || t < 3 || t % 30 == 0 {
-            for &p in &alive {
-                self.views.insert(p, game.place_name(p));
+            for (p, player) in game.players.iter().enumerate() {
+                if !player.is_alive() {
+                    continue;
+                }
+                let ver = player.tile_change_version;
+                if self.name_versions[p] != ver || self.views[p].is_none() {
+                    self.views[p] = Some(game.place_name(p));
+                    self.name_versions[p] = ver;
+                }
             }
         }
     }
@@ -673,7 +693,7 @@ impl FrameStream {
         let names = (0..game.players.len())
             .filter(|&p| game.players[p].is_alive())
             .filter_map(|p| {
-                self.views.get(&p).map(|&(x, y, size)| NameView {
+                self.views.get(p).and_then(|v| *v).map(|(x, y, size)| NameView {
                     small_id: game.players[p].small_id as u32,
                     x,
                     y,

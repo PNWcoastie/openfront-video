@@ -13,7 +13,7 @@ use crate::js::{is_integer, simple_hash};
 use crate::map::{eucl_dist_center, GameMap, Terrain};
 use crate::rng::PseudoRandom;
 use crate::tileset::TileSet;
-use crate::water::{BoundedAStar, Bounds, WaterPathfinder};
+use crate::water::{Bounds, WaterPathfinder};
 
 mod doomsday;
 pub use doomsday::DoomsdayExec;
@@ -468,12 +468,18 @@ pub struct Game {
     visited: Vec<u32>,
     cluster_index_map: Vec<i32>,
     gen: u32,
+    tile_slot: Vec<u32>,
+    border_slot: Vec<u32>,
+    dfs_stack: Vec<u32>,
+    territory_sigmoid_lut: Vec<f64>,
 }
 
 impl Game {
     pub fn new(config: Config, map: GameMap, mini_map: GameMap, humans: Vec<PlayerInfo>, nations: Vec<PlayerInfo>, teams: Option<TeamSetup>) -> Game {
         let n = map.num_tiles() as usize;
         let num_cells = (((map.width + 99) / 100) * ((map.height + 99) / 100)) as usize;
+        let log_mid = log(300_000.0);
+        let territory_sigmoid_lut: Vec<f64> = (0..=map.num_land_tiles as usize).map(|cnt| sigmoid(log(cnt as f64), 2.5, log_mid)).collect();
         let mut g = Game {
             config,
             map,
@@ -509,6 +515,10 @@ impl Game {
             alliances: Vec::new(),
             next_alliance_id: 0,
             gen: 0,
+            tile_slot: vec![u32::MAX; n],
+            border_slot: vec![u32::MAX; n],
+            dfs_stack: Vec::new(),
+            territory_sigmoid_lut,
         };
         for t in 0..g.water.mini.num_tiles() {
             if g.water.mini.is_water(t) {
@@ -834,13 +844,13 @@ impl Game {
             let p = &mut self.players[prev];
             p.last_tile_change = self.ticks;
             p.tile_change_version += 1;
-            p.tiles.delete(tile);
-            p.border_tiles.delete(tile);
+            p.tiles.delete_indexed(tile, &mut self.tile_slot);
+            p.border_tiles.delete_indexed(tile, &mut self.border_slot);
         }
         let small_id = self.players[owner].small_id;
         self.map.set_owner_id(tile, small_id);
         let p = &mut self.players[owner];
-        p.tiles.add(tile);
+        p.tiles.add_indexed(tile, &mut self.tile_slot);
         p.last_tile_change = self.ticks;
         p.tile_change_version += 1;
         self.update_borders(tile);
@@ -853,8 +863,8 @@ impl Game {
         let p = &mut self.players[prev];
         p.last_tile_change = self.ticks;
         p.tile_change_version += 1;
-        p.tiles.delete(tile);
-        p.border_tiles.delete(tile);
+        p.tiles.delete_indexed(tile, &mut self.tile_slot);
+        p.border_tiles.delete_indexed(tile, &mut self.border_slot);
         self.map.set_owner_id(tile, 0);
         self.update_borders(tile);
     }
@@ -871,9 +881,9 @@ impl Game {
     fn update_border_status(&mut self, t: u32) {
         let Some(owner) = self.owner_index(t) else { return };
         if self.map.is_border(t) {
-            self.players[owner].border_tiles.add(t);
+            self.players[owner].border_tiles.add_indexed(t, &mut self.border_slot);
         } else {
-            self.players[owner].border_tiles.delete(t);
+            self.players[owner].border_tiles.delete_indexed(t, &mut self.border_slot);
         }
     }
 
@@ -894,6 +904,19 @@ impl Game {
     /// PlayerImpl.sharesBorderWith
     fn shares_border_with(&self, p: usize, other_small: u16) -> bool {
         let mut nb = [0u32; 4];
+        if other_small > 0 {
+            let other = other_small as usize - 1;
+            if other < self.players.len() && self.players[other].border_tiles.len() < self.players[p].border_tiles.len() {
+                let my_small = self.players[p].small_id;
+                for border in self.players[other].border_tiles.values() {
+                    let n = self.map.neighbors4(border, &mut nb);
+                    if nb[..n].iter().any(|&t| self.map.owner_id(t) == my_small) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+        }
         for border in self.players[p].border_tiles.values() {
             let n = self.map.neighbors4(border, &mut nb);
             if nb[..n].iter().any(|&t| self.map.owner_id(t) == other_small) {
@@ -908,8 +931,15 @@ impl Game {
     fn nearby(&self, p: usize) -> Vec<Neighbor> {
         let me = self.players[p].small_id;
         let mut seen: Vec<u16> = Vec::new();
+        let mut seen_bits = [false; 1024];
         let mut add = |small: u16, seen: &mut Vec<u16>| {
-            if !seen.contains(&small) {
+            let idx = small as usize;
+            if idx < seen_bits.len() {
+                if !seen_bits[idx] {
+                    seen_bits[idx] = true;
+                    seen.push(small);
+                }
+            } else if !seen.contains(&small) {
                 seen.push(small);
             }
         };
@@ -931,7 +961,6 @@ impl Game {
         }
         // shoreReachableNeighbors: every 10th shore border tile, 5 tiles out
         // in each direction that starts with water.
-        let mut shore = Vec::new();
         let mut shore_idx = 0;
         let (w, h) = (map.width as i64, map.height as i64);
         for border in self.players[p].border_tiles.values() {
@@ -962,12 +991,9 @@ impl Game {
                 }
                 let owner = map.owner_id(tile);
                 if owner != me {
-                    add(owner, &mut shore);
+                    add(owner, &mut seen);
                 }
             }
-        }
-        for s in shore {
-            add(s, &mut seen);
         }
         seen.into_iter().map(|s| if s == 0 { None } else { Some(s as usize - 1) }).collect()
     }
@@ -1443,15 +1469,16 @@ impl Game {
         gen: u32,
         start: u32,
         diag: bool,
-        include: &dyn Fn(&Game, u32) -> bool,
+        include: impl Fn(&Game, u32) -> bool,
         bbox: Option<&mut [i64; 4]>,
     ) -> Vec<u32> {
         let mut result = Vec::new();
-        let mut stack = Vec::new();
+        let mut stack = std::mem::take(&mut self.dfs_stack);
+        stack.clear();
+        let track_bbox = bbox.is_some();
         let (mut min_x, mut min_y, mut max_x, mut max_y) = (1e9 as i64, 1e9 as i64, -1e9 as i64, -1e9 as i64);
-        let w = self.map.width;
-        let mut note = |t: u32, min_x: &mut i64, min_y: &mut i64, max_x: &mut i64, max_y: &mut i64| {
-            let (x, y) = ((t % w) as i64, (t / w) as i64);
+        let note = |map: &GameMap, t: u32, min_x: &mut i64, min_y: &mut i64, max_x: &mut i64, max_y: &mut i64| {
+            let (x, y) = (map.x(t) as i64, map.y(t) as i64);
             *min_x = (*min_x).min(x);
             *min_y = (*min_y).min(y);
             *max_x = (*max_x).max(x);
@@ -1461,7 +1488,9 @@ impl Game {
             self.visited[start as usize] = gen;
             result.push(start);
             stack.push(start);
-            note(start, &mut min_x, &mut min_y, &mut max_x, &mut max_y);
+            if track_bbox {
+                note(&self.map, start, &mut min_x, &mut min_y, &mut max_x, &mut max_y);
+            }
         }
         let mut nb4 = [0u32; 4];
         let mut nb8 = [0u32; 8];
@@ -1480,9 +1509,12 @@ impl Game {
                 self.visited[n as usize] = gen;
                 result.push(n);
                 stack.push(n);
-                note(n, &mut min_x, &mut min_y, &mut max_x, &mut max_y);
+                if track_bbox {
+                    note(&self.map, n, &mut min_x, &mut min_y, &mut max_x, &mut max_y);
+                }
             }
         }
+        self.dfs_stack = stack;
         if let Some(b) = bbox {
             *b = [min_x, min_y, max_x, max_y];
         }
@@ -1497,14 +1529,17 @@ impl Game {
         }
         let border_gen = self.bump_generations(2);
         let current_gen = border_gen + 1;
-        let borders: Vec<u32> = self.players[p].border_tiles.values().collect();
-        for &t in &borders {
+        for t in self.players[p].border_tiles.values() {
             self.visited[t as usize] = border_gen;
         }
         let mut clusters = Vec::new();
         let mut boxes = Vec::new();
         let include = move |g: &Game, t: u32| g.visited[t as usize] == border_gen;
-        for &start in &borders {
+        let slot_count = self.players[p].border_tiles.slot_count();
+        for i in 0..slot_count {
+            let Some(start) = self.players[p].border_tiles.slot(i) else {
+                continue;
+            };
             if self.visited[start as usize] == current_gen {
                 continue;
             }
@@ -1695,7 +1730,7 @@ impl Game {
     }
 
     fn surrounded_by_same_player(&self, p: usize, cluster: &[u32], b: [i64; 4]) -> Option<usize> {
-        let mut enemies: Vec<u16> = Vec::new();
+        let mut single_enemy: u16 = 0;
         let (mut min_x, mut min_y, mut max_x, mut max_y) = (1e9 as i64, 1e9 as i64, -1e9 as i64, -1e9 as i64);
         let me = self.players[p].small_id;
         let mut nb = [0u32; 4];
@@ -1710,8 +1745,10 @@ impl Game {
                     return None;
                 }
                 if owner != me {
-                    if !enemies.contains(&owner) {
-                        enemies.push(owner);
+                    if single_enemy == 0 {
+                        single_enemy = owner;
+                    } else if single_enemy != owner {
+                        return None;
                     }
                     let (x, y) = (self.map.x(nn) as i64, self.map.y(nn) as i64);
                     min_x = min_x.min(x);
@@ -1720,14 +1757,14 @@ impl Game {
                     max_y = max_y.max(y);
                 }
             }
-            if enemies.len() != 1 {
+            if single_enemy == 0 {
                 return None;
             }
         }
-        if enemies.len() != 1 {
+        if single_enemy == 0 {
             return None;
         }
-        let enemy = enemies[0] as usize - 1;
+        let enemy = single_enemy as usize - 1;
         if min_x <= b[0] && min_y <= b[1] && max_x >= b[2] && max_y >= b[3] {
             Some(enemy)
         } else {
@@ -2066,10 +2103,12 @@ impl Game {
         let a = ae.attack.expect("attack");
         ae.to_conquer.clear();
         self.attacks[a].border_size = 0;
-        self.attacks[a].border = TileSet::default();
-        let borders: Vec<u32> = self.players[ae.owner].border_tiles.values().collect();
-        for t in borders {
-            self.add_neighbors(ae, t);
+        self.attacks[a].border.clear();
+        let slot_count = self.players[ae.owner].border_tiles.slot_count();
+        for i in 0..slot_count {
+            if let Some(t) = self.players[ae.owner].border_tiles.slot(i) {
+                self.add_neighbors(ae, t);
+            }
         }
     }
 
@@ -2084,8 +2123,12 @@ impl Game {
                 continue;
             }
             let at = &mut self.attacks[a];
-            if !at.border.contains(neighbor) {
-                at.border.add(neighbor);
+            let inserted = if ae.source_tile.is_some() {
+                at.border.insert(neighbor)
+            } else {
+                at.border.insert_unordered(neighbor)
+            };
+            if inserted {
                 at.border_size += 1;
             }
             let mut owned_by_me = 0;
@@ -2155,17 +2198,24 @@ impl Game {
                 return;
             }
             if ae.to_conquer.size() == 0 {
-                self.refresh_to_conquer(ae);
                 self.retreat(ae, 0.0);
                 return;
             }
             let tile = ae.to_conquer.dequeue();
-            if self.attacks[a].border.delete(tile) {
+            let removed = if ae.source_tile.is_some() {
+                self.attacks[a].border.delete(tile)
+            } else {
+                self.attacks[a].border.delete_unordered(tile)
+            };
+            if removed {
                 self.attacks[a].border_size -= 1;
+            }
+            if self.map.owner_id(tile) != ae.target_small {
+                continue;
             }
             let n = self.map.neighbors4(tile, &mut nb);
             let on_border = nb[..n].iter().any(|&t| self.map.owner_id(t) == ae.owner_small);
-            if self.map.owner_id(tile) != ae.target_small || !on_border {
+            if !on_border {
                 continue;
             }
             if !self.map.is_land(tile) || self.map.is_impassable(tile) {
@@ -2217,9 +2267,9 @@ impl Game {
         if matches!(a.info.player_type, PlayerType::Human | PlayerType::Nation) && dp.info.player_type == PlayerType::Bot {
             mag *= 0.7;
         }
-        let attacker_sigmoid = territory_sigmoid(a.tiles.len() as f64);
+        let attacker_sigmoid = self.territory_sigmoid_of(a.tiles.len());
         let large_attacker_bonus = 1.0 - 0.7 * attacker_sigmoid;
-        let large_defender_bonus = 1.0 - 0.3 * territory_sigmoid(dp.tiles.len() as f64);
+        let large_defender_bonus = 1.0 - 0.3 * self.territory_sigmoid_of(dp.tiles.len());
         let traitor = self.is_traitor(d);
         let traitor_loss_mod = if traitor { 0.5 } else { 1.0 };
         let traitor_cost_mod = if traitor { 0.8 } else { 1.0 };
@@ -2272,7 +2322,7 @@ impl Game {
                     }
                 }
             }
-            self.players[target].tiles.resume_compaction();
+            self.players[target].tiles.resume_compaction_indexed(&mut self.tile_slot);
             if !progressed {
                 break;
             }
@@ -2459,6 +2509,14 @@ impl Game {
         let e = self.new_attack(Some(troops), te.player, target_id);
         self.add_execution(e);
         true
+    }
+
+    #[inline]
+    fn territory_sigmoid_of(&self, num_tiles: usize) -> f64 {
+        self.territory_sigmoid_lut
+            .get(num_tiles)
+            .copied()
+            .unwrap_or_else(|| territory_sigmoid(num_tiles as f64))
     }
 
     fn has_land_border_with_terra_nullius(&self, p: usize) -> bool {
@@ -2917,7 +2975,7 @@ impl Game {
         Some(self.refine_start_tile(&path, &shores))
     }
 
-    fn refine_start_tile(&self, path: &[u32], shores: &[u32]) -> u32 {
+    fn refine_start_tile(&mut self, path: &[u32], shores: &[u32]) -> u32 {
         const MAX_AREA: i64 = 100 * 100;
         if path.len() <= 50 {
             return path[0];
@@ -2965,8 +3023,7 @@ impl Game {
         if (b.max_x - b.min_x + 1) * (b.max_y - b.min_y + 1) > MAX_AREA {
             return best;
         }
-        let mut astar = BoundedAStar::new(MAX_AREA as usize);
-        astar.search(&self.map, &candidates, wp, b).and_then(|p| p.first().copied()).unwrap_or(best)
+        self.water.refine_astar.search(&self.map, &candidates, wp, b).and_then(|p| p.first().copied()).unwrap_or(best)
     }
 
     /// TransportShipUtils.canBuildTransportShip
@@ -3242,11 +3299,10 @@ impl Game {
 
 /// execution/Util closestTwoTiles: a sweep over both lists sorted by x.
 fn closest_two_tiles(map: &GameMap, x: &[u32], y: &[u32]) -> Option<(u32, u32)> {
-    let w = map.width;
     let mut xs = x.to_vec();
     let mut ys = y.to_vec();
-    xs.sort_by_key(|t| t % w);
-    ys.sort_by_key(|t| t % w);
+    xs.sort_by_key(|&t| map.x(t));
+    ys.sort_by_key(|&t| map.x(t));
     if xs.is_empty() || ys.is_empty() {
         return None;
     }
@@ -3255,8 +3311,8 @@ fn closest_two_tiles(map: &GameMap, x: &[u32], y: &[u32]) -> Option<(u32, u32)> 
     let mut result = (xs[0], ys[0]);
     while i < xs.len() && j < ys.len() {
         let (cx, cy) = (xs[i], ys[j]);
-        let (cxx, cyx) = (cx % w, cy % w);
-        let d = cxx.abs_diff(cyx) + (cx / w).abs_diff(cy / w);
+        let (cxx, cyx) = (map.x(cx), map.x(cy));
+        let d = cxx.abs_diff(cyx) + map.y(cx).abs_diff(map.y(cy));
         if d < min {
             min = d;
             result = (cx, cy);
@@ -3517,7 +3573,7 @@ impl Game {
     fn would_nuke_break_alliance(&self, target: u32, nuke_type: &str, ally: usize) -> bool {
         let (inner, outer) = Self::nuke_magnitude(nuke_type);
         let structures = [CITY, DEFENSE_POST, SAM_LAUNCHER, MISSILE_SILO, PORT, FACTORY];
-        if self.nearby_units(target, outer, &structures).iter().any(|&(u, _)| self.units[u].owner == ally) {
+        if self.any_nearby_unit(target, outer, &structures, |u, _| self.units[u].owner == ally) {
             return true;
         }
         let (inner2, outer2) = (inner * inner, outer * outer);
@@ -3703,11 +3759,10 @@ impl Game {
         if self.owner_index(tile) != Some(p) {
             return Vec::new();
         }
-        let w = self.map.width;
-        let (cx, cy) = ((tile % w) as i64, (tile / w) as i64);
+        let (cx, cy) = (self.map.x(tile) as i64, self.map.y(tile) as i64);
         let small = self.players[p].small_id;
         let inside = |g: &Game, t: u32| {
-            let (dx, dy) = ((t % w) as i64 - cx, (t / w) as i64 - cy);
+            let (dx, dy) = (g.map.x(t) as i64 - cx, g.map.y(t) as i64 - cy);
             dx * dx + dy * dy < 225 && g.map.owner_id(t) == small
         };
         // nearbyUnits(tile, 30, structures, includeUnderConstruction)
@@ -3741,9 +3796,9 @@ impl Game {
         valid
     }
 
+    #[inline]
     fn dist2(&self, a: u32, b: u32) -> i64 {
-        let w = self.map.width;
-        let (dx, dy) = ((a % w) as i64 - (b % w) as i64, (a / w) as i64 - (b / w) as i64);
+        let (dx, dy) = (self.map.x(a) as i64 - self.map.x(b) as i64, self.map.y(a) as i64 - self.map.y(b) as i64);
         dx * dx + dy * dy
     }
 
@@ -3793,13 +3848,38 @@ impl Game {
     }
 
     fn has_unit_nearby(&self, tile: u32, range: i64, t: &str, owner: Option<usize>) -> bool {
-        self.type_units(t).iter().map(|&i| &self.units[i]).any(|u| {
+        if let Some(o) = owner {
+            let p_units = &self.players[o].units;
+            if p_units.is_empty() {
+                return false;
+            }
+            let (sx, ex, sy, ey) = self.grid_cell_bounds(tile, range);
+            let r2 = range * range;
+            return p_units.iter().map(|&i| &self.units[i]).any(|u| {
+                u.type_name == t
+                    && u.active
+                    && !u.under_construction
+                    && self.dist2(u.tile, tile) <= r2
+                    && {
+                        let (ux, uy) = (self.map.x(u.tile) as i64 / 100, self.map.y(u.tile) as i64 / 100);
+                        ux >= sx && ux <= ex && uy >= sy && uy <= ey
+                    }
+            });
+        }
+        let units = self.type_units(t);
+        if units.is_empty() {
+            return false;
+        }
+        let (sx, ex, sy, ey) = self.grid_cell_bounds(tile, range);
+        let r2 = range * range;
+        units.iter().map(|&i| &self.units[i]).any(|u| {
             u.active
-                && self.in_grid_cells(tile, range, u.tile)
-                && u.type_name == t
                 && !u.under_construction
-                && owner.is_none_or(|o| u.owner == o)
-                && self.dist2(u.tile, tile) <= range * range
+                && self.dist2(u.tile, tile) <= r2
+                && {
+                    let (ux, uy) = (self.map.x(u.tile) as i64 / 100, self.map.y(u.tile) as i64 / 100);
+                    ux >= sx && ux <= ex && uy >= sy && uy <= ey
+                }
         })
     }
 
@@ -3898,6 +3978,13 @@ impl Game {
     /// PlayerExecution: structures on tiles the player no longer owns are
     /// captured (defense posts are destroyed), or deleted on unowned land.
     fn check_structures(&mut self, p: usize) {
+        if !self.players[p]
+            .units
+            .iter()
+            .any(|&u| is_structure(self.units[u].type_name) && self.owner_index(self.units[u].tile) != Some(p))
+        {
+            return;
+        }
         for u in self.players[p].units.clone() {
             if !is_structure(self.units[u].type_name) {
                 continue;
@@ -4084,7 +4171,7 @@ impl Game {
             return;
         }
         // shouldSpawnTradeShip
-        let num_ships: u32 = (0..self.players.len()).map(|p| self.unit_levels(p, TRADE_SHIP)).sum();
+        let num_ships: u32 = self.type_units(TRADE_SHIP).iter().map(|&u| self.units[u].level).sum();
         let owner = self.units[port].owner;
         let port_levels = self.unit_levels(owner, PORT);
         let mut spawn = false;
@@ -4120,6 +4207,9 @@ impl Game {
 
     /// PortExecution.tradingPorts: a weighted list of partner ports.
     fn trading_ports(&self, port: usize) -> Vec<usize> {
+        if self.type_units(PORT).len() <= 1 {
+            return Vec::new();
+        }
         let tile = self.units[port].tile;
         let owner = self.units[port].owner;
         let mut comps: Vec<u32> = Vec::new();
@@ -4139,8 +4229,8 @@ impl Game {
             if !self.players[p].is_alive() || p == owner || !self.can_trade(p, owner) {
                 continue;
             }
-            for u in self.player_units_of(p, PORT) {
-                if comps.iter().any(|&c| self.has_water_component(self.units[u].tile, c)) {
+            for &u in &self.players[p].units {
+                if self.units[u].type_name == PORT && comps.iter().any(|&c| self.has_water_component(self.units[u].tile, c)) {
                     ports.push(u);
                 }
             }
@@ -4330,9 +4420,13 @@ impl Game {
     fn nearby_units(&self, tile: u32, range: i64, types: &[&str]) -> Vec<(usize, i64)> {
         let _p = crate::prof::scope("nearby_units");
         debug_assert!(!types.contains(&TRAIN), "trains are not in the cell index");
+        if types.iter().all(|t| self.type_units(t).is_empty()) {
+            return Vec::new();
+        }
         let mut found: Vec<(i64, i64, usize, u64, usize, i64)> = Vec::new();
         let (sx, ex, sy, ey) = self.grid_cell_bounds(tile, range);
         let cols = (self.map.width as i64 + 99) / 100;
+        let r2 = range * range;
         for cy in sy..=ey {
             for cx in sx..=ex {
                 for &i in &self.cells[(cy * cols + cx) as usize] {
@@ -4342,7 +4436,7 @@ impl Game {
                     }
                     let Some(ti) = types.iter().position(|&t| t == u.type_name) else { continue };
                     let d = self.dist2(u.tile, tile);
-                    if d > range * range {
+                    if d > r2 {
                         continue;
                     }
                     found.push((cy, cx, ti, u.grid_seq, i, d));
@@ -4352,6 +4446,31 @@ impl Game {
         // grid_seq is when the unit last entered its cell (Unit.move re-files it).
         found.sort_by_key(|&(cy, cx, ti, seq, _, _)| (cy, cx, ti, seq));
         found.into_iter().map(|(_, _, _, _, i, d)| (i, d)).collect()
+    }
+
+    fn any_nearby_unit(&self, tile: u32, range: i64, types: &[&str], mut pred: impl FnMut(usize, i64) -> bool) -> bool {
+        debug_assert!(!types.contains(&TRAIN), "trains are not in the cell index");
+        if types.iter().all(|t| self.type_units(t).is_empty()) {
+            return false;
+        }
+        let (sx, ex, sy, ey) = self.grid_cell_bounds(tile, range);
+        let cols = (self.map.width as i64 + 99) / 100;
+        let r2 = range * range;
+        for cy in sy..=ey {
+            for cx in sx..=ex {
+                for &i in &self.cells[(cy * cols + cx) as usize] {
+                    let u = &self.units[i];
+                    if u.under_construction || !types.contains(&u.type_name) {
+                        continue;
+                    }
+                    let d = self.dist2(u.tile, tile);
+                    if d <= r2 && pred(i, d) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     fn train_station_exec(&mut self, unit: usize, spawn_trains: bool) -> Exec {
@@ -4801,7 +4920,7 @@ impl Game {
                 }
             }
         }
-        self.rail.dirty = TileSet::default();
+        self.rail.dirty.clear();
     }
 
     /// RailNetworkImpl.removeStation (GameImpl.removeUnit for station units).
@@ -4814,7 +4933,7 @@ impl Game {
             self.remove_railroad(to, rail as usize);
             self.grid_unregister(rail as usize);
         }
-        self.rail.stations[s].railroads = TileSet::default();
+        self.rail.stations[s].railroads.clear();
         self.rail.stations[s].by_neighbor.clear();
         let id = self.rail.stations[s].id as usize;
         self.rail.by_id[id] = None;
@@ -5428,10 +5547,6 @@ impl Game {
         }
     }
 
-    fn ports_of(&self, p: usize) -> Vec<usize> {
-        self.player_units_of(p, PORT)
-    }
-
     /// PlayerImpl.warshipSpawn
     fn warship_spawn(&self, p: usize, tile: u32) -> Option<u32> {
         if !self.map.is_water(tile) {
@@ -5440,9 +5555,9 @@ impl Game {
         let comp = self.water_component(tile);
         let mut best = None;
         let mut best_d = u32::MAX;
-        for port in self.ports_of(p) {
+        for &port in &self.players[p].units {
             let u = &self.units[port];
-            if !(u.active && !u.under_construction && comp.is_some_and(|c| self.has_water_component(u.tile, c))) {
+            if !(u.type_name == PORT && u.active && !u.under_construction && comp.is_some_and(|c| self.has_water_component(u.tile, c))) {
                 continue;
             }
             let d = self.map.manhattan_dist(u.tile, tile);
@@ -5534,7 +5649,11 @@ impl Game {
     fn heal_warship(&mut self, we: &mut WarshipExec, w: usize) {
         let owner = self.units[w].owner;
         let tile = self.units[w].tile;
-        if self.ports_of(owner).iter().any(|&p| self.dist2(tile, self.units[p].tile) <= 150 * 150) {
+        if self.players[owner]
+            .units
+            .iter()
+            .any(|&p| self.units[p].type_name == PORT && self.dist2(tile, self.units[p].tile) <= 150 * 150)
+        {
             self.modify_health(w, 1.0, None);
         }
         if self.ws(w).mode == WarshipMode::Docked {
@@ -5560,7 +5679,11 @@ impl Game {
 
     fn current_retreat_port(&self, w: usize) -> Option<usize> {
         let rp = self.ws(w).retreat_port?;
-        self.ports_of(self.units[w].owner).into_iter().find(|&p| self.units[p].tile == rp)
+        self.players[self.units[w].owner]
+            .units
+            .iter()
+            .copied()
+            .find(|&p| self.units[p].type_name == PORT && self.units[p].tile == rp)
     }
 
     fn docked_ships_at_port(&self, w: usize, port: usize, exclude: Option<usize>) -> Vec<usize> {
@@ -5596,8 +5719,8 @@ impl Game {
         let comp = self.water_component(tile)?;
         let mut best = None;
         let mut best_d = f64::INFINITY;
-        for port in self.ports_of(self.units[w].owner) {
-            if self.is_port_full(w, port, exclude) {
+        for &port in &self.players[self.units[w].owner].units {
+            if self.units[port].type_name != PORT || self.is_port_full(w, port, exclude) {
                 continue;
             }
             let pt = self.units[port].tile;
@@ -5614,25 +5737,28 @@ impl Game {
     }
 
     fn refresh_retreat_port(&mut self, w: usize) -> bool {
-        let ports = self.ports_of(self.units[w].owner);
-        if ports.is_empty() {
+        let owner = self.units[w].owner;
+        if !self.players[owner].units.iter().any(|&p| self.units[p].type_name == PORT) {
             return false;
         }
         let cur = self.ws(w).retreat_port;
-        let exists = cur.is_some_and(|c| ports.iter().any(|&p| self.units[p].tile == c));
-        if !exists {
+        let cur_port = cur.and_then(|c| {
+            self.players[owner]
+                .units
+                .iter()
+                .copied()
+                .find(|&p| self.units[p].type_name == PORT && self.units[p].tile == c)
+        });
+        let Some(cp) = cur_port else {
             let np = self.nearest_available_port(w, Some(w)).map(|r| r.0);
             self.ws_mut(w).retreat_port = np;
             return np.is_some();
-        }
-        let cur_port = ports.iter().copied().find(|&p| Some(self.units[p].tile) == cur);
-        if let Some(cp) = cur_port {
-            if self.is_port_full(w, cp, None) {
-                if let Some(alt) = self.nearest_available_port(w, None) {
-                    self.ws_mut(w).retreat_port = Some(alt.0);
-                }
-                return self.ws(w).retreat_port.is_some();
+        };
+        if self.is_port_full(w, cp, None) {
+            if let Some(alt) = self.nearest_available_port(w, None) {
+                self.ws_mut(w).retreat_port = Some(alt.0);
             }
+            return self.ws(w).retreat_port.is_some();
         }
         // findBetterPortTile
         if let Some((t, d)) = self.nearest_available_port(w, None) {
@@ -5662,7 +5788,11 @@ impl Game {
         }
         let Some(rp) = self.ws(w).retreat_port else { return false };
         if self.dist2(self.units[w].tile, rp) <= 25 {
-            let port = self.ports_of(self.units[w].owner).into_iter().find(|&p| self.units[p].tile == rp);
+            let port = self.players[self.units[w].owner]
+                .units
+                .iter()
+                .copied()
+                .find(|&p| self.units[p].type_name == PORT && self.units[p].tile == rp);
             if port.is_some_and(|p| !self.is_port_full(w, p, Some(w))) {
                 self.units[w].target_tile = None;
                 self.ws_mut(w).mode = WarshipMode::Docked;
@@ -5708,20 +5838,23 @@ impl Game {
         if health_before >= threshold {
             return false;
         }
-        !self.ports_of(self.units[w].owner).is_empty()
+        self.players[self.units[w].owner].units.iter().any(|&p| self.units[p].type_name == PORT)
     }
 
     fn start_repair_retreat(&mut self, we: &mut WarshipExec, w: usize) {
         // findNearestPort
-        let ports = self.ports_of(self.units[w].owner);
-        if ports.is_empty() {
+        let owner = self.units[w].owner;
+        if !self.players[owner].units.iter().any(|&p| self.units[p].type_name == PORT) {
             return;
         }
         let tile = self.units[w].tile;
         let Some(comp) = self.water_component(tile) else { return };
         let mut best = None;
         let mut best_d = f64::INFINITY;
-        for p in ports {
+        for &p in &self.players[owner].units {
+            if self.units[p].type_name != PORT {
+                continue;
+            }
             let pt = self.units[p].tile;
             if self.water_component(pt) != Some(comp) {
                 continue;
@@ -5759,9 +5892,9 @@ impl Game {
                 let (reachable, patrol) = *lazy.get_or_insert_with(|| {
                     let comp = self.water_component(self.units[w].tile);
                     let reachable = comp.is_some_and(|c| {
-                        self.ports_of(owner).iter().any(|&p| {
+                        self.players[owner].units.iter().any(|&p| {
                             let pu = &self.units[p];
-                            pu.active && pu.deletion_at.is_none() && !pu.under_construction && self.has_water_component(pu.tile, c)
+                            pu.type_name == PORT && pu.active && pu.deletion_at.is_none() && !pu.under_construction && self.has_water_component(pu.tile, c)
                         })
                     });
                     (reachable, self.ws(w).patrol_tile)
@@ -6059,7 +6192,11 @@ impl Game {
             None => {
                 let src_tile = self.units[te.src_port].tile;
                 let o = te.orig_owner;
-                let ok = self.players[o].is_alive() && self.player_units_of(o, PORT).iter().any(|&u| self.units[u].tile == src_tile);
+                let ok = self.players[o].is_alive()
+                    && self.players[o]
+                        .units
+                        .iter()
+                        .any(|&u| self.units[u].type_name == PORT && self.units[u].tile == src_tile);
                 if !ok {
                     te.active = false;
                     return;
@@ -6095,9 +6232,9 @@ impl Game {
             let comp = self.water_component(cur);
             let mut nearest = None;
             let mut best = u32::MAX;
-            for p in self.ports_of(ship_owner) {
+            for &p in &self.players[ship_owner].units {
                 let u = &self.units[p];
-                if !(u.active && u.deletion_at.is_none() && !u.under_construction && comp.is_some_and(|c| self.has_water_component(u.tile, c))) {
+                if !(u.type_name == PORT && u.active && u.deletion_at.is_none() && !u.under_construction && comp.is_some_and(|c| self.has_water_component(u.tile, c))) {
                     continue;
                 }
                 let d = self.map.manhattan_dist(u.tile, cur);
@@ -6174,7 +6311,14 @@ impl Game {
                 continue;
             }
             seen.push(id);
-            let Some(w) = self.player_units_of(owner, WARSHIP).into_iter().find(|&u| self.units[u].id == id) else { continue };
+            let Some(w) = self.players[owner]
+                .units
+                .iter()
+                .copied()
+                .find(|&u| self.units[u].type_name == WARSHIP && self.units[u].id == id)
+            else {
+                continue;
+            };
             if !self.units[w].active {
                 continue;
             }
@@ -6353,8 +6497,6 @@ impl Game {
 
 // ── SAM launchers and missile silos (SAMLauncherExecution, MissileSiloExecution) ──
 
-const NUKE_TYPES: [&str; 3] = ["Atom Bomb", "Hydrogen Bomb", "MIRV Warhead"];
-
 impl Game {
     fn tick_silo(&mut self, silo: usize, active: &mut bool) {
         if self.units[silo].under_construction {
@@ -6430,11 +6572,28 @@ impl Game {
         if self.map.num_tiles_with_fallout() == 0 {
             return None;
         }
-        let largest = match self.split_cluster(p, largest_cluster, false) {
+        let largest = match self.split_cluster(p, largest_cluster, severed.is_none()) {
             Some(parts) => parts,
             None => {
                 if severed.is_none() && open_clusters.is_none() {
                     return None;
+                }
+                if severed.is_none() {
+                    let mut nb = [0u32; 4];
+                    let has_fallout = largest_cluster.iter().any(|&t| {
+                        let n = self.map.neighbors4(t, &mut nb);
+                        nb[..n].iter().any(|&x| self.map.has_fallout(x) && self.map.owner_id(x) == 0)
+                    }) || open_clusters.is_some_and(|op| {
+                        op.clusters.iter().any(|cl| {
+                            cl.iter().any(|&t| {
+                                let n = self.map.neighbors4(t, &mut nb);
+                                nb[..n].iter().any(|&x| self.map.has_fallout(x) && self.map.owner_id(x) == 0)
+                            })
+                        })
+                    });
+                    if !has_fallout {
+                        return None;
+                    }
                 }
                 let cls = self.classify_cluster(p, largest_cluster, lbox);
                 whole_cluster(largest_cluster, &lbox, cls)
@@ -6904,7 +7063,6 @@ pub struct NukeExec {
 struct Cached {
     tick: i64,
     tile: u32,
-    min_dist_sq: f64,
     last_seen: u32,
 }
 
@@ -7081,10 +7239,9 @@ impl Game {
             None => {
                 self.move_unit(nuke, ne.dst);
                 let owner = self.units[nuke].owner;
-                let intercepted = self
-                    .nearby_units(ne.dst, 12, &[SAM_MISSILE])
-                    .into_iter()
-                    .any(|(m, _)| self.units[m].owner != owner && self.units[m].target_unit == Some(nuke));
+                let intercepted = self.any_nearby_unit(ne.dst, 12, &[SAM_MISSILE], |m, _| {
+                    self.units[m].owner != owner && self.units[m].target_unit == Some(nuke)
+                });
                 if !intercepted {
                     self.detonate(ne, nuke);
                 }
@@ -7335,7 +7492,7 @@ impl Game {
             let sam_ticks = self.tick_to_reach(sam_tile, tile);
             let allowed = self.dynamic_sam_range(sam, ticks as i64 + nuke_ticks);
             if targetable && dist_sq <= allowed * allowed && nuke_ticks >= sam_ticks {
-                return Cached { tick: nuke_ticks - sam_ticks, tile, min_dist_sq, last_seen: ticks };
+                return Cached { tick: nuke_ticks - sam_ticks, tile, last_seen: ticks };
             }
             if inc_steps > 3 && dist_sq > max_sq {
                 break;
@@ -7368,9 +7525,9 @@ impl Game {
             }
         })();
         if let Some((tick, tile)) = det {
-            return Cached { tick, tile, min_dist_sq, last_seen: ticks };
+            return Cached { tick, tile, last_seen: ticks };
         }
-        Cached { tick: if min_dist_sq > max_sq { -2 } else { -1 }, tile: closest, min_dist_sq, last_seen: ticks }
+        Cached { tick: if min_dist_sq > max_sq { -2 } else { -1 }, tile: closest, last_seen: ticks }
     }
 
     fn sam_valid_targets(&self, se: &mut SamExec, ticks: u32) -> Vec<(usize, u32)> {
@@ -7826,6 +7983,7 @@ impl Game {
         };
         // findLargestInscribedRectangle
         let mut heights = vec![0i64; cols];
+        let mut stack: Vec<usize> = Vec::with_capacity(cols + 1);
         let mut best = (0i64, 0i64, 0i64, 0i64); // x, y, width, height
         for row in 0..rows {
             for (col, hgt) in heights.iter_mut().enumerate() {
@@ -7836,7 +7994,7 @@ impl Game {
                 }
             }
             // largestRectangleInHistogram
-            let mut stack: Vec<usize> = Vec::new();
+            stack.clear();
             let mut max_area = 0;
             let mut rect = (0i64, 0i64, 0i64);
             for i in 0..=cols {
@@ -8599,7 +8757,7 @@ impl Game {
             return;
         }
         let random = ee.random.as_mut().unwrap();
-        let mut reply = |g: &mut Game, list: &[&str], random: &mut PseudoRandom| {
+        let reply = |g: &mut Game, list: &[&str], random: &mut PseudoRandom| {
             let ids = emoji_ids(list);
             let e = ids[random.next_int(0.0, ids.len() as f64) as usize];
             let to = g.players[ee.from].info.id.clone();
@@ -9030,8 +9188,8 @@ impl Game {
         if matches!(a.info.player_type, PlayerType::Human | PlayerType::Nation) && dp.info.player_type == PlayerType::Bot {
             mag *= 0.7;
         }
-        let large_attacker_bonus = 1.0 - 0.7 * territory_sigmoid(a.tiles.len() as f64);
-        let large_defender_bonus = 1.0 - 0.3 * territory_sigmoid(dp.tiles.len() as f64);
+        let large_attacker_bonus = 1.0 - 0.7 * self.territory_sigmoid_of(a.tiles.len());
+        let large_defender_bonus = 1.0 - 0.3 * self.territory_sigmoid_of(dp.tiles.len());
         let traitor_loss_mod = if self.is_traitor(bot) { 0.5 } else { 1.0 };
         let defender_troops = dp.troops_f();
         let defender_loss = defender_troops / dp.tiles.len() as f64;
@@ -9187,19 +9345,25 @@ impl Game {
     }
 
     fn hostile_warships(&self, p: usize) -> Vec<usize> {
-        let mut out = Vec::new();
-        for q in 0..self.players.len() {
-            for &u in &self.players[q].units {
+        let mut out: Vec<usize> = self
+            .type_units(WARSHIP)
+            .iter()
+            .copied()
+            .filter(|&u| {
                 let unit = &self.units[u];
-                if unit.type_name == WARSHIP
+                unit.active
                     && unit.owner != p
                     && !unit.under_construction
                     && self.ws(u).mode != WarshipMode::Docked
                     && self.can_attack_player_afk(unit.owner, p, true)
-                {
-                    out.push(u);
-                }
-            }
+            })
+            .collect();
+        if out.len() > 1 {
+            out.sort_by_key(|&u| {
+                let owner = self.units[u].owner;
+                let pos = self.players[owner].units.iter().position(|&x| x == u).unwrap_or(0);
+                (owner, pos)
+            });
         }
         out
     }
@@ -10344,6 +10508,9 @@ impl Game {
     // ── NationMIRVBehavior helpers ──
 
     fn mirv_leak_share(&self, attacker: usize, target: usize) -> f64 {
+        if self.type_units(SAM_LAUNCHER).is_empty() {
+            return 1.0;
+        }
         let warheads = js_min(350.0, crate::detmath::js_max(1.0, self.players[target].tiles.len() as f64 / 2000.0));
         let mut random = PseudoRandom::new(self.ticks as f64 * 1024.0 + self.players[target].small_id as f64);
         let samples = self.rand_territory_tiles(&mut random, target, 40);
@@ -10991,7 +11158,7 @@ impl Game {
         if set.len() == 0 {
             return f64::INFINITY;
         }
-        if set.contains(tile) {
+        if set.contains_indexed(tile, &self.border_slot) {
             return 0.0;
         }
         let (w, h) = (self.map.width as i64, self.map.height as i64);
@@ -11004,12 +11171,12 @@ impl Game {
                 }
                 let dy = d - dx.abs();
                 let y1 = cy - dy;
-                if y1 >= 0 && set.contains((y1 * w + x) as u32) {
+                if y1 >= 0 && set.contains_indexed((y1 * w + x) as u32, &self.border_slot) {
                     return d as f64;
                 }
                 if dy != 0 {
                     let y2 = cy + dy;
-                    if y2 < h && set.contains((y2 * w + x) as u32) {
+                    if y2 < h && set.contains_indexed((y2 * w + x) as u32, &self.border_slot) {
                         return d as f64;
                     }
                 }
@@ -11270,18 +11437,27 @@ impl Game {
         }
         // trackIncomingTransportsAndRetaliate
         let small = self.players[p].small_id;
-        for q in 0..self.players.len() {
-            for &u in &self.players[q].units {
+        let mut new_incoming: Vec<usize> = self
+            .type_units(TRANSPORT_SHIP)
+            .iter()
+            .copied()
+            .filter(|&u| {
                 let unit = &self.units[u];
-                if unit.type_name != TRANSPORT_SHIP {
-                    continue;
-                }
-                let Some(target) = unit.target_tile else { continue };
-                if target != 0 && unit.active && !unit.retreating && self.map.owner_id(target) == small && self.players[unit.owner].small_id != small && !ne.tracked_incoming.contains(&u) {
-                    ne.tracked_incoming.push(u);
-                }
-            }
+                unit.active
+                    && !unit.retreating
+                    && unit.target_tile.is_some_and(|target| target != 0 && self.map.owner_id(target) == small)
+                    && self.players[unit.owner].small_id != small
+                    && !ne.tracked_incoming.contains(&u)
+            })
+            .collect();
+        if new_incoming.len() > 1 {
+            new_incoming.sort_by_key(|&u| {
+                let owner = self.units[u].owner;
+                let pos = self.players[owner].units.iter().position(|&x| x == u).unwrap_or(0);
+                (owner, pos)
+            });
         }
+        ne.tracked_incoming.extend(new_incoming);
         for u in ne.tracked_incoming.clone() {
             let unit = &self.units[u];
             let Some(target) = unit.target_tile.filter(|_| unit.active && !unit.retreating) else {
@@ -11330,7 +11506,14 @@ impl Game {
     }
 
     fn hostile_warships_near(&self, p: usize, tile: u32) -> usize {
-        self.nearby_units(tile, 130, &[WARSHIP]).into_iter().filter(|&(u, _)| self.can_attack_player_afk(self.units[u].owner, p, true)).count()
+        let mut count = 0;
+        self.any_nearby_unit(tile, 130, &[WARSHIP], |u, _| {
+            if self.can_attack_player_afk(self.units[u].owner, p, true) {
+                count += 1;
+            }
+            false
+        });
+        count
     }
 
     fn can_build_warship_at(&self, p: usize, tile: u32) -> bool {
@@ -11388,7 +11571,7 @@ impl Game {
         if !self.lands_beachheads() {
             return;
         }
-        let total: usize = (0..self.players.len()).map(|q| self.player_units_of(q, WARSHIP).len()).sum();
+        let total: usize = self.type_units(WARSHIP).len();
         if total <= 10
             || self.unit_cost(p, WARSHIP) > self.players[p].gold
             || self.player_units_of(p, PORT).is_empty()
@@ -11815,6 +11998,9 @@ impl Game {
     /// isTrajectoryInterceptableBySam: whether an enemy SAM covers the bomb's flight
     /// outside its untargetable mid-air stretch.
     fn is_trajectory_interceptable_by_sam(&self, p: usize, spawn: u32, target: u32) -> bool {
+        if self.type_units(SAM_LAUNCHER).is_empty() {
+            return false;
+        }
         let pts = self.parabola_points(spawn, target, true);
         let trajectory: Vec<u32> = Curve::new(pts, 10.0).points.iter().map(|&q| self.curve_tile(q)).collect();
         if trajectory.is_empty() {
@@ -11842,15 +12028,15 @@ impl Game {
                 continue;
             }
             let t = trajectory[i as usize];
-            for (sam, d2) in self.nearby_units(t, 150, &[SAM_LAUNCHER]) {
+            if self.any_nearby_unit(t, 150, &[SAM_LAUNCHER], |sam, d2| {
                 let owner = self.units[sam].owner;
                 if owner == p || self.is_friendly(p, owner, false) {
-                    continue;
+                    return false;
                 }
                 let range = Self::sam_range(self.units[sam].level);
-                if d2 as f64 <= range * range {
-                    return true;
-                }
+                d2 as f64 <= range * range
+            }) {
+                return true;
             }
             i += 1;
         }
@@ -12026,14 +12212,16 @@ impl Game {
             return Some(a);
         }
         // findIncomingNukePlayer
-        for q in 0..self.players.len() {
-            for &u in &self.players[q].units {
-                let unit = &self.units[u];
-                if !matches!(unit.type_name, ATOM_BOMB | HYDROGEN_BOMB) || self.is_friendly(p, unit.owner, false) {
-                    continue;
-                }
-                if unit.target_tile.is_some_and(|t| self.owner_index(t) == Some(p)) {
-                    return Some(unit.owner);
+        if !self.type_units(ATOM_BOMB).is_empty() || !self.type_units(HYDROGEN_BOMB).is_empty() {
+            for q in 0..self.players.len() {
+                for &u in &self.players[q].units {
+                    let unit = &self.units[u];
+                    if !matches!(unit.type_name, ATOM_BOMB | HYDROGEN_BOMB) || self.is_friendly(p, unit.owner, false) {
+                        continue;
+                    }
+                    if unit.target_tile.is_some_and(|t| self.owner_index(t) == Some(p)) {
+                        return Some(unit.owner);
+                    }
                 }
             }
         }
@@ -12204,16 +12392,14 @@ impl Game {
             let mut coverage = 0.0;
             if self.config.difficulty != "Easy" {
             // isNukeAlreadyLandingNear
-            let landing = [ATOM_BOMB, HYDROGEN_BOMB, MIRV_WARHEAD].iter().any(|ty| {
-                (0..self.players.len()).any(|q| {
-                    self.players[q].units.iter().any(|&u| {
-                        let unit = &self.units[u];
-                        unit.type_name == *ty
-                            && unit.target_tile.is_some_and(|tt| {
-                                let sum = inner + Self::nuke_magnitude(unit.type_name).0;
-                                self.dist2(tile, tt) <= sum * sum
-                            })
-                    })
+            let landing = [ATOM_BOMB, HYDROGEN_BOMB, MIRV_WARHEAD].iter().any(|&ty| {
+                self.type_units(ty).iter().any(|&u| {
+                    let unit = &self.units[u];
+                    unit.active
+                        && unit.target_tile.is_some_and(|tt| {
+                            let sum = inner + Self::nuke_magnitude(unit.type_name).0;
+                            self.dist2(tile, tt) <= sum * sum
+                        })
                 })
             });
             if landing {

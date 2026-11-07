@@ -19,6 +19,8 @@
 //! Games from engine versions openfront-video doesn't follow render with
 //! render.ts and the TypeScript engine at the version they were played on.
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};

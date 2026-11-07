@@ -1,7 +1,6 @@
 //! H.264 encoding (OpenH264, compiled in) into an MP4 file.
 
-use std::fs::File;
-use std::io::BufWriter;
+use std::io::Cursor;
 
 use openh264::encoder::{
     BitRate, Complexity, Encoder, EncoderConfig, FrameRate, RateControlMode, SpsPpsStrategy, VuiConfig,
@@ -12,12 +11,13 @@ use openh264::OpenH264API;
 pub struct VideoWriter {
     path: String,
     encoder: Encoder,
-    mp4: Option<mp4::Mp4Writer<BufWriter<File>>>,
-    file: Option<BufWriter<File>>,
+    mp4: Option<mp4::Mp4Writer<Cursor<Vec<u8>>>>,
+    buf: Option<Cursor<Vec<u8>>>,
     w: usize,
     h: usize,
     fps: u32,
     yuv: Vec<u8>,
+    prev_rgba: Vec<u8>,
     frames: u64,
     /// Duration written so far, in frames.
     written: u64,
@@ -54,42 +54,54 @@ fn nal_units(data: &[u8]) -> Vec<&[u8]> {
 impl VideoWriter {
     /// `bitrate` in bits per second; `threads` encoder threads.
     pub fn create(path: &str, w: usize, h: usize, fps: u32, bitrate: u32, threads: u16) -> Result<VideoWriter, String> {
-        let config = EncoderConfig::new()
+        let mut config = EncoderConfig::new()
             .rate_control_mode(RateControlMode::Quality)
             .bitrate(BitRate::from_bps(bitrate))
             .max_frame_rate(FrameRate::from_hz(fps as f32))
             .skip_frames(false)
-            .complexity(Complexity::Medium)
+            .complexity(Complexity::Low)
             .sps_pps_strategy(SpsPpsStrategy::ConstantId)
+            .debug(false)
             // Several threads need several slices per frame.
             .num_threads(threads)
-            .max_slice_len(if threads > 1 { 60_000 } else { 0 })
             .vui(VuiConfig::bt709());
-        let mut encoder = Encoder::with_api_config(OpenH264API::from_source(), config).map_err(|e| format!("starting the encoder: {e}"))?;
-        // Quiet: the slice settings make OpenH264 warn when it starts.
-        unsafe {
-            let mut quiet: std::os::raw::c_int = openh264_sys2::WELS_LOG_QUIET as _;
-            if std::env::var("OPENH264_LOG").is_err() { encoder.raw_api().set_option(openh264_sys2::ENCODER_OPTION_TRACE_LEVEL, (&raw mut quiet).cast()); }
+        if threads > 1 {
+            config = config.max_slice_len(60_000);
         }
-        let file = BufWriter::with_capacity(1 << 20, File::create(path).map_err(|e| format!("creating {path}: {e}"))?);
+        let encoder = Encoder::with_api_config(OpenH264API::from_source(), config).map_err(|e| format!("starting the encoder: {e}"))?;
+        let buf = Cursor::new(Vec::with_capacity(8 << 20));
         Ok(VideoWriter {
             path: path.to_string(),
             encoder,
             mp4: None,
-            file: Some(file),
+            buf: Some(buf),
             w,
             h,
             fps,
             yuv: vec![0; w * h * 3 / 2],
+            prev_rgba: Vec::new(),
             frames: 0,
             written: 0,
             pending: None,
         })
     }
 
-    /// Encodes one RGBA frame.
-    pub fn write(&mut self, rgba: &[u8]) -> Result<(), String> {
-        rgba_to_i420(rgba, self.w, self.h, &mut self.yuv);
+    /// Encodes an RGBA frame displayed for `repeat` frame durations.
+    pub fn write(&mut self, rgba: &[u8], repeat: u32) -> Result<(), String> {
+        if repeat == 0 {
+            return Ok(());
+        }
+        rgba_to_i420_delta(rgba, &mut self.prev_rgba, self.w, self.h, &mut self.yuv);
+        if repeat <= 2 {
+            self.encode_yuv(repeat)
+        } else {
+            // Encode first frame, then one refining P-frame held for the remaining duration.
+            self.encode_yuv(1)?;
+            self.encode_yuv(repeat - 1)
+        }
+    }
+
+    fn encode_yuv(&mut self, duration: u32) -> Result<(), String> {
         let (w, h) = (self.w, self.h);
         let (y, uv) = self.yuv.split_at(w * h);
         let (u, v) = uv.split_at(w * h / 4);
@@ -120,7 +132,7 @@ impl VideoWriter {
                 return Err("the encoder's first frame has no parameter sets".into());
             };
             let mut mp4 = mp4::Mp4Writer::write_start(
-                self.file.take().unwrap(),
+                self.buf.take().unwrap(),
                 &mp4::Mp4Config {
                     major_brand: str::parse("isom").unwrap(),
                     minor_version: 512,
@@ -146,12 +158,12 @@ impl VideoWriter {
         if sample.is_empty() {
             // A skipped frame: the previous one shows for longer.
             if let Some(p) = &mut self.pending {
-                p.2 += 1;
+                p.2 += duration;
             }
             return Ok(());
         }
         self.flush_pending()?;
-        self.pending = Some((sample, sync, 1));
+        self.pending = Some((sample, sync, duration));
         Ok(())
     }
 
@@ -169,18 +181,16 @@ impl VideoWriter {
         Ok(())
     }
 
-    /// Finishes the file; returns the number of frames encoded.
+    /// Finishes the file; returns the number of frames written.
     pub fn finish(mut self) -> Result<u64, String> {
         self.flush_pending()?;
         let mut mp4 = self.mp4.take().ok_or("no frames were encoded")?;
         mp4.write_end().map_err(|e| e.to_string())?;
-        std::io::Write::flush(&mut mp4.into_writer()).map_err(|e| e.to_string())?;
+        let data = mp4.into_writer().into_inner();
         // The index goes first so players can start before the whole file is in.
-        let data = std::fs::read(&self.path).map_err(|e| e.to_string())?;
-        if let Some(fast) = faststart(&data) {
-            std::fs::write(&self.path, fast).map_err(|e| e.to_string())?;
-        }
-        Ok(self.frames)
+        let out = faststart(&data).unwrap_or(data);
+        std::fs::write(&self.path, out).map_err(|e| format!("writing {}: {e}", self.path))?;
+        Ok(self.written)
     }
 }
 
@@ -257,8 +267,13 @@ fn faststart(data: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// RGBA to I420 with BT.709 limited-range coefficients (as tagged in the
-/// stream's VUI), on a few threads.
-fn rgba_to_i420(rgba: &[u8], w: usize, h: usize, out: &mut [u8]) {
+/// stream's VUI), skipping 32x2 pixel strips unchanged from the previous frame.
+fn rgba_to_i420_delta(rgba: &[u8], prev_rgba: &mut Vec<u8>, w: usize, h: usize, out: &mut [u8]) {
+    let has_prev = prev_rgba.len() == rgba.len();
+    if !has_prev {
+        prev_rgba.clear();
+        prev_rgba.extend_from_slice(rgba);
+    }
     let (y_plane, uv) = out.split_at_mut(w * h);
     let (u_plane, v_plane) = uv.split_at_mut(w * h / 4);
     // Fixed point, 16 fractional bits: Y = 16 + 219/255 (0.2126 R + 0.7152 G + 0.0722 B), etc.
@@ -271,47 +286,63 @@ fn rgba_to_i420(rgba: &[u8], w: usize, h: usize, out: &mut [u8]) {
     const VR: i32 = 28785;
     const VG: i32 = -26145;
     const VB: i32 = -2640;
+    let half_w = w / 2;
     let pairs = h / 2;
-    let threads = 4.min(pairs.max(1));
-    let rows_per = pairs.div_ceil(threads);
-    std::thread::scope(|s| {
-        let mut y_rest = &mut *y_plane;
-        let mut u_rest = &mut *u_plane;
-        let mut v_rest = &mut *v_plane;
-        for t in 0..threads {
-            let p0 = t * rows_per;
-            let p1 = ((t + 1) * rows_per).min(pairs);
-            if p0 >= p1 {
-                break;
-            }
-            let (yc, yr) = std::mem::take(&mut y_rest).split_at_mut((p1 - p0) * 2 * w);
-            let (uc, ur) = std::mem::take(&mut u_rest).split_at_mut((p1 - p0) * w / 2);
-            let (vc, vr) = std::mem::take(&mut v_rest).split_at_mut((p1 - p0) * w / 2);
-            y_rest = yr;
-            u_rest = ur;
-            v_rest = vr;
-            s.spawn(move || {
-                for p in p0..p1 {
-                    let ly = (p - p0) * 2;
-                    for x2 in 0..w / 2 {
-                        let (mut rs, mut gs, mut bs) = (0, 0, 0);
-                        for dy in 0..2 {
-                            for dx in 0..2 {
-                                let (yy, xx) = (p * 2 + dy, x2 * 2 + dx);
-                                let i = (yy * w + xx) * 4;
-                                let (r, g, b) = (rgba[i] as i32, rgba[i + 1] as i32, rgba[i + 2] as i32);
-                                yc[(ly + dy) * w + xx] = (16 + ((YR * r + YG * g + YB * b + 32768) >> 16)) as u8;
-                                rs += r;
-                                gs += g;
-                                bs += b;
-                            }
-                        }
-                        let ci = (p - p0) * (w / 2) + x2;
-                        uc[ci] = (128 + ((UR * rs + UG * gs + UB * bs + 131072) >> 18)) as u8;
-                        vc[ci] = (128 + ((VR * rs + VG * gs + VB * bs + 131072) >> 18)) as u8;
-                    }
-                }
-            });
+    const STRIP_QUADS: usize = 16; // 32 pixels = 128 bytes per row
+    for p in 0..pairs {
+        let r0_start = (p * 2) * w * 4;
+        let r1_start = (p * 2 + 1) * w * 4;
+        let r1_end = (p * 2 + 2) * w * 4;
+        let row0_rgba = &rgba[r0_start..r1_start];
+        let row1_rgba = &rgba[r1_start..r1_end];
+        if has_prev && row0_rgba == &prev_rgba[r0_start..r1_start] && row1_rgba == &prev_rgba[r1_start..r1_end] {
+            continue;
         }
-    });
+        let (y_row0, y_row1) = y_plane[(p * 2) * w..(p * 2 + 2) * w].split_at_mut(w);
+        let u_row = &mut u_plane[p * half_w..(p + 1) * half_w];
+        let v_row = &mut v_plane[p * half_w..(p + 1) * half_w];
+        let mut x2 = 0;
+        while x2 < half_w {
+            let x2_end = (x2 + STRIP_QUADS).min(half_w);
+            let b0 = x2 * 8;
+            let b1 = x2_end * 8;
+            if has_prev {
+                let p0 = &mut prev_rgba[r0_start + b0..r0_start + b1];
+                let s0 = &row0_rgba[b0..b1];
+                let same0 = p0 == s0;
+                if !same0 {
+                    p0.copy_from_slice(s0);
+                }
+                let p1 = &mut prev_rgba[r1_start + b0..r1_start + b1];
+                let s1 = &row1_rgba[b0..b1];
+                let same1 = p1 == s1;
+                if !same1 {
+                    p1.copy_from_slice(s1);
+                }
+                if same0 && same1 {
+                    x2 = x2_end;
+                    continue;
+                }
+            }
+            for q in x2..x2_end {
+                let i = q * 8;
+                let (r00, g00, b00) = (row0_rgba[i] as i32, row0_rgba[i + 1] as i32, row0_rgba[i + 2] as i32);
+                let (r01, g01, b01) = (row0_rgba[i + 4] as i32, row0_rgba[i + 5] as i32, row0_rgba[i + 6] as i32);
+                let (r10, g10, b10) = (row1_rgba[i] as i32, row1_rgba[i + 1] as i32, row1_rgba[i + 2] as i32);
+                let (r11, g11, b11) = (row1_rgba[i + 4] as i32, row1_rgba[i + 5] as i32, row1_rgba[i + 6] as i32);
+
+                y_row0[q * 2] = (16 + ((YR * r00 + YG * g00 + YB * b00 + 32768) >> 16)) as u8;
+                y_row0[q * 2 + 1] = (16 + ((YR * r01 + YG * g01 + YB * b01 + 32768) >> 16)) as u8;
+                y_row1[q * 2] = (16 + ((YR * r10 + YG * g10 + YB * b10 + 32768) >> 16)) as u8;
+                y_row1[q * 2 + 1] = (16 + ((YR * r11 + YG * g11 + YB * b11 + 32768) >> 16)) as u8;
+
+                let rs = r00 + r01 + r10 + r11;
+                let gs = g00 + g01 + g10 + g11;
+                let bs = b00 + b01 + b10 + b11;
+                u_row[q] = (128 + ((UR * rs + UG * gs + UB * bs + 131072) >> 18)) as u8;
+                v_row[q] = (128 + ((VR * rs + VG * gs + VB * bs + 131072) >> 18)) as u8;
+            }
+            x2 = x2_end;
+        }
+    }
 }

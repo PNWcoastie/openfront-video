@@ -15,7 +15,6 @@ ttf-parser = "0.25"
 rustybuzz = "0.20"
 openh264 = "0.9"
 mp4 = "0.14"
-openh264-sys2 = "0.9"
 
 [build-dependencies]
 flate2 = "1"
@@ -27,6 +26,6 @@ name = "openfront-video"
 path = "src/bin/openfront-video/main.rs"
 
 [profile.release]
-debug = true
-lto = "fat"
+debug = "line-tables-only"
+lto = "thin"
 codegen-units = 1

@@ -4,43 +4,42 @@
 
 #[derive(Default)]
 pub struct FlatBinaryHeap {
-    pri: Vec<f32>,
-    tiles: Vec<u32>,
+    nodes: Vec<(f32, u32)>,
 }
 
 impl FlatBinaryHeap {
+    #[inline]
     pub fn clear(&mut self) {
-        self.pri.clear();
-        self.tiles.clear();
+        self.nodes.clear();
     }
 
+    #[inline]
     pub fn size(&self) -> usize {
-        self.pri.len()
+        self.nodes.len()
     }
 
+    #[inline]
     pub fn enqueue(&mut self, tile: u32, priority: f64) {
-        let mut i = self.pri.len();
-        self.pri.push(0.0);
-        self.tiles.push(0);
+        let mut i = self.nodes.len();
+        self.nodes.push((0.0, 0));
         while i > 0 {
             let parent = (i - 1) >> 1;
-            if priority >= self.pri[parent] as f64 {
+            let p_node = self.nodes[parent];
+            if priority >= p_node.0 as f64 {
                 break;
             }
-            self.pri[i] = self.pri[parent];
-            self.tiles[i] = self.tiles[parent];
+            self.nodes[i] = p_node;
             i = parent;
         }
-        self.pri[i] = priority as f32;
-        self.tiles[i] = tile;
+        self.nodes[i] = (priority as f32, tile);
     }
 
+    #[inline]
     pub fn dequeue(&mut self) -> u32 {
-        assert!(!self.pri.is_empty(), "heap empty");
-        let top = self.tiles[0];
-        let last_pri = self.pri.pop().unwrap();
-        let last_tile = self.tiles.pop().unwrap();
-        let len = self.pri.len();
+        assert!(!self.nodes.is_empty(), "heap empty");
+        let top = self.nodes[0].1;
+        let last = self.nodes.pop().unwrap();
+        let len = self.nodes.len();
         if len == 0 {
             return top;
         }
@@ -51,16 +50,15 @@ impl FlatBinaryHeap {
                 break;
             }
             let right = left + 1;
-            let child = if right < len && self.pri[right] < self.pri[left] { right } else { left };
-            if last_pri <= self.pri[child] {
+            let child = if right < len && self.nodes[right].0 < self.nodes[left].0 { right } else { left };
+            let c_node = self.nodes[child];
+            if last.0 <= c_node.0 {
                 break;
             }
-            self.pri[i] = self.pri[child];
-            self.tiles[i] = self.tiles[child];
+            self.nodes[i] = c_node;
             i = child;
         }
-        self.pri[i] = last_pri;
-        self.tiles[i] = last_tile;
+        self.nodes[i] = last;
         top
     }
 }

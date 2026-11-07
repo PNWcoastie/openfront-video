@@ -10,23 +10,27 @@ use engine_rs::rng::PseudoRandom;
 use serde_json::Value;
 
 /// A color packed as little-endian RGBA (r in the low byte), alpha 255.
+#[inline]
 pub fn rgba(r: u32, g: u32, b: u32) -> u32 {
     0xff00_0000 | (b << 16) | (g << 8) | r
 }
 
+#[inline]
 pub fn channels(c: u32) -> [u32; 3] {
     [c & 0xff, (c >> 8) & 0xff, (c >> 16) & 0xff]
 }
 
 /// JavaScript's Math.round.
+#[inline]
 pub fn js_round(x: f64) -> f64 {
     (x + 0.5).floor()
 }
 
 /// render.ts mix: a toward b by t, per channel.
+#[inline]
 pub fn mix(a: u32, b: u32, t: f64) -> u32 {
     let (a, b) = (channels(a), channels(b));
-    let m = |i: usize| js_round(a[i] as f64 + (b[i] as f64 - a[i] as f64) * t) as u32;
+    let m = |i: usize| (a[i] as f64 + (b[i] as f64 - a[i] as f64) * t + 0.5) as u32;
     rgba(m(0), m(1), m(2))
 }
 

@@ -7,6 +7,7 @@
 //! It reads terrain only, so a (from, to) query has one answer per map; the
 //! harness compares whole paths against the TypeScript chain.
 
+use crate::fxhash::FxHashMap;
 use crate::map::GameMap;
 
 const LAND_MASK: u8 = 0x80;
@@ -218,7 +219,7 @@ impl BfsGrid {
                 continue;
             }
             let x = node % width;
-            let mut try_add = |n: u32, s: &mut Self, tail: &mut usize| {
+            let try_add = |n: u32, s: &mut Self, tail: &mut usize| {
                 if s.visited[n as usize] != stamp && is_valid(n) {
                     s.visited[n as usize] = stamp;
                     s.dist[n as usize] = next as u16;
@@ -296,7 +297,7 @@ impl AbstractGraph {
             node_edges: Vec::new(),
             clusters: vec![Vec::new(); (clusters_x * clusters_y) as usize],
         };
-        let mut tile_to_node: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        let mut tile_to_node: FxHashMap<u32, u32> = FxHashMap::default();
         let is_water = |t: u32| map.terrain_byte(t) & LAND_MASK == 0;
 
         let mut get_or_create = |g: &mut AbstractGraph, x: u32, y: u32| -> u32 {
@@ -378,7 +379,7 @@ impl AbstractGraph {
 
         // Edges between nodes of a cluster, by bounded BFS.
         let mut bfs = BfsGrid::new(map.num_tiles() as usize);
-        let mut edge_between: std::collections::HashMap<(u32, u32), usize> = std::collections::HashMap::new();
+        let mut edge_between: FxHashMap<(u32, u32), usize> = FxHashMap::default();
         for cy in 0..clusters_y {
             for cx in 0..clusters_x {
                 let node_ids = g.clusters[(cy * clusters_x + cx) as usize].clone();
@@ -404,13 +405,13 @@ impl AbstractGraph {
                         let n = g.nodes[t as usize];
                         max_manhattan = max_manhattan.max(n.x.abs_diff(from.x) + n.y.abs_diff(from.y));
                     }
-                    let tile_to_target: std::collections::HashMap<u32, u32> =
+                    let tile_to_target: FxHashMap<u32, u32> =
                         targets.iter().map(|&t| (g.nodes[t as usize].tile, t)).collect();
                     // Map insertion order: first time each target is reached.
                     let mut reachable: Vec<(u32, u32)> = Vec::new();
                     let mut found = 0;
                     bfs.search(w, h, from.tile, max_manhattan * 4, is_water, |tile, dist| {
-                        let (x, y) = (tile % w, tile / w);
+                        let (x, y) = map.xy(tile);
                         let is_target = tile_to_target.get(&tile).copied();
                         if !(tile == from.tile || is_target.is_some()) && (x < min_x || x > max_x || y < min_y || y > max_y) {
                             return Visit::Reject;
@@ -518,11 +519,11 @@ impl BoundedAStar {
         if num_local > self.max_area as i64 {
             return None;
         }
-        let goal_x = goal as i64 % w;
-        let goal_y = goal as i64 / w;
+        let goal_x = map.x(goal) as i64;
+        let goal_y = map.y(goal) as i64;
         let to_local = |tile: u32| -> i64 {
-            let x = (tile as i64 % w).clamp(b.min_x, b.max_x);
-            let y = (tile as i64 / w).clamp(b.min_y, b.max_y);
+            let x = (map.x(tile) as i64).clamp(b.min_x, b.max_x);
+            let y = (map.y(tile) as i64).clamp(b.min_y, b.max_y);
             (y - b.min_y) * bw + (x - b.min_x)
         };
         let to_global = |local: i64| -> i64 { ((local / bw) + b.min_y) * w + (local % bw + b.min_x) };
@@ -531,8 +532,8 @@ impl BoundedAStar {
             return None;
         }
         self.queue.clear();
-        let s0 = starts[0] as i64;
-        let (start_x, start_y) = (s0 % w, s0 / w);
+        let s0 = starts[0];
+        let (start_x, start_y) = (map.x(s0) as i64, map.y(s0) as i64);
         let dx_goal = goal_x - start_x;
         let dy_goal = goal_y - start_y;
         let cross_norm = 1.max(dx_goal.abs() + dy_goal.abs()) as f64;
@@ -549,7 +550,7 @@ impl BoundedAStar {
             self.g[sl] = 0;
             self.g_stamp[sl] = stamp;
             self.came_from[sl] = -1;
-            let (sx, sy) = (s as i64 % w, s as i64 / w);
+            let (sx, sy) = (map.x(s) as i64, map.y(s) as i64);
             self.queue.push(sl as i32, 3.0 * 100.0 * ((sx - goal_x).abs() + (sy - goal_y).abs()) as f64);
         }
         let mut iterations: i64 = 100_000;
@@ -577,8 +578,11 @@ impl BoundedAStar {
                 return Some(path);
             }
             let cur_g = self.g[cl];
-            let current = to_global(cur_local);
-            let (cx, cy) = (current % w, current / w);
+            let lx = cur_local % bw;
+            let ly = cur_local / bw;
+            let cx = lx + b.min_x;
+            let cy = ly + b.min_y;
+            let current = cy * w + cx;
             // N, S, W, E
             let dirs: [(bool, i64, i64, i64, i64); 4] = [
                 (cy > b.min_y, current - w, cur_local - bw, cx, cy - 1),
@@ -741,11 +745,11 @@ impl SimpleAStar {
         let stamp = self.stamp;
         let w = map.width as i64;
         let n = map.num_tiles() as i64;
-        let (gx, gy) = (goal as i64 % w, goal as i64 / w);
+        let (gx, gy) = (map.x(goal) as i64, map.y(goal) as i64);
         self.queue.clear();
         // Cross-product tie-breaker: prefer the straight start-goal line.
-        let s0 = starts[0] as i64;
-        let (dxg, dyg) = (gx - s0 % w, gy - s0 / w);
+        let s0 = starts[0];
+        let (dxg, dyg) = (gx - map.x(s0) as i64, gy - map.y(s0) as i64);
         let cross_norm = (dxg.abs() + dyg.abs()).max(1) as f64;
         let tie = |nx: i64, ny: i64| -> u32 {
             let cross = (dxg * (ny - gy) - dyg * (nx - gx)).abs() as f64;
@@ -756,7 +760,7 @@ impl SimpleAStar {
             self.g[s as usize] = 0;
             self.g_stamp[s as usize] = stamp;
             self.came_from[s as usize] = -1;
-            self.queue.push(s as i32, h(s as i64 % w, s as i64 / w) as f64);
+            self.queue.push(s as i32, h(map.x(s) as i64, map.y(s) as i64) as f64);
         }
         let mut iterations = Self::MAX_ITERATIONS;
         while !self.queue.is_empty() {
@@ -780,7 +784,7 @@ impl SimpleAStar {
                 return Some(path);
             }
             let cur_g = self.g[cur as usize];
-            let (cx, cy) = (cur % w, cur / w);
+            let (cx, cy) = (map.x(cur as u32) as i64, map.y(cur as u32) as i64);
             // Up, down, left, right, as AStar.Water.ts.
             let neighbors = [
                 (cur >= w, cur - w, cx, cy - 1),
@@ -826,6 +830,8 @@ pub struct WaterPathfinder {
     local_multi: BoundedAStar,
     local_short: BoundedAStar,
     smooth_astar: BoundedAStar,
+    pub refine_astar: BoundedAStar,
+    edge_cache: FxHashMap<u64, Option<Vec<u32>>>,
 }
 
 impl WaterPathfinder {
@@ -844,6 +850,8 @@ impl WaterPathfinder {
             local_multi: BoundedAStar::new(96 * 96),
             local_short: BoundedAStar::new(260 * 260),
             smooth_astar: BoundedAStar::new(100 * 100),
+            refine_astar: BoundedAStar::new(100 * 100),
+            edge_cache: FxHashMap::default(),
             graph,
             mini,
         }
@@ -869,11 +877,10 @@ impl WaterPathfinder {
             return None;
         }
         // upscalePath
-        let mw = self.mini.width;
         let mut up: Vec<u32> = Vec::new();
         for i in 0..path.len() - 1 {
-            let (cx, cy) = ((path[i] % mw) as f64 * 2.0, (path[i] / mw) as f64 * 2.0);
-            let (nx, ny) = ((path[i + 1] % mw) as f64 * 2.0, (path[i + 1] / mw) as f64 * 2.0);
+            let (cx, cy) = (self.mini.x(path[i]) as f64 * 2.0, self.mini.y(path[i]) as f64 * 2.0);
+            let (nx, ny) = (self.mini.x(path[i + 1]) as f64 * 2.0, self.mini.y(path[i + 1]) as f64 * 2.0);
             up.push(map.ref_at(cx as u32, cy as u32));
             let (dx, dy) = (nx - cx, ny - cy);
             let steps = dx.abs().max(dy.abs()) as i64;
@@ -884,7 +891,7 @@ impl WaterPathfinder {
             }
         }
         let last = path[path.len() - 1];
-        up.push(map.ref_at((last % mw) * 2, (last / mw) * 2));
+        up.push(map.ref_at(self.mini.x(last) * 2, self.mini.y(last) * 2));
         // The source: the given tile, or the one nearest the path's start.
         let src = if from.len() > 1 {
             let (sx, sy) = (map.x(up[0]) as i64, map.y(up[0]) as i64);
@@ -1022,11 +1029,7 @@ impl WaterPathfinder {
             }
             let farthest = farthest as usize;
             if farthest > current + 1 {
-                if let Some(trace) = self.trace_path(path[current], path[farthest]) {
-                    for i in 1..trace.len().saturating_sub(1) {
-                        result.push(trace[i]);
-                    }
-                }
+                self.trace_path_interior(path[current], path[farthest], &mut result);
             }
             current = farthest;
             if current < path.len() - 1 {
@@ -1044,7 +1047,12 @@ impl WaterPathfinder {
 
     fn can_see(&self, from: u32, to: u32, min_mag: u8) -> bool {
         let w = self.mini.width as i64;
-        let (x0, y0, x1, y1) = (from as i64 % w, from as i64 / w, to as i64 % w, to as i64 / w);
+        let (x0, y0, x1, y1) = (
+            self.mini.x(from) as i64,
+            self.mini.y(from) as i64,
+            self.mini.x(to) as i64,
+            self.mini.y(to) as i64,
+        );
         let (dx, dy) = ((x1 - x0).abs(), (y1 - y0).abs());
         let (sx, sy) = (if x0 < x1 { 1 } else { -1 }, if y0 < y1 { 1 } else { -1 });
         let mut err = dx - dy;
@@ -1094,28 +1102,40 @@ impl WaterPathfinder {
         }
     }
 
-    fn trace_path(&self, from: u32, to: u32) -> Option<Vec<u32>> {
+    /// Appends interior tiles (`trace[1..trace.len()-1]`) of the straight line
+    /// between `from` and `to` directly into `out`, truncating `out` back to its
+    /// original length if any tile on the trace is not water.
+    fn trace_path_interior(&self, from: u32, to: u32, out: &mut Vec<u32>) -> bool {
+        let saved_len = out.len();
         let w = self.mini.width as i64;
         let water = |t: i64| self.mini_is_water(t as u32);
-        let (x0, y0, x1, y1) = (from as i64 % w, from as i64 / w, to as i64 % w, to as i64 / w);
+        let (x0, y0, x1, y1) = (
+            self.mini.x(from) as i64,
+            self.mini.y(from) as i64,
+            self.mini.x(to) as i64,
+            self.mini.y(to) as i64,
+        );
         let (dx, dy) = ((x1 - x0).abs(), (y1 - y0).abs());
         let (sx, sy) = (if x0 < x1 { 1 } else { -1 }, if y0 < y1 { 1 } else { -1 });
         let mut err = dx - dy;
         let (mut x, mut y) = (x0, y0);
-        let mut tiles = Vec::new();
         let mut iterations = 0;
         loop {
             iterations += 1;
             if iterations > 100_001 {
-                return None;
+                out.truncate(saved_len);
+                return false;
             }
             let tile = y * w + x;
             if !water(tile) {
-                return None;
+                out.truncate(saved_len);
+                return false;
             }
-            tiles.push(tile as u32);
             if x == x1 && y == y1 {
                 break;
+            }
+            if iterations > 1 {
+                out.push(tile as u32);
             }
             let e2 = 2 * err;
             let move_x = e2 > -dy;
@@ -1131,13 +1151,14 @@ impl WaterPathfinder {
                     err += dx;
                     let alt = y * w + x;
                     if !water(alt) {
-                        return None;
+                        out.truncate(saved_len);
+                        return false;
                     }
-                    tiles.push(alt as u32);
+                    out.push(alt as u32);
                     x += sx;
                     err -= dy;
                 } else {
-                    tiles.push(inter as u32);
+                    out.push(inter as u32);
                     y += sy;
                     err += dx;
                 }
@@ -1152,7 +1173,7 @@ impl WaterPathfinder {
                 }
             }
         }
-        Some(tiles)
+        true
     }
 
     fn mini_manhattan(&self, a: u32, b: u32) -> u32 {
@@ -1309,12 +1330,19 @@ impl WaterPathfinder {
         let (sx, sy) = self.cluster_of(from);
         let mut path = self.local_path(from, first, sx, sy, false)?;
         for i in 0..node_path.len() - 1 {
-            let edge = *self.graph.edge_between(node_path[i], node_path[i + 1])?;
-            let a = self.graph.nodes[node_path[i] as usize].tile;
-            let b = self.graph.nodes[node_path[i + 1] as usize].tile;
-            // The engine caches these per edge and direction; the local
-            // search is deterministic, so recomputing gives the same tiles.
-            let seg = self.local_path(a, b, edge.cluster_x, edge.cluster_y, false)?;
+            let (na, nb) = (node_path[i], node_path[i + 1]);
+            let key = ((na as u64) << 32) | (nb as u64);
+            if !self.edge_cache.contains_key(&key) {
+                let seg = if let Some(&edge) = self.graph.edge_between(na, nb) {
+                    let a = self.graph.nodes[na as usize].tile;
+                    let b = self.graph.nodes[nb as usize].tile;
+                    self.local_path(a, b, edge.cluster_x, edge.cluster_y, false)
+                } else {
+                    None
+                };
+                self.edge_cache.insert(key, seg);
+            }
+            let seg = self.edge_cache.get(&key).unwrap().as_ref()?;
             path.extend_from_slice(&seg[1..]);
         }
         let last = self.graph.nodes[*node_path.last().unwrap() as usize].tile;
@@ -1339,7 +1367,7 @@ impl WaterPathfinder {
         let mini = &self.mini;
         let (w, h) = (mini.width, mini.height);
         self.tile_bfs.search(w, h, tile, cs * cs, |t| mini.terrain_byte(t) & LAND_MASK == 0, |t, _| {
-            let (tx, ty) = (t % w, t / w);
+            let (tx, ty) = mini.xy(t);
             for (i, n) in candidates.iter().enumerate() {
                 if n.x == tx && n.y == ty {
                     return Visit::Found(ids[i]);

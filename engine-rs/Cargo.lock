@@ -105,7 +105,6 @@ dependencies = [
  "flate2",
  "mp4",
  "openh264",
- "openh264-sys2",
  "rustybuzz",
  "serde_json",
  "tiny-skia",

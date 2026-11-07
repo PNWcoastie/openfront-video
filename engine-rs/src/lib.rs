@@ -2,6 +2,8 @@
 //! checked tick by tick against the TypeScript engine. Used by the
 //! `engine-rs` harness binary and by `openfront-video`.
 
+#![forbid(unsafe_code)]
+
 pub mod detmath;
 pub mod fxhash;
 pub mod game;

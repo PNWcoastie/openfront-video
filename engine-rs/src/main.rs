@@ -5,6 +5,8 @@
 //!   engine-rs <record.json> <OpenFrontIO dir> <ticks> <out.jsonl>
 //!   engine-rs stream <record.json> <OpenFrontIO dir> <frames>   (for render.ts --rust)
 
+#![forbid(unsafe_code)]
+
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
