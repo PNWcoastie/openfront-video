@@ -362,6 +362,13 @@ impl Game {
         ne.structures.shared = self.shared_water_components(p);
         let city_count = self.structure_city_count(p);
         let coastal = ne.structures.shared.is_some();
+        if ne.structures.placements_count == 0
+            && self.lands_beachheads()
+            && self.high_starting_gold(p)
+            && self.maybe_spawn_structure(ne, SAM_LAUNCHER)
+        {
+            return true;
+        }
         // On crowded maps the first structure is a port (a factory if landlocked)
         // instead of a city; so does a nation starting in a team spawn area (not Easy).
         let in_area = self.config.difficulty != "Easy" && self.team_spawn_area(p).is_some();
@@ -475,7 +482,7 @@ impl Game {
                 return false;
             }
         }
-        ne.random.next_int(0.0, 100.0) < chance
+        chance == 100.0 || ne.random.next_int(0.0, 100.0) < chance
     }
 
     pub(super) fn sam_protecting_most(&self, p: usize) -> Option<usize> {
@@ -947,13 +954,20 @@ impl Game {
             }
             SAM_LAUNCHER => {
                 let others = tiles_of(self, SAM_LAUNCHER);
-                let protect: Vec<u32> = self.player_units_of_types(p, &[CITY, FACTORY, MISSILE_SILO, PORT]).iter().map(|&u| self.units[u].tile).collect();
+                let weight_by_level = self.lands_beachheads();
+                let mut protect: Vec<(u32, f64)> = Vec::new();
+                for t in [CITY, FACTORY, MISSILE_SILO, PORT] {
+                    for u in self.player_units_of(p, t) {
+                        let weight = if weight_by_level { self.units[u].level as f64 } else { 1.0 };
+                        protect.push((self.units[u].tile, weight));
+                    }
+                }
                 let use_coverage = self.config.difficulty != "Easy" && ne.random.next_int(0.0, 100.0) < 25.0;
                 let coverage: Vec<f64> = if use_coverage {
                     let sams = self.player_units_of(p, SAM_LAUNCHER);
                     protect
                         .iter()
-                        .map(|&pt| {
+                        .map(|&(pt, _)| {
                             sams.iter()
                                 .filter(|&&s| {
                                     let r = Self::sam_range(self.units[s].level);
@@ -978,15 +992,16 @@ impl Game {
                         w += js_min(d, structure_spacing);
                     }
                     // Prefer to be in range of other structures (not on Easy).
-                    let near_structures: &[u32] = if g.config.difficulty == "Easy" { &[] } else { &protect };
-                    for (i, &pt) in near_structures.iter().enumerate() {
+                    let near_structures: &[(u32, f64)] = if g.config.difficulty == "Easy" { &[] } else { &protect };
+                    for (i, &(pt, weight)) in near_structures.iter().enumerate() {
                         if g.dist2(tile, pt) > 70 * 70 {
                             continue;
                         }
                         if use_coverage {
-                            w += structure_spacing / (1.0 + coverage[i]);
+                            let coverage_weight = 1.0 / (1.0 + coverage[i]);
+                            w += structure_spacing * weight * coverage_weight;
                         } else {
-                            w += structure_spacing;
+                            w += structure_spacing * weight;
                         }
                     }
                     w

@@ -108,12 +108,26 @@ fn valid_id(id: &str) -> bool {
     (4..=32).contains(&id.len()) && id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
 }
 
-/// The game ID in a link (`.../game/<id>`) or a bare ID.
+/// The game ID in a link (`.../game/<id>` or `.../join/<id>`) or a bare ID.
 fn game_id_from(input: &str) -> Option<String> {
     let input = input.trim();
-    if let Some(i) = input.find("/game/") {
-        let id: String = input[i + 6..].chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').collect();
-        return valid_id(&id).then_some(id);
+    for marker in ["/game/", "/join/"] {
+        if let Some(i) = input.find(marker) {
+            let id: String = input[i + marker.len()..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+                .collect();
+            return valid_id(&id).then_some(id);
+        }
+    }
+    if let Some((_, tail)) = input.rsplit_once('/') {
+        let id: String = tail
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .collect();
+        if valid_id(&id) {
+            return Some(id);
+        }
     }
     valid_id(input).then(|| input.to_string())
 }
@@ -126,9 +140,44 @@ fn now_secs() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
+fn fmt_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.0} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 impl App {
     fn path(&self, id: &str, ext: &str) -> PathBuf {
-        self.dir.join(format!("{id}.{ext}"))
+        let primary = self.dir.join(format!("{id}.{ext}"));
+        if ext == "mp4" && !primary.exists() {
+            let alt = self.dir.join("videos").join(format!("{id}.mp4"));
+            if alt.exists() {
+                return alt;
+            }
+        }
+        primary
+    }
+
+    fn progress_path(&self, id: &str) -> PathBuf {
+        self.dir.join("tmp").join(format!("{id}.progress.json"))
+    }
+
+    /// Reads cached fast preview metadata (`--preview-meta`) for an in-progress render if available.
+    async fn preview_meta(&self, id: &str) -> Option<Value> {
+        {
+            let jobs = self.jobs.lock().unwrap();
+            if let Some(Job::Running { preview_rx, .. }) = jobs.get(id) {
+                if let Some(meta) = preview_rx.borrow().clone() {
+                    return Some(meta);
+                }
+            }
+        }
+        let bytes = tokio::fs::read(self.dir.join(format!(".{id}.tmp.preview.json"))).await.ok()?;
+        serde_json::from_slice(&bytes).ok()
     }
 
     /// Reads finished game metadata from the `redb` catalog (falling back to disk if placed externally).
@@ -136,13 +185,29 @@ impl App {
         if let Some(meta) = self.catalog.get_video_meta(id) {
             return Some(meta);
         }
-        let bytes = tokio::fs::read(self.path(id, "json")).await.ok()?;
-        let meta: Value = serde_json::from_slice(&bytes).ok()?;
-        let mp4_len = tokio::fs::metadata(self.path(id, "mp4")).await.map_or(0, |m| m.len());
-        let png_len = tokio::fs::metadata(self.path(id, "png")).await.map_or(0, |m| m.len());
-        let now = now_secs();
-        self.catalog.upsert_video(id, &meta, mp4_len + png_len + bytes.len() as u64, now, now);
-        Some(meta)
+        if let Ok(bytes) = tokio::fs::read(self.path(id, "json")).await {
+            if let Ok(meta) = serde_json::from_slice::<Value>(&bytes) {
+                let mp4_len = tokio::fs::metadata(self.path(id, "mp4")).await.map_or(0, |m| m.len());
+                let png_len = tokio::fs::metadata(self.path(id, "png")).await.map_or(0, |m| m.len());
+                let now = now_secs();
+                self.catalog.upsert_video(id, &meta, mp4_len + png_len + bytes.len() as u64, now, now);
+                return Some(meta);
+            }
+        }
+        if let Ok(mp4_meta) = tokio::fs::metadata(self.path(id, "mp4")).await {
+            let meta = json!({
+                "gameID": id,
+                "map": "?",
+                "mode": "?",
+                "players": 0,
+                "durationSeconds": 0.0,
+                "width": 1280,
+                "height": 1280,
+                "bytes": mp4_meta.len(),
+            });
+            return Some(meta);
+        }
+        None
     }
 
     /// The game's status, starting its render if needed and waiting up to
@@ -250,7 +315,10 @@ impl App {
         println!("render {id}: started{}", if auto { " (auto)" } else { "" });
         let tmp = |ext: &str| self.dir.join(format!(".{id}.tmp.{ext}"));
         let preview_path = tmp("preview.json");
+        let progress_path = self.progress_path(id);
+        let _ = tokio::fs::create_dir_all(self.dir.join("tmp")).await;
         let _ = tokio::fs::remove_file(&preview_path).await;
+        let _ = tokio::fs::remove_file(&progress_path).await;
         let preview_watcher = async {
             for _ in 0..60 {
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -274,6 +342,8 @@ impl App {
                 .arg(tmp("json"))
                 .arg("--preview-meta")
                 .arg(&preview_path)
+                .arg("--progress-file")
+                .arg(&progress_path)
                 // Games from other engine versions stop right away (exit code 4): they
                 // are checked for engine-path git diffs, or go to the TypeScript engine.
                 .args(if auto || self.engines.is_some() { &["--same-engine"][..] } else { &[][..] })
@@ -308,6 +378,8 @@ impl App {
                     .arg(tmp("json"))
                     .arg("--preview-meta")
                     .arg(&preview_path)
+                    .arg("--progress-file")
+                    .arg(&progress_path)
                     .stdin(std::process::Stdio::null())
                     .kill_on_drop(true);
                 return tokio::time::timeout(RENDER_TIMEOUT, cmd2.output()).await;
@@ -344,6 +416,8 @@ impl App {
             _ = preempted => None,
         };
         let _ = tokio::fs::remove_file(&preview_path).await;
+        let _ = tokio::fs::remove_file(&progress_path).await;
+        let _ = tokio::fs::remove_file(format!("{}.tmp", progress_path.display())).await;
         let outcome = match result {
             None => Outcome::Preempted,
             Some(result) => match result {
@@ -409,15 +483,37 @@ impl App {
 }
 
 const STYLE: &str = "body{margin:0;background:#16181d;color:#e6e6e6;font:16px/1.5 system-ui,sans-serif}\
-main{max-width:960px;margin:0 auto;padding:24px 16px}a{color:#7cb7ff}h1{font-size:22px;margin:0 0 4px}\
-p{color:#a9adb7;margin:0 0 16px}video,img{width:100%;height:auto;border-radius:8px;background:#000}\
-form{display:flex;gap:8px;flex-wrap:wrap}input{flex:1;min-width:0;padding:10px 12px;border-radius:6px;border:1px solid #3a3f4b;background:#0f1115;color:inherit;font:inherit}\
-button{padding:10px 16px;border-radius:6px;border:0;background:#3b82f6;color:#fff;font:inherit;cursor:pointer}";
+main{max-width:960px;margin:0 auto;padding:24px 16px}a{color:#7cb7ff;text-decoration:none}a:hover{text-decoration:underline}\
+h1{font-size:22px;margin:0 0 4px;color:#f3f4f6}h2{font-size:17px;margin:28px 0 12px;color:#e6e6e6;font-weight:600}\
+p{color:#a9adb7;margin:0 0 16px}video,img{width:100%;height:auto;border-radius:6px;background:#000;display:block}\
+form{display:flex;gap:8px;flex-wrap:wrap}input{flex:1;min-width:0;padding:9px 12px;border-radius:6px;border:1px solid #374151;background:#111827;color:#f3f4f6;font:inherit}input:focus{outline:none;border-color:#4785b5}\
+button,.btn{padding:9px 16px;border-radius:6px;border:1px solid #4785b5;background:#2b547e;color:#f3f4f6;font:inherit;font-weight:500;cursor:pointer;display:inline-flex;align-items:center;gap:6px;text-decoration:none}button:hover,.btn:hover{background:#366799;text-decoration:none}\
+.btn-sub{padding:5px 10px;font-size:13px;border-color:#374151;background:#111827;color:#d1d5db}.btn-sub:hover{border-color:#4785b5;background:#1c2536;color:#f3f4f6}\
+.btn-sub.active{border-color:#4785b5;background:#2b547e;color:#f3f4f6}\
+.toolbar{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:10px;margin-top:10px;padding:10px 12px;border-radius:6px;border:1px solid #2b303c;background:#111827}\
+.tool-group{display:flex;flex-wrap:wrap;align-items:center;gap:6px}\
+.tool-label{font-size:12px;color:#9ca3af;margin-right:4px;font-weight:600;text-transform:uppercase;letter-spacing:.04em}\
+.kbd-hint{font-size:12px;color:#8b929e;margin-top:8px}\
+.status-card{margin:20px 0;padding:18px 20px;border-radius:6px;border:1px solid #374151;background:#111827}\
+.progress-head{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px;font-weight:600;color:#f3f4f6}\
+.progress-pct{color:#d1d5db;font-variant-numeric:tabular-nums;font-size:16px}\
+.progress-track{height:8px;border-radius:4px;background:#1f2937;overflow:hidden;margin-bottom:12px}\
+.progress-fill{height:100%;width:0%;background:#4785b5;transition:width .3s ease}\
+.progress-meta{display:flex;justify-content:space-between;gap:12px;color:#9ca3af;font-size:13px;font-variant-numeric:tabular-nums}\
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px}\
+.card{display:flex;flex-direction:column;border-radius:6px;border:1px solid #2b303c;background:#111827;overflow:hidden;color:inherit}\
+.card:hover{border-color:#4785b5;text-decoration:none}\
+.card img{aspect-ratio:1/1;object-fit:cover;border-radius:0;border-bottom:1px solid #222630;background:#16181d}\
+.card-body{padding:10px 12px;display:flex;flex-direction:column;gap:6px}\
+.card-title{font-weight:600;color:#f3f4f6;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}\
+.card-meta{display:flex;flex-wrap:wrap;gap:6px;font-size:12px;color:#a9adb7}\
+.pill{background:#16181d;border:1px solid #2b303c;border-radius:4px;padding:1px 6px}\
+.pill-win{border-color:#b48a1e;color:#f3e3a3}";
 
 fn page(head: &str, body: &str) -> Html<String> {
     Html(format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
-<meta name=\"theme-color\" content=\"#3b82f6\">{head}<style>{STYLE}</style></head><body><main>{body}</main></body></html>"
+<meta name=\"theme-color\" content=\"#4785b5\">{head}<style>{STYLE}</style></head><body><main>{body}</main></body></html>"
     ))
 }
 
@@ -471,14 +567,107 @@ async fn ads_txt() -> Response {
     }
 }
 
+/// Collects up to `limit` recently rendered games from the `redb` catalog, scanning
+/// `<DATA_DIR>` and `<DATA_DIR>/videos` for `*.mp4` files as a fallback if needed.
+async fn recent_timelapses(app: &App, limit: usize) -> Vec<storage::StoredVideoRecord> {
+    let mut recent = app.catalog.list_recent(limit);
+    if recent.len() < limit {
+        for scan_dir in [app.dir.clone(), app.dir.join("videos")] {
+            let Ok(mut rd) = tokio::fs::read_dir(&scan_dir).await else { continue };
+            while let Ok(Some(entry)) = rd.next_entry().await {
+                if recent.len() >= limit {
+                    break;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                let Some(id) = name.strip_suffix(".mp4") else { continue };
+                if !valid_id(id) || recent.iter().any(|r| r.id == id) {
+                    continue;
+                }
+                let Ok(mp4_meta) = entry.metadata().await else { continue };
+                let rendered = mp4_meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_secs());
+                recent.push(storage::StoredVideoRecord {
+                    id: id.to_string(),
+                    map: "?".to_string(),
+                    mode: "?".to_string(),
+                    players: 0,
+                    bytes: mp4_meta.len(),
+                    render_secs: 0.0,
+                    rendered,
+                    last_used: rendered,
+                    meta: Value::Null,
+                });
+            }
+        }
+        recent.sort_by(|a, b| b.rendered.cmp(&a.rendered).then_with(|| b.last_used.cmp(&a.last_used)));
+        recent.truncate(limit);
+    }
+    recent
+}
+
 async fn index(State(app): State<Arc<App>>, headers: HeaderMap) -> Html<String> {
     app.events.view("", "home", &headers);
+    let recent = recent_timelapses(&app, 12).await;
+    let gallery_html = if recent.is_empty() {
+        "<p>No timelapses rendered yet — paste a match URL or ID above to render the first one.</p>".to_string()
+    } else {
+        let mut cards = String::from("<div class=\"grid\">");
+        for g in &recent {
+            let id_esc = esc(&g.id);
+            let has_meta = g.map != "?" && !g.map.is_empty();
+            let title = if has_meta {
+                format!("{} · {}", esc(&g.map), esc(&g.mode))
+            } else {
+                format!("Match {id_esc}")
+            };
+            let mut pills = format!("<span class=\"pill\">#{id_esc}</span>");
+            if let Some(w) = g.meta["winner"].as_str().filter(|s| !s.is_empty()) {
+                if let Some(pct) = g.meta["winnerPct"].as_f64() {
+                    pills.push_str(&format!("<span class=\"pill pill-win\">★ {} ({pct:.1}%)</span>", esc(w)));
+                } else {
+                    pills.push_str(&format!("<span class=\"pill pill-win\">★ {}</span>", esc(w)));
+                }
+            }
+            if g.players > 0 {
+                pills.push_str(&format!("<span class=\"pill\">{} players</span>", g.players));
+            }
+            if g.bytes > 0 {
+                pills.push_str(&format!("<span class=\"pill\">{}</span>", fmt_bytes(g.bytes)));
+            }
+            if g.render_secs > 0.0 {
+                pills.push_str(&format!("<span class=\"pill\">{:.1}s render</span>", g.render_secs));
+            }
+            cards.push_str(&format!(
+                "<a class=\"card\" href=\"/{id_esc}\">\
+<img src=\"/thumb/{id_esc}.png\" alt=\"{title}\" loading=\"lazy\" onerror=\"this.style.display='none'\">\
+<div class=\"card-body\"><div class=\"card-title\">{title}</div><div class=\"card-meta\">{pills}</div></div></a>"
+            ));
+        }
+        cards.push_str("</div>");
+        cards
+    };
+    let body = format!(
+        "<h1>openfront.video</h1><p>Paste an OpenFront.io match URL or ID to watch or render a full-game timelapse. \
+Or swap <b>openfront.io</b> for <b>openfront.video</b> in a game link.</p>\
+<form id=\"paste-form\" action=\"/go\">\
+<input id=\"game-input\" name=\"game\" placeholder=\"https://openfront.io/join/cAj8yxzNsH or cAj8yxzNsH\" required autofocus>\
+<button type=\"submit\">Watch / Render Timelapse</button></form>\
+<script>\
+document.getElementById('paste-form').addEventListener('submit',function(e){{\
+var raw=(document.getElementById('game-input').value||'').trim();\
+var m=raw.match(/(?:\\/(?:game|join)\\/)([A-Za-z0-9_-]{{4,32}})/)||raw.match(/^([A-Za-z0-9_-]{{4,32}})$/);\
+if(m&&m[1]){{e.preventDefault();window.location.href='/'+m[1];}}\
+}});\
+</script>\
+<section class=\"gallery\"><h2>Recent Timelapses</h2>{gallery_html}</section>"
+    );
     page_with_ads(
         "<title>openfront.video</title><meta property=\"og:title\" content=\"openfront.video\">\
 <meta property=\"og:description\" content=\"Timelapse videos of OpenFront.io games\">",
-        "<h1>openfront.video</h1><p>Paste an OpenFront.io game link or ID to get a timelapse of the whole game. \
-Or swap <b>openfront.io</b> for <b>openfront.video</b> in a game link.</p>\
-<form action=\"/go\"><input name=\"game\" placeholder=\"https://openfront.io/game/...\" required autofocus><button>Make video</button></form>",
+        &body,
     )
 }
 
@@ -489,7 +678,7 @@ struct Go {
 
 async fn go(Query(q): Query<Go>) -> Response {
     match game_id_from(&q.game) {
-        Some(id) => Redirect::to(&format!("/game/{id}")).into_response(),
+        Some(id) => Redirect::to(&format!("/{id}")).into_response(),
         None => (StatusCode::BAD_REQUEST, page("<title>openfront.video</title>", "<h1>That doesn't look like a game link</h1><p><a href=\"/\">Try again</a></p>")).into_response(),
     }
 }
@@ -506,9 +695,10 @@ async fn game_page(app: Arc<App>, id: String, headers: HeaderMap) -> Response {
         return (StatusCode::NOT_FOUND, page("<title>Not found</title>", "<h1>Not a game ID</h1>")).into_response();
     }
     let previewer = is_previewer(&headers);
-    // Both people and link previewers wait up to 3s on the HTML endpoint:
-    // previewers wake in ~0.15s as soon as `--preview-meta` is written.
-    let wait = Duration::from_secs(3);
+    // Link previewers wait up to 3s for `--preview-meta` (~0.15s); human browsers
+    // wait briefly (250ms) so already-finished or near-instant renders resolve,
+    // otherwise immediately receive the live progress UI.
+    let wait = if previewer { Duration::from_secs(3) } else { Duration::from_millis(250) };
     let base = &app.public_url;
     let video = format!("{base}/video/{id}.mp4");
     let thumb = format!("{base}/thumb/{id}.png");
@@ -521,8 +711,20 @@ async fn game_page(app: Arc<App>, id: String, headers: HeaderMap) -> Response {
             let s = |k: &str| meta[k].as_str().unwrap_or("?").to_string();
             let (w, h) = (meta["width"].as_u64().unwrap_or(1280), meta["height"].as_u64().unwrap_or(1280));
             let minutes = (meta["durationSeconds"].as_f64().unwrap_or(0.0) / 60.0).round();
-            let title = format!("{} · {}", s("map"), s("mode"));
-            let mut desc = format!("OpenFront.io game {id}: {} players, {minutes} min, as a timelapse", meta["players"]);
+            let has_meta = s("map") != "?";
+            let title = if has_meta { format!("{} · {}", s("map"), s("mode")) } else { format!("OpenFront game {id}") };
+            let mut desc = if has_meta {
+                format!("OpenFront.io game {id}: {} players, {minutes} min, as a timelapse", meta["players"])
+            } else {
+                format!("OpenFront.io game {id} timelapse")
+            };
+            if let Some(winner) = meta["winner"].as_str().filter(|s| !s.is_empty()) {
+                if let Some(pct) = meta["winnerPct"].as_f64() {
+                    desc.push_str(&format!(" — Won by {winner} ({pct:.1}%)"));
+                } else {
+                    desc.push_str(&format!(" — Won by {winner}"));
+                }
+            }
             if meta["hashMismatches"].as_u64().unwrap_or(0) > 0 {
                 desc.push_str(" (the replay drifted from the real game, so it may differ)");
             }
@@ -551,8 +753,66 @@ async fn game_page(app: Arc<App>, id: String, headers: HeaderMap) -> Response {
 <meta name=\"twitter:player:width\" content=\"{w}\"><meta name=\"twitter:player:height\" content=\"{h}\">"
             );
             let body = format!(
-                "<h1>{t}</h1><p>{d}. <a href=\"{source}\">Replay on OpenFront</a> · <a href=\"/video/{id}.mp4\" download>Download</a></p>\
-<video src=\"/video/{id}.mp4\" poster=\"/thumb/{id}.png\" width=\"{w}\" height=\"{h}\" controls autoplay muted loop playsinline></video>"
+                "<h1>{t}</h1><p>{d}. <a href=\"{source}\">Replay on OpenFront</a> · <a href=\"/video/{id}.mp4\" download>Download MP4</a> · <a href=\"/\">All timelapses</a></p>\
+<video id=\"ofv-video\" src=\"/video/{id}.mp4\" poster=\"/thumb/{id}.png\" width=\"{w}\" height=\"{h}\" controls autoplay muted loop playsinline></video>\
+<div class=\"toolbar\">\
+<div class=\"tool-group\">\
+<span class=\"tool-label\">Speed</span>\
+<button type=\"button\" class=\"btn-sub\" data-rate=\"0.25\">0.25x</button>\
+<button type=\"button\" class=\"btn-sub\" data-rate=\"0.5\">0.5x</button>\
+<button type=\"button\" class=\"btn-sub active\" data-rate=\"1\">1x</button>\
+<button type=\"button\" class=\"btn-sub\" data-rate=\"1.5\">1.5x</button>\
+<button type=\"button\" class=\"btn-sub\" data-rate=\"2\">2x</button>\
+</div>\
+<div class=\"tool-group\">\
+<span class=\"tool-label\">Scrub</span>\
+<button type=\"button\" class=\"btn-sub\" id=\"btn-start\" title=\"Jump to start\">⏮ Start</button>\
+<button type=\"button\" class=\"btn-sub\" id=\"btn-prev\" title=\"Previous frame (,)\">◀ -1f</button>\
+<button type=\"button\" class=\"btn-sub\" id=\"btn-next\" title=\"Next frame (.)\">+1f ▶</button>\
+<button type=\"button\" class=\"btn-sub\" id=\"btn-end\" title=\"Jump to final victory board\">⏭ Victory</button>\
+</div>\
+<div class=\"tool-group\">\
+<button type=\"button\" class=\"btn-sub\" id=\"btn-copy\">Copy Discord Link</button>\
+</div>\
+</div>\
+<div class=\"kbd-hint\">Shortcuts: <b>Space</b> Play/Pause · <b>,</b> / <b>.</b> Step 1 Frame · <b>[</b> / <b>]</b> Change Speed</div>\
+<script>\
+(function(){{\
+var v=document.getElementById('ofv-video');\
+if(!v)return;\
+var rates=[0.25,0.5,1,1.5,2];\
+var btns=document.querySelectorAll('[data-rate]');\
+var setRate=function(r){{\
+v.playbackRate=r;\
+btns.forEach(function(b){{b.classList.toggle('active',Number(b.getAttribute('data-rate'))===r);}});\
+}};\
+btns.forEach(function(b){{b.addEventListener('click',function(){{setRate(Number(b.getAttribute('data-rate')));}});}});\
+var step=function(dir){{v.pause();v.currentTime=Math.max(0,Math.min(v.duration||32,v.currentTime+dir*(1/30)));}};\
+document.getElementById('btn-start').addEventListener('click',function(){{v.currentTime=0;}});\
+document.getElementById('btn-prev').addEventListener('click',function(){{step(-1);}});\
+document.getElementById('btn-next').addEventListener('click',function(){{step(1);}});\
+document.getElementById('btn-end').addEventListener('click',function(){{v.pause();v.currentTime=Math.max(0,(v.duration||32)-1.5);}});\
+var cp=document.getElementById('btn-copy');\
+cp.addEventListener('click',function(){{\
+navigator.clipboard.writeText(window.location.origin+'/game/{id}').then(function(){{\
+cp.textContent='Copied Discord Link!';\
+setTimeout(function(){{cp.textContent='Copy Discord Link';}},2000);\
+}});\
+}});\
+window.addEventListener('keydown',function(e){{\
+if(e.target&&(e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA'))return;\
+if(e.key===','){{e.preventDefault();step(-1);}}\
+else if(e.key==='.'){{e.preventDefault();step(1);}}\
+else if(e.key==='['||e.key===']'){{\
+e.preventDefault();\
+var idx=rates.indexOf(v.playbackRate);\
+if(idx<0)idx=2;\
+idx=Math.max(0,Math.min(rates.length-1,idx+(e.key===']'?1:-1)));\
+setRate(rates[idx]);\
+}}\
+}});\
+}})();\
+</script>"
             );
             page_with_ads(&head, &body).into_response()
         }
@@ -564,14 +824,87 @@ async fn game_page(app: Arc<App>, id: String, headers: HeaderMap) -> Response {
         }
         Status::Pending => {
             app.events.view(&id, "pending", &headers);
+            let pmeta = app.preview_meta(&id).await;
+            let (heading, sub) = if let Some(ref m) = pmeta {
+                let map = m["map"].as_str().unwrap_or("?");
+                let mode = m["mode"].as_str().unwrap_or("?");
+                let players = m["players"].as_u64().unwrap_or(0);
+                if map != "?" {
+                    (
+                        esc(&format!("{map} · {mode}")),
+                        format!("OpenFront.io game {id} ({players} players) · <a href=\"{source}\">Replay on OpenFront</a> · <a href=\"/\">Home</a>"),
+                    )
+                } else {
+                    (
+                        format!("Rendering game {id}…"),
+                        format!("OpenFront.io game {id} · <a href=\"{source}\">Replay on OpenFront</a> · <a href=\"/\">Home</a>"),
+                    )
+                }
+            } else {
+                (
+                    format!("Rendering game {id}…"),
+                    format!("OpenFront.io game {id} · <a href=\"{source}\">Replay on OpenFront</a> · <a href=\"/\">Home</a>"),
+                )
+            };
             let head = format!(
-                "<title>Rendering {id}</title><meta http-equiv=\"refresh\" content=\"5\">\
+                "<title>Rendering {id}</title>\
+<noscript><meta http-equiv=\"refresh\" content=\"3\"></noscript>\
 <meta property=\"og:site_name\" content=\"openfront.video\"><meta property=\"og:title\" content=\"OpenFront game {id}\">\
 <meta property=\"og:description\" content=\"The timelapse is still rendering\"><meta property=\"og:url\" content=\"{url}\">"
             );
             let body = format!(
-                "<h1>Rendering game {id}…</h1><p>This takes about half a minute the first time; the page reloads by itself. \
-After that the video is ready right away.</p><p><a href=\"{source}\">Replay on OpenFront</a></p>"
+                "<h1 id=\"match-title\">{heading}</h1>\
+<p id=\"match-sub\">{sub}</p>\
+<div id=\"stage\">\
+<div class=\"status-card\">\
+<div class=\"progress-head\"><span id=\"status-label\">Rendering timelapse…</span><span id=\"pct-text\" class=\"progress-pct\">0%</span></div>\
+<div class=\"progress-track\"><div id=\"progress-fill\" class=\"progress-fill\" style=\"width:0%\"></div></div>\
+<div class=\"progress-meta\"><span id=\"tick-text\">Starting simulation…</span><span id=\"elapsed-text\">0.0s</span></div>\
+</div>\
+</div>\
+<script>\
+(function(){{\
+var id={id_json};\
+var fmt=function(n){{return Number(n||0).toLocaleString();}};\
+var swapped=false;\
+var poll=function(){{\
+if(swapped)return;\
+fetch('/api/v1/status/'+encodeURIComponent(id),{{cache:'no-store'}})\
+.then(function(r){{return r.json();}})\
+.then(function(d){{\
+if(!d||swapped)return;\
+if(d.map&&d.map!=='?'){{document.getElementById('match-title').textContent=d.map+' · '+(d.mode||'');}}\
+if(d.status==='ready'){{\
+swapped=true;\
+var fill=document.getElementById('progress-fill');if(fill)fill.style.width='100%';\
+var pct=document.getElementById('pct-text');if(pct)pct.textContent='100%';\
+window.location.reload();\
+return;\
+}}\
+if(d.status==='failed'){{\
+swapped=true;\
+var lbl=document.getElementById('status-label');if(lbl)lbl.textContent='Render failed';\
+var tt=document.getElementById('tick-text');if(tt)tt.textContent=d.error||'The renderer stopped.';\
+return;\
+}}\
+var p=Math.min(100,Math.max(0,Math.round(Number(d.percent||0))));\
+var fillEl=document.getElementById('progress-fill');if(fillEl)fillEl.style.width=p+'%';\
+var pctEl=document.getElementById('pct-text');if(pctEl)pctEl.textContent=p+'%';\
+if(d.status==='rendering'&&d.total_ticks){{\
+var tickEl=document.getElementById('tick-text');\
+if(tickEl)tickEl.textContent='Tick '+fmt(d.tick)+' / '+fmt(d.total_ticks)+' • Frame '+fmt(d.frame)+' / '+fmt(d.total_frames);\
+}}\
+if(typeof d.elapsed_secs==='number'){{\
+var elEl=document.getElementById('elapsed-text');\
+if(elEl)elEl.textContent=d.elapsed_secs.toFixed(1)+'s';\
+}}\
+}}).catch(function(){{}});\
+}};\
+poll();\
+setInterval(poll,1000);\
+}})();\
+</script>",
+                id_json = serde_json::to_string(&id).unwrap_or_else(|_| format!("\"{id}\""))
             );
             page(&head, &body).into_response()
         }
@@ -604,6 +937,17 @@ async fn game(State(app): State<Arc<App>>, Path(id): Path<String>, headers: Head
 
 async fn game_prefixed(State(app): State<Arc<App>>, Path((_, id)): Path<(String, String)>, headers: HeaderMap) -> Response {
     game_page(app, id, headers).await
+}
+
+async fn root_id_or_media(State(app): State<Arc<App>>, Path(name): Path<String>, req: Request) -> Response {
+    if name.ends_with(".mp4") {
+        return media(app, name, "mp4", req).await;
+    }
+    if name.ends_with(".png") {
+        return media(app, name, "png", req).await;
+    }
+    let headers = req.headers().clone();
+    game_page(app, name, headers).await
 }
 
 /// /video/<id>.mp4 and /thumb/<id>.png: rendered on demand, then served
@@ -642,6 +986,142 @@ async fn video(State(app): State<Arc<App>>, Path(name): Path<String>, req: Reque
 
 async fn thumb(State(app): State<Arc<App>>, Path(name): Path<String>, req: Request) -> Response {
     media(app, name, "png", req).await
+}
+
+/// Live render progress polling endpoint (`GET /api/v1/status/{id}`).
+async fn api_status_handler(State(app): State<Arc<App>>, Path(id): Path<String>) -> Response {
+    if !valid_id(&id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            [(header::CACHE_CONTROL, "no-store")],
+            axum::Json(json!({"status": "invalid_id", "percent": 0})),
+        )
+            .into_response();
+    }
+    if app.catalog.has_video(&id) || tokio::fs::metadata(app.path(&id, "mp4")).await.is_ok() {
+        let mut body = json!({
+            "status": "ready",
+            "percent": 100,
+        });
+        if let Some(meta) = app.meta(&id).await {
+            if let Some(obj) = body.as_object_mut() {
+                if let Some(map) = meta["map"].as_str() {
+                    obj.insert("map".into(), json!(map));
+                }
+                if let Some(mode) = meta["mode"].as_str() {
+                    obj.insert("mode".into(), json!(mode));
+                }
+                if let Some(players) = meta["players"].as_u64() {
+                    obj.insert("players".into(), json!(players));
+                }
+            }
+        }
+        return ([(header::CACHE_CONTROL, "no-store")], axum::Json(body)).into_response();
+    }
+    let prog_path = app.progress_path(&id);
+    let prog_bytes = match tokio::fs::read(&prog_path).await {
+        Ok(b) => Some(b),
+        Err(_) => tokio::fs::read(app.dir.join(format!(".{id}.tmp.progress.json"))).await.ok(),
+    };
+    if let Some(bytes) = prog_bytes {
+        if let Ok(prog) = serde_json::from_slice::<Value>(&bytes) {
+            let tick = prog["tick"].as_u64().or_else(|| prog["current_tick"].as_u64()).unwrap_or(0);
+            let total_ticks = prog["total_ticks"].as_u64().or_else(|| prog["ticks"].as_u64()).unwrap_or(0);
+            let frame = prog["frame"]
+                .as_u64()
+                .or_else(|| prog["encoded_frames"].as_u64())
+                .or_else(|| prog["frames_encoded"].as_u64())
+                .unwrap_or(0);
+            let total_frames = prog["total_frames"].as_u64().or_else(|| prog["frames"].as_u64()).unwrap_or(0);
+            let elapsed_secs = prog["elapsed_secs"].as_f64().or_else(|| prog["elapsed"].as_f64()).unwrap_or(0.0);
+            let percent = prog["percent"]
+                .as_f64()
+                .or_else(|| prog["progress"].as_f64().map(|p| if p <= 1.0 { p * 100.0 } else { p }))
+                .unwrap_or_else(|| {
+                    if total_ticks > 0 {
+                        (tick as f64 / total_ticks as f64) * 100.0
+                    } else {
+                        0.0
+                    }
+                })
+                .clamp(0.0, 99.9);
+            let mut body = json!({
+                "status": "rendering",
+                "percent": (percent * 10.0).round() / 10.0,
+                "tick": tick,
+                "total_ticks": total_ticks,
+                "frame": frame,
+                "total_frames": total_frames,
+                "elapsed_secs": (elapsed_secs * 10.0).round() / 10.0,
+            });
+            if let Some(pmeta) = app.preview_meta(&id).await {
+                if let Some(obj) = body.as_object_mut() {
+                    if let Some(map) = pmeta["map"].as_str() {
+                        obj.insert("map".into(), json!(map));
+                    }
+                    if let Some(mode) = pmeta["mode"].as_str() {
+                        obj.insert("mode".into(), json!(mode));
+                    }
+                    if let Some(players) = pmeta["players"].as_u64() {
+                        obj.insert("players".into(), json!(players));
+                    }
+                }
+            }
+            return ([(header::CACHE_CONTROL, "no-store")], axum::Json(body)).into_response();
+        }
+    }
+    enum JobState {
+        Running(Option<Value>),
+        Failed(String),
+        None,
+    }
+    let job_state = {
+        let jobs = app.jobs.lock().unwrap();
+        match jobs.get(&id) {
+            Some(Job::Running { preview_rx, .. }) => JobState::Running(preview_rx.borrow().clone()),
+            Some(Job::Failed(msg, at)) if at.elapsed() < FAILURE_TTL => JobState::Failed(msg.clone()),
+            _ => JobState::None,
+        }
+    };
+    match job_state {
+        JobState::Running(preview) => {
+            let mut body = json!({
+                "status": "starting",
+                "percent": 0,
+            });
+            if let Some(pmeta) = preview {
+                if let Some(obj) = body.as_object_mut() {
+                    if let Some(map) = pmeta["map"].as_str() {
+                        obj.insert("map".into(), json!(map));
+                    }
+                    if let Some(mode) = pmeta["mode"].as_str() {
+                        obj.insert("mode".into(), json!(mode));
+                    }
+                    if let Some(players) = pmeta["players"].as_u64() {
+                        obj.insert("players".into(), json!(players));
+                    }
+                }
+            }
+            ([(header::CACHE_CONTROL, "no-store")], axum::Json(body)).into_response()
+        }
+        JobState::Failed(msg) => (
+            [(header::CACHE_CONTROL, "no-store")],
+            axum::Json(json!({
+                "status": "failed",
+                "percent": 0,
+                "error": msg,
+            })),
+        )
+            .into_response(),
+        JobState::None => (
+            [(header::CACHE_CONTROL, "no-store")],
+            axum::Json(json!({
+                "status": "not_started",
+                "percent": 0,
+            })),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -705,10 +1185,18 @@ async fn api_render(
 async fn main() {
     let dir = PathBuf::from(env_or("DATA_DIR", "./data"));
     std::fs::create_dir_all(&dir).expect("DATA_DIR");
+    std::fs::create_dir_all(dir.join("tmp")).expect("DATA_DIR/tmp");
     // Leftovers of renders that were cut off by a restart.
     for e in std::fs::read_dir(&dir).unwrap().flatten() {
         if e.file_name().to_string_lossy().contains(".tmp.") {
             let _ = std::fs::remove_file(e.path());
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(dir.join("tmp")) {
+        for e in entries.flatten() {
+            if e.file_name().to_string_lossy().contains(".progress.json") {
+                let _ = std::fs::remove_file(e.path());
+            }
         }
     }
     let secs = |k: &str, d: &str| Duration::from_secs(env_or(k, d).parse().expect(k));
@@ -742,10 +1230,13 @@ async fn main() {
         .route("/admin", get(stats::page))
         .route("/admin/api/stats", get(stats::api))
         .route("/api/v1/render", post(api_render))
+        .route("/api/v1/status/{id}", get(api_status_handler))
         .route("/game/{id}", get(game))
+        .route("/join/{id}", get(game))
         .route("/{prefix}/game/{id}", get(game_prefixed))
         .route("/video/{name}", get(video))
         .route("/thumb/{name}", get(thumb))
+        .route("/{id}", get(root_id_or_media))
         .with_state(app.clone());
     let addr = format!("0.0.0.0:{}", env_or("PORT", "8080"));
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");

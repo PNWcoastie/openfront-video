@@ -18,8 +18,16 @@ pub fn game_id_from(input: &str) -> Option<String> {
 }
 
 pub fn load_record(input: &str) -> Result<Value, String> {
-    if std::path::Path::new(input).is_file() {
-        let mut buf = std::fs::read(input).map_err(|e| format!("reading {input}: {e}"))?;
+    let resolved = if std::path::Path::new(input).is_file() {
+        Some(std::path::PathBuf::from(input))
+    } else {
+        input
+            .strip_prefix("replays/")
+            .map(|s| std::path::Path::new("..").join(s))
+            .filter(|p| p.is_file())
+    };
+    if let Some(path) = resolved {
+        let mut buf = std::fs::read(&path).map_err(|e| format!("reading {input}: {e}"))?;
         if buf.starts_with(&[0x1f, 0x8b]) {
             let mut out = Vec::new();
             flate2::read::GzDecoder::new(&buf[..]).read_to_end(&mut out).map_err(|e| format!("unpacking {input}: {e}"))?;

@@ -107,10 +107,10 @@ impl Game {
         }
     }
 
-    /// Nation AI is ported for Easy, Medium and Hard.
+    /// Nation AI is ported for Easy, Medium, Hard, and Impossible.
     pub(super) fn assert_nation_difficulty(&self) {
         assert!(
-            matches!(self.config.difficulty.as_str(), "Easy" | "Medium" | "Hard"),
+            matches!(self.config.difficulty.as_str(), "Easy" | "Medium" | "Hard" | "Impossible"),
             "{} nations are not ported yet",
             self.config.difficulty
         );
@@ -508,10 +508,10 @@ impl Game {
         let p = ne.player.unwrap();
         self.assert_nation_difficulty();
         let d = self.config.difficulty.clone();
-        let (easy, hard) = (d == "Easy", d == "Hard");
+        let (easy, hard, impossible) = (d == "Easy", d == "Hard", d == "Impossible");
         let chance = |ne: &mut NationExec, n: f64| ne.random.next_int(0.0, n) == 0.0;
         // isConfused
-        if chance(ne, self.by_difficulty([10.0, 20.0, 40.0, f64::INFINITY])) {
+        if !impossible && chance(ne, self.by_difficulty([10.0, 20.0, 40.0, f64::INFINITY])) {
             return chance(ne, 2.0);
         }
         if self.is_traitor(other) && ne.random.next_int(0.0, 100.0) >= 10.0 {
@@ -520,11 +520,12 @@ impl Game {
             }
             return false;
         }
-        // hasTooManyAlliances (Hard): the other has allied with half the field.
-        if hard {
+        // hasTooManyAlliances (Hard: 50%, Impossible: 25% of the field).
+        if hard || impossible {
             let total = self.alive_players().into_iter().filter(|&q| self.players[q].info.player_type != PlayerType::Bot).count() as f64;
             let theirs = self.players[other].alliances.len() as f64 - if self.is_allied_with(other, p) { 1.0 } else { 0.0 };
-            if theirs >= total * 0.5 {
+            let cap = if hard { 0.5 } else { 0.25 };
+            if theirs >= total * cap {
                 return false;
             }
         }
@@ -532,11 +533,19 @@ impl Game {
             return false;
         }
         // isAlliancePartnerThreat: Easy sees none; Medium much more troops;
-        // Hard more troops and twice the max troops.
+        // Hard more troops and twice the max troops; Impossible 1.5x troops, max troops, or tiles.
         let threat = match d.as_str() {
             "Easy" => false,
             "Medium" => self.players[other].troops_f() > self.players[p].troops_f() * 2.5,
-            _ => self.players[other].troops_f() > self.players[p].troops_f() && self.max_troops(other) > self.max_troops(p) * 2.0,
+            "Hard" => self.players[other].troops_f() > self.players[p].troops_f() && self.max_troops(other) > self.max_troops(p) * 2.0,
+            _ => {
+                let more_troops = self.players[other].troops_f() > self.players[p].troops_f() * 1.5;
+                let more_max = self.players[other].troops_f() > self.players[p].troops_f()
+                    && self.max_troops(other) > self.max_troops(p) * 1.5;
+                let more_tiles = self.players[other].troops_f() > self.players[p].troops_f()
+                    && (self.players[other].tiles.len() as f64) > (self.players[p].tiles.len() as f64) * 1.5;
+                more_troops || more_max || more_tiles
+            }
         };
         if threat {
             if !is_response && chance(ne, 6.0) {
@@ -548,7 +557,7 @@ impl Game {
             return true;
         }
         // shouldRejectInTeamGame
-        if self.config.is_team_mode && ne.random.next_int(0.0, 100.0) < self.by_difficulty([25.0, 50.0, 75.0, 101.0]) {
+        if self.config.is_team_mode && (impossible || ne.random.next_int(0.0, 100.0) < self.by_difficulty([25.0, 50.0, 75.0, 100.0])) {
             return false;
         }
         if self.relation(p, other) < 2 {
@@ -557,8 +566,14 @@ impl Game {
             }
             return false;
         }
-        // isAlliancePartnerFriendly (Hard: 83% of the time)
-        if self.relation(p, other) == 3 && (!hard || ne.random.next_int(0.0, 100.0) >= 17.0) {
+        // isAlliancePartnerFriendly (Hard: 83%, Impossible: 67%)
+        let friendly = self.relation(p, other) == 3
+            && match d.as_str() {
+                "Easy" | "Medium" => true,
+                "Hard" => ne.random.next_int(0.0, 100.0) >= 17.0,
+                _ => ne.random.next_int(0.0, 100.0) >= 33.0,
+            };
+        if friendly {
             if chance(ne, 3.0) {
                 self.emoji_send(ne, Some(other), &["🤝"]);
             }
@@ -569,7 +584,7 @@ impl Game {
             "Easy" => false,
             "Medium" => self.players[p].alliances.len() as f64 >= ne.random.next_int(4.0, 6.0),
             _ => {
-                // Hard: don't ally with all our neighbors (when there are 2+).
+                // Hard & Impossible: don't ally with all our neighbors (when there are 2+).
                 let bordering: Vec<usize> = self
                     .nearby(p)
                     .into_iter()
@@ -579,8 +594,10 @@ impl Game {
                 let friends = bordering.iter().filter(|&&o| self.is_friendly(p, o, false)).count();
                 if bordering.len() >= 2 && bordering.contains(&other) {
                     bordering.len() <= friends + 1
-                } else {
+                } else if hard {
                     self.players[p].alliances.len() as f64 >= ne.random.next_int(3.0, 5.0)
+                } else {
+                    self.players[p].alliances.len() as f64 >= ne.random.next_int(2.0, 4.0)
                 }
             }
         };
@@ -649,7 +666,7 @@ impl Game {
         self.players[q].troops_f() + self.outgoing_troops(q)
     }
 
-    /// maybeBetray. Hard betrays its juiciest ally when that's safe; Easy and
+    /// maybeBetray. Hard & Impossible betray their juiciest ally when that's safe; Easy and
     /// Medium betray very weak allies (Easy not humans); all but Easy betray
     /// traitors not much stronger, and a lone neighbor much weaker.
     pub(super) fn maybe_betray(&mut self, ne: &mut NationExec, other: usize, juiciest: Option<usize>, friends: &[usize], enemies: &[usize]) -> bool {
@@ -659,7 +676,7 @@ impl Game {
         let easy = d == "Easy";
         let (mine, theirs) = (self.players[p].troops_f(), self.players[other].troops_f());
         let human = self.players[other].info.player_type == PlayerType::Human;
-        let betray = (d == "Hard" && juiciest == Some(other) && self.safe_to_betray(p, other, friends, enemies))
+        let betray = (self.lands_beachheads() && juiciest == Some(other) && self.safe_to_betray(p, other, friends, enemies))
             || (matches!(d.as_str(), "Easy" | "Medium") && !(easy && human) && mine >= theirs * 10.0)
             || (!easy && self.is_traitor(other) && theirs < mine * 1.2)
             || (!easy && friends.len() + enemies.len() == 1 && theirs * 3.0 < mine);
@@ -843,23 +860,55 @@ impl Game {
         stack.max(tiles * self.bot_tile_loss(p, bot, stack))
     }
 
-    /// Troops lost per tile at that stack; Hard assumes highland.
+    /// Troops lost per tile at that stack; Impossible samples 6x6 grid across
+    /// the bot's largest cluster box, while other difficulties assume highland.
     pub(super) fn bot_tile_loss(&self, p: usize, bot: usize, stack: f64) -> f64 {
         self.assert_nation_difficulty();
         let a = &self.players[p];
         let dp = &self.players[bot];
-        let mut mag = 100.0;
-        if matches!(a.info.player_type, PlayerType::Human | PlayerType::Nation) && dp.info.player_type == PlayerType::Bot {
-            mag *= 0.7;
+        let mut terrains: Vec<Terrain> = Vec::new();
+        if self.config.difficulty == "Impossible" {
+            if let Some(b) = dp.largest_cluster_box {
+                let width = b[2] - b[0] + 1;
+                let height = b[3] - b[1] + 1;
+                for i in 0..6 {
+                    for j in 0..6 {
+                        let x = (b[0] + ((2 * i + 1) * width) / 12) as u32;
+                        let y = (b[1] + ((2 * j + 1) * height) / 12) as u32;
+                        let tile = self.map.ref_at(x, y);
+                        if self.map.owner_id(tile) == dp.small_id {
+                            terrains.push(self.map.terrain_type(tile));
+                        }
+                    }
+                }
+            }
+        }
+        if terrains.is_empty() {
+            terrains.push(Terrain::Highland);
         }
         let large_attacker_bonus = 1.0 - 0.7 * self.territory_sigmoid_of(a.tiles.len());
         let large_defender_bonus = 1.0 - 0.3 * self.territory_sigmoid_of(dp.tiles.len());
         let traitor_loss_mod = if self.is_traitor(bot) { 0.5 } else { 1.0 };
         let defender_troops = dp.troops_f();
         let defender_loss = defender_troops / dp.tiles.len() as f64;
-        mag * traitor_loss_mod
-            * within(defender_troops / stack, 0.6, 2.0)
-            * (0.463 * large_attacker_bonus * large_defender_bonus + 0.0039 * defender_loss)
+        let is_bot_vs_player = matches!(a.info.player_type, PlayerType::Human | PlayerType::Nation) && dp.info.player_type == PlayerType::Bot;
+        let mut total_loss = 0.0;
+        for &terrain in &terrains {
+            let mut mag = match terrain {
+                Terrain::Plains => 80.0,
+                Terrain::Highland => 100.0,
+                Terrain::Mountain => 120.0,
+                t => panic!("terrain {t:?} cannot be attacked"),
+            };
+            if is_bot_vs_player {
+                mag *= 0.7;
+            }
+            total_loss += mag
+                * traitor_loss_mod
+                * within(defender_troops / stack, 0.6, 2.0)
+                * (0.463 * large_attacker_bonus * large_defender_bonus + 0.0039 * defender_loss);
+        }
+        total_loss / terrains.len() as f64
     }
 
     /// Land attacks on the same target merge, so these troops join the next one,
@@ -1550,11 +1599,48 @@ impl Game {
     }
 
     /// donateTroops: team games, not public ones (to balance HvN).
-    pub(super) fn nation_donate_troops(&mut self, _ne: &mut NationExec) -> bool {
+    pub(super) fn nation_donate_troops(&mut self, ne: &mut NationExec) -> bool {
         if !self.config.is_team_mode || self.config.is_public || !self.config.donate_troops || self.config.difficulty == "Easy" {
             return false;
         }
-        panic!("nations donating troops in private team games is not ported yet");
+        match self.config.difficulty.as_str() {
+            "Medium" => {
+                if ne.random.next_int(0.0, 4.0) != 0.0 {
+                    return false;
+                }
+            }
+            "Hard" => {
+                if ne.random.next_int(0.0, 2.0) != 0.0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+        let p = ne.player.unwrap();
+        let mut candidates: Vec<(usize, f64)> = self
+            .alive_players()
+            .into_iter()
+            .filter(|&q| {
+                self.is_on_same_team(p, q)
+                    && (!self.incoming_attacks(q).is_empty() || !self.players[q].outgoing.is_empty())
+            })
+            .map(|q| (q, self.players[q].troops_f() / self.max_troops(q).max(1.0)))
+            .collect();
+        if candidates.is_empty() {
+            return false;
+        }
+        candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        let Some((selected, _)) = candidates.into_iter().find(|&(q, _)| self.can_donate(p, q, false)) else {
+            return false;
+        };
+        let available = self.players[p].troops_f() - self.max_troops(p) * ne.reserve_ratio;
+        if available < 1.0 {
+            return false;
+        }
+        let id = self.players[selected].info.id.clone();
+        let e = self.new_donation(p, false, id, Some(available));
+        self.add_execution(e);
+        true
     }
 
     /// Target groups, tried in order: Hard & Impossible without a land front weigh

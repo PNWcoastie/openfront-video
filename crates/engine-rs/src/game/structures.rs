@@ -196,35 +196,49 @@ impl Game {
     }
 
     pub(super) fn has_unit_nearby(&self, tile: u32, range: i64, t: &str, owner: Option<usize>) -> bool {
+        let units = self.type_units(t);
+        if units.is_empty() {
+            return false;
+        }
+        let r2 = range * range;
         if let Some(o) = owner {
             let p_units = &self.players[o].units;
             if p_units.is_empty() {
                 return false;
             }
-            let (sx, ex, sy, ey) = self.grid_cell_bounds(tile, range);
-            let r2 = range * range;
+            let mut bounds = None;
+            if units.len() <= p_units.len() {
+                return units.iter().map(|&i| &self.units[i]).any(|u| {
+                    u.owner == o
+                        && u.active
+                        && !u.under_construction
+                        && self.dist2(u.tile, tile) <= r2
+                        && {
+                            let (sx, ex, sy, ey) = *bounds.get_or_insert_with(|| self.grid_cell_bounds(tile, range));
+                            let (ux, uy) = (self.map.x(u.tile) as i64 / 100, self.map.y(u.tile) as i64 / 100);
+                            ux >= sx && ux <= ex && uy >= sy && uy <= ey
+                        }
+                });
+            }
             return p_units.iter().map(|&i| &self.units[i]).any(|u| {
                 u.type_name == t
                     && u.active
                     && !u.under_construction
                     && self.dist2(u.tile, tile) <= r2
                     && {
+                        let (sx, ex, sy, ey) = *bounds.get_or_insert_with(|| self.grid_cell_bounds(tile, range));
                         let (ux, uy) = (self.map.x(u.tile) as i64 / 100, self.map.y(u.tile) as i64 / 100);
                         ux >= sx && ux <= ex && uy >= sy && uy <= ey
                     }
             });
         }
-        let units = self.type_units(t);
-        if units.is_empty() {
-            return false;
-        }
-        let (sx, ex, sy, ey) = self.grid_cell_bounds(tile, range);
-        let r2 = range * range;
+        let mut bounds = None;
         units.iter().map(|&i| &self.units[i]).any(|u| {
             u.active
                 && !u.under_construction
                 && self.dist2(u.tile, tile) <= r2
                 && {
+                    let (sx, ex, sy, ey) = *bounds.get_or_insert_with(|| self.grid_cell_bounds(tile, range));
                     let (ux, uy) = (self.map.x(u.tile) as i64 / 100, self.map.y(u.tile) as i64 / 100);
                     ux >= sx && ux <= ex && uy >= sy && uy <= ey
                 }

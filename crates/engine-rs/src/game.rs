@@ -489,7 +489,7 @@ pub struct Game {
     warhead_cancelled: Vec<bool>,
     pub winner: Option<String>,
     /// ENGINE_RS_PROFILE: time spent per execution type.
-    pub profile: Option<HashMap<&'static str, std::time::Duration>>,
+    pub profile: Option<FxHashMap<&'static str, std::time::Duration>>,
     pub requests: Vec<AllianceRequest>,
     /// Pending requests in creation order (GameImpl.allianceRequests).
     pub alliance_requests: Vec<usize>,
@@ -540,7 +540,7 @@ impl Game {
             warhead_units: Vec::new(),
             warhead_cancelled: Vec::new(),
             winner: None,
-            profile: std::env::var("ENGINE_RS_PROFILE").ok().map(|_| HashMap::new()),
+            profile: std::env::var("ENGINE_RS_PROFILE").is_ok().then(FxHashMap::default),
             requests: Vec::new(),
             alliance_requests: Vec::new(),
             alliances: Vec::new(),
@@ -1038,14 +1038,29 @@ impl Game {
     /// GameImpl.executeNextTick
     pub fn execute_next_tick(&mut self) {
         let mut execs = std::mem::take(&mut self.execs);
-        for e in execs.iter_mut() {
-            if (!self.in_spawn_phase() || e.active_during_spawn_phase()) && e.is_active(self) {
-                if self.profile.is_some() {
-                    let t0 = std::time::Instant::now();
+        if self.profile.is_some() {
+            let mut cur_name: &'static str = "";
+            let mut cur_start = std::time::Instant::now();
+            for e in execs.iter_mut() {
+                if (!self.in_spawn_phase() || e.active_during_spawn_phase()) && e.is_active(self) {
+                    let name = e.name();
+                    if !std::ptr::eq(name, cur_name) {
+                        let now = std::time::Instant::now();
+                        if !cur_name.is_empty() {
+                            *self.profile.as_mut().unwrap().entry(cur_name).or_default() += now.duration_since(cur_start);
+                        }
+                        cur_start = now;
+                        cur_name = name;
+                    }
                     self.tick_exec(e);
-                    let d = t0.elapsed();
-                    *self.profile.as_mut().unwrap().entry(e.name()).or_default() += d;
-                } else {
+                }
+            }
+            if !cur_name.is_empty() {
+                *self.profile.as_mut().unwrap().entry(cur_name).or_default() += cur_start.elapsed();
+            }
+        } else {
+            for e in execs.iter_mut() {
+                if (!self.in_spawn_phase() || e.active_during_spawn_phase()) && e.is_active(self) {
                     self.tick_exec(e);
                 }
             }
@@ -1503,24 +1518,22 @@ impl Game {
         include: impl Fn(&Game, u32) -> bool,
         bbox: Option<&mut [i64; 4]>,
     ) -> Vec<u32> {
-        let mut result = Vec::new();
+        let mut result = Vec::with_capacity(64);
         let mut stack = std::mem::take(&mut self.dfs_stack);
         stack.clear();
         let track_bbox = bbox.is_some();
+        let w = self.map.width;
         let (mut min_x, mut min_y, mut max_x, mut max_y) = (1e9 as i64, 1e9 as i64, -1e9 as i64, -1e9 as i64);
-        let note = |map: &GameMap, t: u32, min_x: &mut i64, min_y: &mut i64, max_x: &mut i64, max_y: &mut i64| {
-            let (x, y) = (map.x(t) as i64, map.y(t) as i64);
-            *min_x = (*min_x).min(x);
-            *min_y = (*min_y).min(y);
-            *max_x = (*max_x).max(x);
-            *max_y = (*max_y).max(y);
-        };
         if self.visited[start as usize] != gen && include(self, start) {
             self.visited[start as usize] = gen;
             result.push(start);
             stack.push(start);
             if track_bbox {
-                note(&self.map, start, &mut min_x, &mut min_y, &mut max_x, &mut max_y);
+                let (x, y) = ((start % w) as i64, (start / w) as i64);
+                min_x = x;
+                min_y = y;
+                max_x = x;
+                max_y = y;
             }
         }
         let mut nb4 = [0u32; 4];
@@ -1541,7 +1554,11 @@ impl Game {
                 result.push(n);
                 stack.push(n);
                 if track_bbox {
-                    note(&self.map, n, &mut min_x, &mut min_y, &mut max_x, &mut max_y);
+                    let (x, y) = ((n % w) as i64, (n / w) as i64);
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x);
+                    max_y = max_y.max(y);
                 }
             }
         }
@@ -1555,7 +1572,8 @@ impl Game {
     /// PlayerExecution.calculateClusters: the border split into 8-connected
     /// clusters, in border-set order, with their bounding boxes.
     fn calculate_clusters(&mut self, p: usize) -> (Vec<Vec<u32>>, Vec<[i64; 4]>) {
-        if self.players[p].border_tiles.len() == 0 {
+        let total_border = self.players[p].border_tiles.len();
+        if total_border == 0 {
             return (Vec::new(), Vec::new());
         }
         let border_gen = self.bump_generations(2);
@@ -1565,8 +1583,11 @@ impl Game {
         }
         let mut clusters = Vec::new();
         let mut boxes = Vec::new();
-        let include = move |g: &Game, t: u32| g.visited[t as usize] == border_gen;
+        let mut stack = std::mem::take(&mut self.dfs_stack);
+        let w = self.map.width;
+        let mut nb8 = [0u32; 8];
         let slot_count = self.players[p].border_tiles.slot_count();
+        let mut visited_border_count = 0;
         for i in 0..slot_count {
             let Some(start) = self.players[p].border_tiles.slot(i) else {
                 continue;
@@ -1574,11 +1595,37 @@ impl Game {
             if self.visited[start as usize] == current_gen {
                 continue;
             }
-            let mut b = [0i64; 4];
-            let cluster = self.flood_fill(current_gen, start, true, &include, Some(&mut b));
+            let mut cluster = Vec::with_capacity((total_border - visited_border_count).min(64));
+            stack.clear();
+            self.visited[start as usize] = current_gen;
+            cluster.push(start);
+            stack.push(start);
+            let (mut min_x, mut min_y) = (start % w, start / w);
+            let (mut max_x, mut max_y) = (min_x, min_y);
+            while let Some(tile) = stack.pop() {
+                let n = self.map.neighbors8(tile, &mut nb8);
+                for &nb in &nb8[..n] {
+                    if self.visited[nb as usize] != border_gen {
+                        continue;
+                    }
+                    self.visited[nb as usize] = current_gen;
+                    cluster.push(nb);
+                    stack.push(nb);
+                    let (x, y) = (nb % w, nb / w);
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x);
+                    max_y = max_y.max(y);
+                }
+            }
+            visited_border_count += cluster.len();
             clusters.push(cluster);
-            boxes.push(b);
+            boxes.push([min_x as i64, min_y as i64, max_x as i64, max_y as i64]);
+            if visited_border_count == total_border {
+                break;
+            }
         }
+        self.dfs_stack = stack;
         (clusters, boxes)
     }
 
@@ -2707,10 +2754,13 @@ pub fn assign_teams(
             team_by_client.insert(cid.clone(), t.clone());
         }
     }
-    let nation_players: Vec<usize> = non_clan.iter().copied().filter(|&i| players[i].player_type == PlayerType::Nation).collect();
-    assert!(nation_players.is_empty(), "nation team shuffling is not ported yet");
+    let mut nation_players: Vec<usize> = non_clan.iter().copied().filter(|&i| players[i].player_type == PlayerType::Nation).collect();
+    if !nation_players.is_empty() {
+        let mut random = PseudoRandom::new(simple_hash(&players[nation_players[0]].id));
+        nation_players = random.shuffle(&nation_players);
+    }
     let others: Vec<usize> = non_clan.iter().copied().filter(|&i| players[i].player_type != PlayerType::Nation).collect();
-    for i in others {
+    for i in others.into_iter().chain(nation_players) {
         let p = &players[i];
         let my_friends = p.client_id.as_ref().and_then(|c| friend_graph.get(c));
         let mut best: Option<&String> = None;

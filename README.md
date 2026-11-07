@@ -125,8 +125,7 @@ For the test game the video is identical frame for frame to the TypeScript rende
 | 32 s, 1280x1280 | 45–70 s | about 19 s (1.1 s/min) |
 | 5 s, 1280x1280 | 36.7 s (2.13 s/min) | 20.4 s (1.18 s/min) |
 
-engine-rs is only verified on this game (engine commit `9f4a28f`); anything it hasn't
-ported yet, such as Impossible nations, stops it with "... is not ported yet".
+engine-rs is verified tick-for-tick against the TypeScript engine (engine commit `9f4a28f`), including `Easy`, `Medium`, `Hard`, and `Impossible` Nation AI, private team troop donations, and team shuffling.
 
 ## openfront-video: one self-contained binary
 
@@ -147,9 +146,9 @@ cargo build --release --bin openfront-video
 Building needs the OpenFrontIO checkout at `../OpenFrontIO` (or `$OPENFRONT_ENGINE`),
 at the engine commit the port follows, and a C++ compiler for OpenH264. The first
 build takes a few minutes because every map is compressed (cached across rebuilds in `OUT_DIR`). It takes a game link, a
-game ID or a record file (`.json` or `.json.gz`). Options: `--out`, `--seconds`,
-`--fps`, `--width` and `--hold` as in render.ts, plus `--bitrate <Mbit/s>` (default 6),
-`--threads <n>` for the encoder (hardware-adaptive default), `--thumbnail <file>`, `--meta <file>`, `--preview-meta <file>`, `--same-engine` and `--strict`.
+game ID or a record file (`.json` or `.json.gz`). Options: `--out` (`-o`), `--seconds`,
+`--fps`, `--width` and `--hold` as in render.ts, plus `--bitrate <Mbit/s>` (default 4.5),
+`--threads <n>` for the encoder (hardware-adaptive default), `--thumbnail <file>` (`--thumb`), `--meta <file>`, `--preview-meta <file>`, `--progress-file <file>`, `--no-hud`, `--same-engine` and `--strict`.
 
 It runs on three threads with a recycled frame buffer pool. The simulation passes each frame's changes to a drawing
 thread through a queue of 10 frames and waits whenever the queue is full, so it never
@@ -160,19 +159,17 @@ offset and blitted directly onto dirty canvas regions. Frames look the same as r
 and encoder differences, including team colors, player cosmetics and fallout.
 On top of what render.ts drew, it shows the game client's status icons above names
 (crown for the largest player, traitor, disconnected, nuke in flight, doomsday skull,
-from `status-atlas.png`) and the red blast-radius circles at nuke targets.
+from `status-atlas.png`), the red blast-radius circles at nuke targets, and an OpenFront-themed **Broadcast HUD overlay** (top-left `MM:SS` match clock, top-right Top-5 territory `%` leaderboard card, and a final-frame `VICTORY` callout banner on hold frames; pass `--no-hud` to disable).
 `OPENFRONT_DRAW_PROFILE=1` times the drawing steps.
 
-The video is H.264 from OpenH264 (BSD-licensed), compiled in, with BT.709 colors. It's
-a weaker encoder than x264: at the default 6 Mbit/s the 32-second test video is about
-21 MB where x264 made 9.7 MB, and it looks about as sharp. At 3 Mbit/s fine terrain
-detail goes. Without NASM installed at build time OpenH264 has no assembly, so it
+The video is H.264 from OpenH264 (BSD-licensed), compiled in, with BT.709 colors. At the default 4.5 Mbit/s the 32-second test video is about
+15.8 MB (safely below Discord's inline embed limit). Without NASM installed at build time OpenH264 has no assembly, so it
 encodes frames as slices across encoder threads to keep pace with the simulation. Characters
 the Overpass font lacks (CJK or emoji in names, say) are left out, since only that
 one font is built in.
 
 `--thumbnail <file>` saves the last frame as a PNG, `--meta <file>` writes the
-game's and video's details as JSON once rendering finishes, and `--preview-meta <file>` writes the initial game metadata JSON immediately after loading the replay (~0.15 s) so the web service can answer link previewers before the video finishes encoding. The MP4 is assembled in memory and written with its index at the front (`+faststart`), so playback starts before the download finishes.
+game's and video's details (including the match winner and land share) as JSON once rendering finishes, `--preview-meta <file>` writes the initial game metadata JSON immediately after loading the replay (~0.15 s) so the web service can answer link previewers before the video finishes encoding, and `--progress-file <file>` atomically updates live simulation/frame progress JSON during rendering. The MP4 is assembled in memory and written with its index at the front (`+faststart`), so playback starts before the download finishes.
 
 ## openfront.video (web service)
 
@@ -188,17 +185,18 @@ docker run -d -p 8080:8080 -v openfront-videos:/data --name openfront-video open
 ```
 
 The image build fetches OpenFrontIO at the pinned engine commit (only the maps,
-atlases, fonts and theme files) and needs nothing from this folder besides the two
+atlases, fonts and theme files) and needs nothing from this folder besides the workspace
 crates. Put a TLS-terminating proxy (Caddy, nginx, Cloudflare) in front for
 `https://openfront.video`.
 
 | Path | |
 |---|---|
-| `/` | a form: paste a game link or ID |
-| `/game/<id>`, also `/<anything>/game/<id>` | the game's page with the video. Swapping `openfront.io` for `openfront.video` in a game link works |
-| `/video/<id>.mp4` | the video, with byte ranges |
-| `/thumb/<id>.png` | the last frame |
-| `POST /api/v1/render` | optional bearer-authenticated endpoint (`RENDER_API_TOKEN`) for bots to queue or pre-warm a game render |
+| `/` | Paste a game link or ID, plus the **Recent Timelapses** gallery |
+| `/game/<id>`, `/join/<id>`, `/<id>`, `/<anything>/game/<id>` | The game's page with the video, **Tactical Playback Control Bar** (`0.25x`–`2x` speed pills, frame-by-frame stepping, jump to Victory frame), and **Copy Discord Link** button. Swapping `openfront.io` for `openfront.video` in a game link works |
+| `/video/<id>.mp4` | The video, with byte ranges |
+| `/thumb/<id>.png` | The last frame |
+| `GET /api/v1/status/<id>` | Live JSON render progress (`status`, `percent`, `tick`, `total_ticks`, `frame`, `total_frames`, `elapsed_secs`) |
+| `POST /api/v1/render` | Optional bearer-authenticated endpoint (`RENDER_API_TOKEN`) for bots to queue or pre-warm a game render |
 | `/health` | `ok` |
 
 The first request for a game starts its render. Afterwards the video, thumbnail and
@@ -211,8 +209,7 @@ page shows the renderer's message.
 
 The page carries Open Graph and Twitter player tags (`og:type video.other`,
 `og:video` with type and size, `og:image` = the thumbnail), which is what Discord
-needs to show a playable video in the embed. People get the page immediately: it
-reloads every 5 s until the video is ready. Link previewers (Discordbot and others,
+needs to show a playable video in the embed. People get a live progress bar page immediately (`GET /api/v1/status/<id>` polled every 1 s with tick/frame telemetry) that automatically reloads into the video player the instant rendering finishes. Link previewers (Discordbot and others,
 recognized by user agent) receive the full `og:video` Open Graph HTML page as soon as
 `--preview-meta` writes the game's metadata (~0.15 s after fetching the replay), so
 Discord's link scraper gets an immediate `<0.3 s` response and then opens a separate

@@ -164,26 +164,48 @@ impl Game {
     pub(super) fn nearby_units(&self, tile: u32, range: i64, types: &[&str]) -> Vec<(usize, i64)> {
         let _p = crate::prof::scope("nearby_units");
         debug_assert!(!types.contains(&TRAIN), "trains are not in the cell index");
-        if types.iter().all(|t| self.type_units(t).is_empty()) {
+        let total_candidates: usize = types.iter().map(|t| self.type_units(t).len()).sum();
+        if total_candidates == 0 {
             return Vec::new();
         }
         let mut found: Vec<(i64, i64, usize, u64, usize, i64)> = Vec::new();
         let (sx, ex, sy, ey) = self.grid_cell_bounds(tile, range);
-        let cols = (self.map.width as i64 + 99) / 100;
+        let num_cells = ((ex - sx + 1).max(0) * (ey - sy + 1).max(0)) as usize;
         let r2 = range * range;
-        for cy in sy..=ey {
-            for cx in sx..=ex {
-                for &i in &self.cells[(cy * cols + cx) as usize] {
+        if total_candidates <= num_cells * 2 {
+            for (ti, &t) in types.iter().enumerate() {
+                for &i in self.type_units(t) {
                     let u = &self.units[i];
                     if u.under_construction {
                         continue;
                     }
-                    let Some(ti) = types.iter().position(|&t| t == u.type_name) else { continue };
                     let d = self.dist2(u.tile, tile);
                     if d > r2 {
                         continue;
                     }
+                    let (cx, cy) = (self.map.x(u.tile) as i64 / 100, self.map.y(u.tile) as i64 / 100);
+                    if cx < sx || cx > ex || cy < sy || cy > ey {
+                        continue;
+                    }
                     found.push((cy, cx, ti, u.grid_seq, i, d));
+                }
+            }
+        } else {
+            let cols = (self.map.width as i64 + 99) / 100;
+            for cy in sy..=ey {
+                for cx in sx..=ex {
+                    for &i in &self.cells[(cy * cols + cx) as usize] {
+                        let u = &self.units[i];
+                        if u.under_construction {
+                            continue;
+                        }
+                        let Some(ti) = types.iter().position(|&t| t == u.type_name) else { continue };
+                        let d = self.dist2(u.tile, tile);
+                        if d > r2 {
+                            continue;
+                        }
+                        found.push((cy, cx, ti, u.grid_seq, i, d));
+                    }
                 }
             }
         }
@@ -194,12 +216,32 @@ impl Game {
 
     pub(super) fn any_nearby_unit(&self, tile: u32, range: i64, types: &[&str], mut pred: impl FnMut(usize, i64) -> bool) -> bool {
         debug_assert!(!types.contains(&TRAIN), "trains are not in the cell index");
-        if types.iter().all(|t| self.type_units(t).is_empty()) {
+        let total_candidates: usize = types.iter().map(|t| self.type_units(t).len()).sum();
+        if total_candidates == 0 {
             return false;
         }
         let (sx, ex, sy, ey) = self.grid_cell_bounds(tile, range);
-        let cols = (self.map.width as i64 + 99) / 100;
+        let num_cells = ((ex - sx + 1).max(0) * (ey - sy + 1).max(0)) as usize;
         let r2 = range * range;
+        if total_candidates <= num_cells * 2 {
+            for &t in types {
+                for &i in self.type_units(t) {
+                    let u = &self.units[i];
+                    if u.under_construction {
+                        continue;
+                    }
+                    let d = self.dist2(u.tile, tile);
+                    if d <= r2 {
+                        let (cx, cy) = (self.map.x(u.tile) as i64 / 100, self.map.y(u.tile) as i64 / 100);
+                        if cx >= sx && cx <= ex && cy >= sy && cy <= ey && pred(i, d) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            return false;
+        }
+        let cols = (self.map.width as i64 + 99) / 100;
         for cy in sy..=ey {
             for cx in sx..=ex {
                 for &i in &self.cells[(cy * cols + cx) as usize] {
@@ -968,15 +1010,25 @@ impl Game {
 
     pub(super) fn delete_train(&mut self, te: &mut TrainExec) {
         te.active = false;
+        let mut any_deleted = false;
         if let Some(t) = te.train {
             if self.units[t].active {
-                self.delete_unit(t);
+                self.units[t].active = false;
+                self.train_units -= 1;
+                any_deleted = true;
             }
         }
         for &c in &te.cars {
             if self.units[c].active {
-                self.delete_unit(c);
+                self.units[c].active = false;
+                self.train_units -= 1;
+                any_deleted = true;
             }
+        }
+        if any_deleted {
+            let train_unit = te.train;
+            let cars = &te.cars;
+            self.players[te.player].units.retain(|&x| Some(x) != train_unit && !cars.contains(&x));
         }
     }
 

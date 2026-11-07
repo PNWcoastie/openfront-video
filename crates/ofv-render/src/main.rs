@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use engine_rs::replay::{self, setup};
 use serde_json::Value;
 
-use draw::{Label, Renderer};
+use draw::{HudEntry, HudState, Label, Renderer};
 use look::{Settings, Style, Theme};
 
 /// Frames the simulation may queue up for drawing before it waits.
@@ -47,14 +47,16 @@ Options:
   --fps <n>          frames per second (default: 30)
   --width <n>        video width in pixels, height follows the map (default: 1280)
   --hold <n>         seconds to hold the final frame (default: 2)
-  --bitrate <n>      target bitrate in Mbit/s (default: 6)
+  --bitrate <n>      target bitrate in Mbit/s (default: 4.5)
   --threads <n>      encoder threads (default: 4)
   --strict           stop if the replay desyncs from the archived hashes
   --same-engine      stop right away (exit code 4) if the game was played on another
                      engine version; the message names its full commit
-  --thumbnail <file>    also save the last frame as a PNG
-  --meta <file>         also write the game's and video's details as JSON
-  --preview-meta <file> write initial game/map metadata JSON immediately before simulating
+  --thumbnail <file>     also save the last frame as a PNG
+  --meta <file>          also write the game's and video's details as JSON
+  --preview-meta <file>  write initial game/map metadata JSON immediately before simulating
+  --progress-file <file> write live JSON render progress atomically
+  --no-hud               disable the broadcast HUD overlay
 ";
 
 struct Options {
@@ -71,6 +73,8 @@ struct Options {
     thumbnail: Option<String>,
     meta: Option<String>,
     preview_meta: Option<String>,
+    progress_file: Option<String>,
+    no_hud: bool,
 }
 
 fn parse_args() -> Result<Options, String> {
@@ -84,13 +88,15 @@ fn parse_args() -> Result<Options, String> {
         fps: 30,
         width: 1280,
         hold: 2.0,
-        bitrate: 6.0,
+        bitrate: 4.5,
         threads: default_threads,
         strict: false,
         same_engine: false,
         thumbnail: None,
         meta: None,
         preview_meta: None,
+        progress_file: None,
+        no_hud: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -99,7 +105,7 @@ fn parse_args() -> Result<Options, String> {
             v.parse::<f64>().ok().filter(|n| n.is_finite() && *n >= 0.0).ok_or_else(|| format!("bad number for {arg}"))
         };
         match arg.as_str() {
-            "--out" => o.out = Some(value()?),
+            "--out" | "-o" => o.out = Some(value()?),
             "--seconds" => o.seconds = num(value()?)?,
             "--fps" => o.fps = num(value()?)?.round().max(1.0) as u32,
             "--width" => o.width = num(value()?)? as u32,
@@ -108,9 +114,11 @@ fn parse_args() -> Result<Options, String> {
             "--threads" => o.threads = num(value()?)?.round().max(1.0) as u16,
             "--strict" => o.strict = true,
             "--same-engine" => o.same_engine = true,
-            "--thumbnail" => o.thumbnail = Some(value()?),
+            "--thumbnail" | "--thumb" => o.thumbnail = Some(value()?),
             "--meta" => o.meta = Some(value()?),
             "--preview-meta" => o.preview_meta = Some(value()?),
+            "--progress-file" => o.progress_file = Some(value()?),
+            "--no-hud" => o.no_hud = true,
             "-h" | "--help" => {
                 print!("{USAGE}");
                 std::process::exit(0);
@@ -135,6 +143,7 @@ struct DrawMsg {
     labels: Arc<Vec<Label>>,
     /// Nukes in flight: target tile and blast radii.
     nukes: Arc<Vec<(u32, u16, u16)>>,
+    hud: Option<Arc<HudState>>,
     /// How many video frames show it.
     repeat: u32,
 }
@@ -162,6 +171,30 @@ fn fmt_int(n: u64) -> String {
 
 fn secs(d: Duration) -> String {
     format!("{:.2} s", d.as_secs_f64())
+}
+
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    s.chars().take(max_chars).collect()
+}
+
+fn write_progress(
+    path: Option<&str>,
+    tick: u64,
+    total_ticks: u64,
+    frame: u64,
+    total_frames: u64,
+    percent: u64,
+    elapsed: Duration,
+) {
+    let Some(path) = path else { return };
+    let elapsed_secs = (elapsed.as_secs_f64() * 10.0).round() / 10.0;
+    let payload = format!(
+        r#"{{"tick":{tick},"total_ticks":{total_ticks},"frame":{frame},"total_frames":{total_frames},"percent":{percent},"elapsed_secs":{elapsed_secs:.1}}}"#
+    );
+    let tmp = format!("{path}.tmp");
+    if std::fs::write(&tmp, payload).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
 }
 
 fn main() {
@@ -322,12 +355,16 @@ fn run() -> Result<(), String> {
     // 4. Simulate, handing each frame to the drawing thread
     let tty = std::io::stdout().is_terminal();
     let total_ticks = turns.len() as u64;
+    let total_frames = frames + hold_frames;
     let sim_start = Instant::now();
+    write_progress(opts.progress_file.as_deref(), 0, total_ticks, 0, total_frames, 0, Duration::ZERO);
     let mut sim = Span { start: Some(sim_start), ..Default::default() };
     let mut last_print = sim_start;
+    let mut last_progress_frame = 0u64;
     let mut sent = 0u64;
     let mut last: (Arc<Vec<i32>>, Arc<Vec<Label>>) = (Arc::new(Vec::new()), Arc::new(Vec::new()));
     let mut last_nukes: Arc<Vec<(u32, u16, u16)>> = Arc::new(Vec::new());
+    let mut last_hud: Option<Arc<HudState>> = None;
     let mut status_by_id: Vec<u8> = Vec::new();
     let mut stopped = false;
     let send = |msg: DrawMsg, sim: &mut Span| -> bool {
@@ -380,6 +417,31 @@ fn run() -> Result<(), String> {
         }
         last = (Arc::new(f.units), Arc::new(labels));
         last_nukes = Arc::new(f.nuke_targets);
+        let hud = if opts.no_hud {
+            None
+        } else {
+            let total_land = (game.map.num_land_tiles as usize).max(1) as f32;
+            let mut alive: Vec<(usize, u16, usize)> = game
+                .players
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.is_alive())
+                .map(|(idx, p)| (idx, p.small_id, p.tiles.len()))
+                .collect();
+            alive.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1)));
+            let top5: Vec<HudEntry> = alive
+                .iter()
+                .take(5)
+                .map(|&(idx, small_id, tiles_len)| HudEntry {
+                    small_id,
+                    name: truncate_chars(&game.display_name(idx), 14),
+                    pct: (tiles_len as f32 * 100.0 / total_land).min(100.0),
+                })
+                .collect();
+            let h = Arc::new(HudState { tick: f.tick, top5, winner: None });
+            last_hud = Some(h.clone());
+            Some(h)
+        };
         let msg = DrawMsg {
             progress: f.tick as f64 / total_ticks as f64,
             styles,
@@ -387,12 +449,27 @@ fn run() -> Result<(), String> {
             units: last.0.clone(),
             labels: last.1.clone(),
             nukes: last_nukes.clone(),
+            hud,
             repeat: f.repeat,
         };
         sent += f.repeat as u64;
         if !send(msg, &mut sim) {
             stopped = true;
             return;
+        }
+        if sent.saturating_sub(last_progress_frame) >= 15 {
+            last_progress_frame = sent;
+            let cur_frame = sent.min(total_frames);
+            let pct = ((cur_frame * 100) / total_frames.max(1)).min(99);
+            write_progress(
+                opts.progress_file.as_deref(),
+                f.tick as u64,
+                total_ticks,
+                cur_frame,
+                total_frames,
+                pct,
+                sim_start.elapsed(),
+            );
         }
         let now = Instant::now();
         if now - last_print >= Duration::from_millis(if tty { 250 } else { 2000 }) {
@@ -422,9 +499,78 @@ fn run() -> Result<(), String> {
     if opts.strict && check.mismatches > 0 {
         return Err("replay desynced (--strict)".into());
     }
+    // Compute final winner summary (team + MVP in team games, top player in FFA).
+    let total_land = (game.map.num_land_tiles as usize).max(1) as f32;
+    let final_winner: Option<(String, f32)> = if game.config.is_team_mode {
+        let mut team_tiles: std::collections::HashMap<String, (usize, Option<(usize, usize)>)> = std::collections::HashMap::new();
+        for (idx, p) in game.players.iter().enumerate().filter(|(_, p)| p.is_alive()) {
+            let t = p.team.clone().unwrap_or_else(|| game.display_name(idx));
+            if t == "Bot" {
+                continue;
+            }
+            let entry = team_tiles.entry(t).or_insert((0, None));
+            entry.0 += p.tiles.len();
+            if entry.1.map_or(true, |(_, best_len)| p.tiles.len() > best_len) {
+                entry.1 = Some((idx, p.tiles.len()));
+            }
+        }
+        let best_team = if let Some(ref w_team) = game.winner {
+            team_tiles.get(w_team).map(|&(tiles, mvp)| (w_team.clone(), tiles, mvp))
+        } else {
+            None
+        }
+        .or_else(|| {
+            team_tiles
+                .into_iter()
+                .max_by_key(|(_, (tiles, _))| *tiles)
+                .map(|(t, (tiles, mvp))| (t, tiles, mvp))
+        });
+        best_team.and_then(|(team_name, tiles, mvp)| {
+            if tiles == 0 {
+                return None;
+            }
+            let pct = (tiles as f32 * 100.0 / total_land).min(100.0);
+            let label = if let Some((mvp_idx, _)) = mvp {
+                let mvp_name = truncate_chars(&game.display_name(mvp_idx), 18);
+                if mvp_name.contains(&team_name) {
+                    format!("Team {team_name} · {mvp_name}")
+                } else {
+                    format!("{team_name} · {mvp_name}")
+                }
+            } else {
+                format!("Team {team_name}")
+            };
+            Some((label, pct))
+        })
+    } else {
+        let best_player = if let Some(ref w_id) = game.winner {
+            game.players.iter().enumerate().find(|(_, p)| &p.info.id == w_id && p.is_alive())
+        } else {
+            None
+        }
+        .or_else(|| {
+            game.players
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.is_alive())
+                .max_by_key(|(_, p)| p.tiles.len())
+        });
+        best_player.and_then(|(idx, p)| {
+            if p.tiles.is_empty() {
+                return None;
+            }
+            let pct = (p.tiles.len() as f32 * 100.0 / total_land).min(100.0);
+            Some((truncate_chars(&game.display_name(idx), 22), pct))
+        })
+    };
+
     // Frames past the last tick, then the hold, repeat the final state.
     let rest = (frames + hold_frames).saturating_sub(sent);
     if rest > 0 && !stopped {
+        let hold_hud = last_hud.as_ref().map(|h| {
+            let winner = final_winner.clone().or_else(|| h.top5.first().map(|top| (top.name.clone(), top.pct)));
+            Arc::new(HudState { tick: h.tick, top5: h.top5.clone(), winner })
+        });
         let msg = DrawMsg {
             progress: 1.0,
             styles: Vec::new(),
@@ -432,6 +578,7 @@ fn run() -> Result<(), String> {
             units: last.0,
             labels: last.1,
             nukes: last_nukes.clone(),
+            hud: hold_hud,
             repeat: rest as u32,
         };
         send(msg, &mut sim);
@@ -442,11 +589,20 @@ fn run() -> Result<(), String> {
     let draw = drawer.join().map_err(|_| "the drawing thread stopped")?;
     let (enc, written) = encoder.join().map_err(|_| "the encoder thread stopped")??;
     let draw = draw?;
+    write_progress(
+        opts.progress_file.as_deref(),
+        total_ticks,
+        total_ticks,
+        total_frames,
+        total_frames,
+        100,
+        sim_start.elapsed(),
+    );
     let total = t0.elapsed();
 
     let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
     if let Some(path) = &opts.meta {
-        let meta = serde_json::json!({
+        let mut meta = serde_json::json!({
             "gameID": game_id,
             "map": info["config"]["gameMap"],
             "mode": info["config"]["gameMode"],
@@ -461,6 +617,10 @@ fn run() -> Result<(), String> {
             "hashesChecked": check.checked,
             "hashMismatches": check.mismatches,
         });
+        if let Some((ref w_name, w_pct)) = final_winner {
+            meta["winner"] = Value::String(w_name.clone());
+            meta["winnerPct"] = serde_json::json!((w_pct as f64 * 10.0).round() / 10.0);
+        }
         std::fs::write(path, serde_json::to_vec_pretty(&meta).unwrap()).map_err(|e| format!("writing {path}: {e}"))?;
     }
     println!();
@@ -541,7 +701,7 @@ fn draw_thread(
             r.set_style(id, s);
         }
         r.apply_tiles(&msg.tiles);
-        let rgba = r.draw(&msg.units, &msg.labels, &msg.nukes, msg.progress);
+        let rgba = r.draw(&msg.units, &msg.labels, &msg.nukes, msg.progress, msg.hud.as_deref());
         if buf.len() == rgba.len() {
             buf.copy_from_slice(rgba);
         } else {

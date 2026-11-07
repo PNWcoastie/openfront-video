@@ -100,9 +100,8 @@ impl Game {
         self.grid_seq += 1;
         if type_name == TRAIN {
             self.train_units += 1;
-        }
-        self.units_by_type.entry(type_name).or_default().push(idx);
-        if type_name != TRAIN {
+        } else {
+            self.units_by_type.entry(type_name).or_default().push(idx);
             let c = self.cell_of(tile);
             self.cells[c].push(idx);
         }
@@ -119,17 +118,16 @@ impl Game {
         let owner = self.units[u].owner;
         self.players[owner].units.retain(|&x| x != u);
         self.units[u].active = false;
-        // Only live units stay in the type lists (none of their users depend on order).
-        let list = self.units_by_type.get_mut(self.units[u].type_name).expect("type list");
-        let pos = list.iter().position(|&x| x == u).expect("unit in its type list");
-        list.swap_remove(pos);
         if self.units[u].type_name != TRAIN {
+            // Only live units stay in the type lists (none of their users depend on order).
+            let list = self.units_by_type.get_mut(self.units[u].type_name).expect("type list");
+            let pos = list.iter().position(|&x| x == u).expect("unit in its type list");
+            list.swap_remove(pos);
             let c = self.cell_of(self.units[u].tile);
             let cell = &mut self.cells[c];
             let pos = cell.iter().position(|&x| x == u).expect("unit in its cell");
             cell.swap_remove(pos);
-        }
-        if self.units[u].type_name == TRAIN {
+        } else {
             self.train_units -= 1;
         }
         if self.units[u].has_train_station {

@@ -68,6 +68,22 @@ pub struct Label {
     pub status: u8,
 }
 
+/// One leaderboard row in the broadcast HUD overlay.
+#[derive(Clone, Debug)]
+pub struct HudEntry {
+    pub small_id: u16,
+    pub name: String,
+    pub pct: f32,
+}
+
+/// Per-frame state for the broadcast HUD overlay.
+#[derive(Clone, Debug)]
+pub struct HudState {
+    pub tick: u32,
+    pub top5: Vec<HudEntry>,
+    pub winner: Option<(String, f32)>,
+}
+
 /// Status icons in the client's order (StatusIconProgram slots) with their
 /// atlas cells: crown, traitor, disconnected, nuke (white), doomsday skull.
 const STATUS_ICONS: [(u8, u32); 5] = [
@@ -1082,13 +1098,236 @@ impl Renderer {
         }
     }
 
+    fn draw_hud_box(
+        &mut self,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        fill: [u8; 4],
+        border: [u8; 4],
+        rounded: bool,
+    ) {
+        let out_w = self.out_w as i32;
+        let out_h = self.out_h as i32;
+        let cx0 = x.max(0);
+        let cy0 = y.max(0);
+        let cx1 = (x + w).min(out_w);
+        let cy1 = (y + h).min(out_h);
+        if cx0 >= cx1 || cy0 >= cy1 {
+            return;
+        }
+        self.overlay_rects.push((cx0 as u16, cy0 as u16, cx1 as u16, cy1 as u16));
+        let canvas_w = self.out_w;
+        let data = self.canvas.data_mut();
+        for py in cy0..cy1 {
+            let ly = py - y;
+            let row_off = py as usize * canvas_w;
+            for px in cx0..cx1 {
+                let lx = px - x;
+                if rounded && w >= 6 && h >= 6 {
+                    if (lx == 0 || lx == w - 1) && (ly == 0 || ly == h - 1) {
+                        continue;
+                    }
+                }
+                let is_border = lx == 0
+                    || lx == w - 1
+                    || ly == 0
+                    || ly == h - 1
+                    || (rounded
+                        && w >= 6
+                        && h >= 6
+                        && (lx == 1 || lx == w - 2)
+                        && (ly == 1 || ly == h - 2));
+                let c = if is_border { border } else { fill };
+                let sa = c[3] as u32;
+                let dp = &mut data[(row_off + px as usize) * 4..(row_off + px as usize) * 4 + 4];
+                if sa == 255 {
+                    dp[0] = c[0];
+                    dp[1] = c[1];
+                    dp[2] = c[2];
+                    dp[3] = 255;
+                } else if sa > 0 {
+                    let inv = 255 - sa;
+                    dp[0] = ((c[0] as u32 * sa + dp[0] as u32 * inv + 127) / 255) as u8;
+                    dp[1] = ((c[1] as u32 * sa + dp[1] as u32 * inv + 127) / 255) as u8;
+                    dp[2] = ((c[2] as u32 * sa + dp[2] as u32 * inv + 127) / 255) as u8;
+                    dp[3] = 255;
+                }
+            }
+        }
+    }
+
+    fn draw_hud_text(&mut self, text: &str, x: f32, y_center: f32, font_size: f32, color: [u8; 4]) {
+        let size10 = (font_size * 10.0).round().max(10.0) as u32;
+        let actual_size = size10 as f32 / 10.0;
+        let line = self.font.shape(text);
+        let s_em = actual_size / self.font.units_per_em;
+        let baseline = y_center + self.font.middle * s_em;
+        let u = self.u;
+        let outline_w = self.settings.outline_width;
+        self.glyph_pos_buf.clear();
+        for &(g, gx_font, gy_font) in &line.glyphs {
+            let gx = x + gx_font * s_em;
+            let gy = baseline - gy_font * s_em;
+            let (g_ix, g_fx) = quarter(gx as f64);
+            let (g_iy, g_fy) = quarter(gy as f64);
+            let gkey = GlyphKey { glyph_id: g.0, size10, fx: g_fx, fy: g_fy };
+            if !self.glyph_cache.contains_key(&gkey) {
+                let rendered = self.font.render_glyph(gkey, u, outline_w);
+                self.glyph_cache.insert(gkey, rendered);
+            }
+            if self.glyph_cache[&gkey].is_some() {
+                self.glyph_pos_buf.push((g_ix, g_iy, gkey));
+            }
+        }
+        let (out_w, out_h) = (self.out_w as i32, self.out_h as i32);
+        let canvas_w = self.out_w;
+        let data = self.canvas.data_mut();
+        let [cr, cg_col, cb, ca] = color.map(|v| v as u32);
+        for &(g_ix, g_iy, gkey) in &self.glyph_pos_buf {
+            let Some(cg) = &self.glyph_cache[&gkey] else { continue };
+            let dst_x0 = g_ix + cg.dx;
+            let dst_y0 = g_iy + cg.dy;
+            let gw = cg.w as i32;
+            let gh = cg.h as i32;
+            let x0 = dst_x0.max(0);
+            let y0 = dst_y0.max(0);
+            let x1 = (dst_x0 + gw).min(out_w);
+            let y1 = (dst_y0 + gh).min(out_h);
+            if x0 >= x1 || y0 >= y1 {
+                continue;
+            }
+            self.overlay_rects.push((x0 as u16, y0 as u16, x1 as u16, y1 as u16));
+            let gw_u = gw as usize;
+            for py in y0..y1 {
+                let sy = (py - dst_y0) as usize;
+                let sx_start = (x0 - dst_x0) as usize;
+                let span = (x1 - x0) as usize;
+                let src_row = &cg.fill_alpha[sy * gw_u + sx_start..sy * gw_u + sx_start + span];
+                let dst_row = &mut data[(py as usize * canvas_w + x0 as usize) * 4..(py as usize * canvas_w + x0 as usize + span) * 4];
+                for (&fa, dp) in src_row.iter().zip(dst_row.chunks_exact_mut(4)) {
+                    if fa == 0 {
+                        continue;
+                    }
+                    let a = (fa as u32 * ca + 127) / 255;
+                    if a == 255 {
+                        dp[0] = cr as u8;
+                        dp[1] = cg_col as u8;
+                        dp[2] = cb as u8;
+                        dp[3] = 255;
+                    } else if a > 0 {
+                        let inv = 255 - a;
+                        dp[0] = ((cr * a + dp[0] as u32 * inv + 127) / 255) as u8;
+                        dp[1] = ((cg_col * a + dp[1] as u32 * inv + 127) / 255) as u8;
+                        dp[2] = ((cb * a + dp[2] as u32 * inv + 127) / 255) as u8;
+                        dp[3] = 255;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Broadcast HUD overlay: top-left match clock pill, top-right top-5
+    /// leaderboard card, and bottom-center winner banner on final hold frames.
+    pub fn draw_hud(&mut self, hud: &HudState) {
+        // 1. Top-Left Match Clock Pill
+        let total_secs = hud.tick / 10;
+        let mins = total_secs / 60;
+        let secs = total_secs % 60;
+        let prefix = "TIME  ";
+        let time_str = format!("{mins:02}:{secs:02}");
+        let full_clock = format!("{prefix}{time_str}");
+        let clock_font = 13.5f32;
+        let text_w = self.font.text_width(&full_clock, clock_font).ceil() as i32;
+        let prefix_w = self.font.text_width(prefix, clock_font);
+        let pad_x = 12;
+        let pill_w = (text_w + pad_x * 2).max(116);
+        let pill_h = 28;
+        self.draw_hud_box(16, 16, pill_w, pill_h, [17, 24, 39, 212], [55, 65, 81, 200], true);
+        let pill_cy = 16.0 + pill_h as f32 / 2.0;
+        self.draw_hud_text(prefix, (16 + pad_x) as f32, pill_cy, clock_font, [156, 163, 175, 255]);
+        self.draw_hud_text(&time_str, (16 + pad_x) as f32 + prefix_w, pill_cy, clock_font, [243, 244, 246, 255]);
+
+        // 2. Top-Right Top-5 Leaderboard Card
+        if !hud.top5.is_empty() {
+            let row_font = 13.0f32;
+            let row_h = 22;
+            let c_pad_x = 10;
+            let c_pad_y = 7;
+            let mut card_w = 216;
+            for entry in &hud.top5 {
+                let pct_str = format!("{:.1}%", entry.pct);
+                let nw = self.font.text_width(&entry.name, row_font).ceil() as i32;
+                let pw = self.font.text_width(&pct_str, row_font).ceil() as i32;
+                card_w = card_w.max(c_pad_x * 2 + 12 + 8 + nw + 12 + pw);
+            }
+            let card_h = c_pad_y * 2 + hud.top5.len() as i32 * row_h;
+            let card_x = self.out_w as i32 - card_w - 16;
+            let card_y = 16;
+            self.draw_hud_box(card_x, card_y, card_w, card_h, [17, 24, 39, 212], [55, 65, 81, 200], true);
+            for (i, entry) in hud.top5.iter().enumerate() {
+                let row_cy = card_y + c_pad_y + i as i32 * row_h + row_h / 2;
+                let fill = self.style(entry.small_id).fill;
+                let [sr, sg, sb] = channels(fill);
+                self.draw_hud_box(
+                    card_x + c_pad_x,
+                    row_cy - 6,
+                    12,
+                    12,
+                    [sr as u8, sg as u8, sb as u8, 255],
+                    [17, 24, 39, 255],
+                    false,
+                );
+                self.draw_hud_text(
+                    &entry.name,
+                    (card_x + c_pad_x + 12 + 8) as f32,
+                    row_cy as f32,
+                    row_font,
+                    [243, 244, 246, 255],
+                );
+                let pct_str = format!("{:.1}%", entry.pct);
+                let pct_w = self.font.text_width(&pct_str, row_font);
+                let pct_x = (card_x + card_w - c_pad_x) as f32 - pct_w;
+                self.draw_hud_text(&pct_str, pct_x, row_cy as f32, row_font, [209, 213, 219, 255]);
+            }
+        }
+
+        // 3. Final-Frame Winner Callout Banner (on Hold Frames)
+        if let Some((winner_name, winner_pct)) = &hud.winner {
+            let banner_font = 15.5f32;
+            let banner_text = format!("VICTORY — {winner_name} ({winner_pct:.1}%)");
+            let text_w = self.font.text_width(&banner_text, banner_font).ceil() as i32;
+            let b_pad_x = 20;
+            let banner_w = text_w + b_pad_x * 2;
+            let banner_h = 34;
+            let banner_x = (self.out_w as i32 - banner_w) / 2;
+            let banner_y = self.out_h as i32 - banner_h - 18;
+            self.draw_hud_box(banner_x, banner_y, banner_w, banner_h, [17, 24, 39, 228], [231, 176, 8, 200], true);
+            self.draw_hud_text(
+                &banner_text,
+                (banner_x + b_pad_x) as f32,
+                banner_y as f32 + banner_h as f32 / 2.0,
+                banner_font,
+                [243, 244, 246, 255],
+            );
+        }
+    }
+
     /// Saves the last drawn frame as a PNG.
     pub fn save_png(&self, path: &str) -> Result<(), String> {
         self.canvas.save_png(path).map_err(|e| format!("writing {path}: {e}"))
     }
 
     /// Draws the current state; returns the frame as RGBA.
-    pub fn draw(&mut self, units: &[i32], labels: &[Label], nukes: &[(u32, u16, u16)], progress: f64) -> &[u8] {
+    pub fn draw(
+        &mut self,
+        units: &[i32],
+        labels: &[Label],
+        nukes: &[(u32, u16, u16)],
+        progress: f64,
+        hud: Option<&HudState>,
+    ) -> &[u8] {
         let mut lap = std::time::Instant::now();
         let mut step = |r: &mut Renderer, name: &'static str| {
             if let Some(p) = &mut r.profile {
@@ -1131,6 +1370,10 @@ impl Renderer {
         step(self, "units and structures");
         self.draw_names(labels);
         step(self, "names");
+        if let Some(h) = hud {
+            self.draw_hud(h);
+            step(self, "hud");
+        }
         self.frame_no += 1;
         if self.frame_no % 64 == 0 {
             let keep = self.frame_no.saturating_sub(64);

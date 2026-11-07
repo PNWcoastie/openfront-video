@@ -131,6 +131,10 @@ pub struct SamMissileExec {
 
 impl Game {
     pub fn new_nuke(&self, nuke_type: &'static str, player: usize, dst: u32, rocket_up: bool) -> Exec {
+        self.new_nuke_with_wait(nuke_type, player, dst, rocket_up, 0)
+    }
+
+    pub fn new_nuke_with_wait(&self, nuke_type: &'static str, player: usize, dst: u32, rocket_up: bool, wait_ticks: i64) -> Exec {
         Exec::Nuke(Box::new(NukeExec {
             active: true,
             nuke_type,
@@ -138,7 +142,7 @@ impl Game {
             dst,
             src: None,
             speed: -1.0,
-            wait_ticks: 0,
+            wait_ticks,
             rocket_up,
             nuke: None,
             curve: None,

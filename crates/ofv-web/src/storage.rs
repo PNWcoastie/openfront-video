@@ -104,6 +104,38 @@ impl Catalog {
                             }
                         }
                     }
+                    // Also bootstrap any bare `<id>.mp4` files in `dir` or `dir/videos/` without a `.json` file.
+                    for scan_dir in [dir.to_path_buf(), dir.join("videos")] {
+                        if let Ok(entries) = std::fs::read_dir(&scan_dir) {
+                            for e in entries.flatten() {
+                                let name = e.file_name().to_string_lossy().to_string();
+                                let Some(id) = name.strip_suffix(".mp4") else { continue };
+                                if !crate::valid_id(id) {
+                                    continue;
+                                }
+                                if videos.get(id).ok().flatten().is_some() {
+                                    continue;
+                                }
+                                let mp4_path = e.path();
+                                let Ok(mp4_meta) = std::fs::metadata(&mp4_path) else { continue };
+                                let t = mtime_secs(&mp4_path);
+                                let record = StoredVideoRecord {
+                                    id: id.to_string(),
+                                    map: "?".to_string(),
+                                    mode: "?".to_string(),
+                                    players: 0,
+                                    bytes: mp4_meta.len(),
+                                    render_secs: 0.0,
+                                    rendered: t,
+                                    last_used: t,
+                                    meta: Value::Null,
+                                };
+                                if let Ok(encoded) = serde_json::to_vec(&record) {
+                                    let _ = videos.insert(id, encoded.as_slice());
+                                }
+                            }
+                        }
+                    }
                 }
             }
             if let Ok(mut events) = write_txn.open_table(EVENTS_TABLE) {
@@ -203,13 +235,17 @@ impl Catalog {
         table.get(id).ok().flatten().is_some()
     }
 
-    /// Returns the stored JSON metadata for `id`, if present.
-    pub fn get_video_meta(&self, id: &str) -> Option<Value> {
+    /// Returns the full stored video record for `id`, if present.
+    pub fn get(&self, id: &str) -> Option<StoredVideoRecord> {
         let read_txn = self.db.begin_read().ok()?;
         let table = read_txn.open_table(VIDEOS_TABLE).ok()?;
         let guard = table.get(id).ok()??;
-        let record = serde_json::from_slice::<StoredVideoRecord>(guard.value()).ok()?;
-        Some(record.meta)
+        serde_json::from_slice::<StoredVideoRecord>(guard.value()).ok()
+    }
+
+    /// Returns the stored JSON metadata for `id`, if present.
+    pub fn get_video_meta(&self, id: &str) -> Option<Value> {
+        self.get(id).map(|r| r.meta).filter(|m| !m.is_null())
     }
 
     /// Lists all stored video records in `VIDEOS_TABLE` without filesystem syscalls.
@@ -224,6 +260,14 @@ impl Catalog {
             }
         }
         out
+    }
+
+    /// Lists up to `limit` most recently rendered video records in `VIDEOS_TABLE`, newest first.
+    pub fn list_recent(&self, limit: usize) -> Vec<StoredVideoRecord> {
+        let mut vids = self.list_videos();
+        vids.sort_by(|a, b| b.rendered.cmp(&a.rendered).then_with(|| b.last_used.cmp(&a.last_used)));
+        vids.truncate(limit);
+        vids
     }
 
     /// Appends a telemetry event to `EVENTS_TABLE`.

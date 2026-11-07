@@ -26,29 +26,46 @@ fn main() {
     if args.get(1).map(|s| s.as_str()) == Some("stream") {
         return stream_mode(&args[2..]);
     }
-    if args.len() < 5 {
-        eprintln!("usage: engine-rs <record.json> <OpenFrontIO dir> <ticks> <out.jsonl>");
+    if args.len() < 2 {
+        eprintln!("usage: engine-rs <record.json> [<OpenFrontIO dir> <ticks> <out.jsonl>]");
         std::process::exit(2);
     }
-    let record: Value = serde_json::from_str(&fs::read_to_string(&args[1]).expect("read record")).expect("parse record");
-    let engine_dir = Path::new(&args[2]);
-    let max_ticks: usize = args[3].parse().expect("ticks");
-    let out_path = &args[4];
+    let rec_path = if Path::new(&args[1]).exists() {
+        PathBuf::from(&args[1])
+    } else if let Some(stripped) = args[1].strip_prefix("replays/") {
+        let p = Path::new("..").join(stripped);
+        if p.exists() { p } else { PathBuf::from(&args[1]) }
+    } else {
+        PathBuf::from(&args[1])
+    };
+    let record: Value = serde_json::from_str(&fs::read_to_string(&rec_path).expect("read record")).expect("parse record");
+    let default_engine_dir = std::env::var("OPENFRONT_DIR").unwrap_or_else(|_| {
+        "/home/dr_floral_funk/Documents/antigravity/modest-rutherford/data/legacy_quarantine/repos/OpenFrontIO".to_string()
+    });
+    let engine_dir = Path::new(args.get(2).map(|s| s.as_str()).unwrap_or(&default_engine_dir));
+    let max_ticks: usize = args.get(3).map(|s| s.parse().expect("ticks")).unwrap_or(usize::MAX);
+    let out_path = args.get(4).map(|s| s.as_str()).unwrap_or("/dev/null");
 
     let t0 = std::time::Instant::now();
-    prof::ON.store(std::env::var("ENGINE_RS_PROFILE").is_ok(), std::sync::atomic::Ordering::Relaxed);
+    let bench = std::env::var("ENGINE_RS_BENCH").is_ok();
+    prof::ON.store(
+        std::env::var("ENGINE_RS_PROFILE").is_ok(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     let (mut game, turns) = setup(&record, &DirResources(engine_dir.to_path_buf()));
+    let archived = replay::archived_hashes(&record);
     let setup_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     // ENGINE_RS_BENCH=1: only the last state line, so the timing is the
     // simulation alone.
-    let bench = std::env::var("ENGINE_RS_BENCH").is_ok();
     let mut out = BufWriter::new(fs::File::create(out_path).expect("create output"));
     if !bench {
         writeln!(out, "{}", digest(&game, -1)).unwrap();
     }
     let t1 = std::time::Instant::now();
     let mut sim = std::time::Duration::ZERO;
+    let mut checked = 0u32;
+    let mut mismatches = 0u32;
     let n = max_ticks.min(turns.len());
     for (i, intents) in turns.iter().take(n).enumerate() {
         let s0 = std::time::Instant::now();
@@ -58,6 +75,12 @@ fn main() {
         }
         game.execute_next_tick();
         sim += s0.elapsed();
+        if let Some(&want) = archived.get(&i) {
+            checked += 1;
+            if want != game.hash() {
+                mismatches += 1;
+            }
+        }
         if !bench || i + 1 == n {
             writeln!(out, "{}", digest(&game, i as i64)).unwrap();
         }
@@ -83,11 +106,20 @@ fn main() {
             eprintln!("  {:<32} {:>8.1} ms", k, d.as_secs_f64() * 1000.0);
         }
     }
+    let sim_s = sim.as_secs_f64();
+    let s_per_min = if n > 0 { sim_s / (n as f64 / 600.0) } else { 0.0 };
     eprintln!(
-        "setup {:.0} ms, {} ticks: simulation {:.1} ms, total with state lines {:.0} ms",
+        "hashes: {}/{} matched (hashMismatches: {})",
+        checked.saturating_sub(mismatches),
+        checked,
+        mismatches
+    );
+    eprintln!(
+        "setup {:.0} ms, {} ticks: simulation {:.1} ms ({:.3} s/min), total with state lines {:.0} ms",
         setup_ms,
         n,
-        sim.as_secs_f64() * 1000.0,
+        sim_s * 1000.0,
+        s_per_min,
         t1.elapsed().as_secs_f64() * 1000.0
     );
 }

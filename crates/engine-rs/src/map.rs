@@ -3,7 +3,7 @@
 
 use crate::fxhash::FxHashSet;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Terrain {
     Plains,
     Highland,

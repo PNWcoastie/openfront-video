@@ -29,9 +29,9 @@ impl Game {
             return;
         }
         self.assert_nation_difficulty();
-        let easy = self.config.difficulty == "Easy";
         // hesitationOdds
-        if ne.random.next_int(0.0, if easy { 2.0 } else { 4.0 }) == 0.0 {
+        let odds = self.by_difficulty([2.0, 4.0, 8.0, 16.0]);
+        if ne.random.next_int(0.0, odds) == 0.0 {
             return;
         }
         let targets: Vec<usize> = self
@@ -50,18 +50,48 @@ impl Game {
             .collect();
         attackers.sort_by_key(|&q| std::cmp::Reverse(tiles(q)));
         let mut candidates: Vec<Option<usize>> = vec![attackers.first().copied()];
-        // selectVictoryDenialTarget (FFA: no teams): Easy 75%, Medium 65%
-        let scaled = self.map.num_land_tiles as usize * if easy { 75 } else { 65 };
+        // selectVictoryDenialTarget: Easy 75%, Medium 65%, Hard 55%, Impossible 40%
+        let threshold_pct = self.by_difficulty([75, 65, 55, 40]);
+        let scaled = self.map.num_land_tiles as usize * threshold_pct;
         let mut best: Option<usize> = None;
+        let mut best_severity: usize = 0;
         for &q in &targets {
             let t = tiles(q);
-            if t > 0 && t * 100 >= scaled && best.is_none_or(|b| t > tiles(b)) {
+            if t == 0 {
+                continue;
+            }
+            let severity = if !self.config.is_team_mode {
+                if t * 100 >= scaled { t } else { 0 }
+            } else if let Some(team) = self.players[q].team.as_deref() {
+                let mut team_territory = 0;
+                let mut largest_member = None;
+                let mut largest_tiles = 0;
+                for m in self.alive_players() {
+                    if self.players[m].team.as_deref() == Some(team) {
+                        let mt = tiles(m);
+                        team_territory += mt;
+                        if mt > largest_tiles {
+                            largest_tiles = mt;
+                            largest_member = Some(m);
+                        }
+                    }
+                }
+                if team_territory * 100 >= scaled && largest_member == Some(q) {
+                    team_territory
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            if severity > best_severity {
+                best_severity = severity;
                 best = Some(q);
             }
         }
         candidates.push(best);
-        // selectSteamrollStopTarget: Easy gap x2 and above 20 cities, Medium x1.5 and above 10
-        let (gap, min_cities) = if easy { (2.0, 20) } else { (1.5, 10) };
+        // selectSteamrollStopTarget
+        let (gap, min_cities) = self.by_difficulty([(2.0, 20), (1.5, 10), (1.25, 10), (1.15, 8)]);
         let mut steam = None;
         if !targets.is_empty() {
             let mut all: Vec<(usize, u32)> = self.alive_players().into_iter().map(|q| (q, self.unit_levels(q, CITY))).collect();
@@ -72,6 +102,22 @@ impl Game {
         }
         candidates.push(steam);
         // selectRivalTarget is Hard/Impossible only.
+        if self.lands_beachheads() {
+            let min_tiles = self.players[p].tiles.len() as f64 * 0.5;
+            let mut rival: Option<usize> = None;
+            for &q in &targets {
+                if self.is_friendly(p, q, false) || (tiles(q) as f64) < min_tiles {
+                    continue;
+                }
+                if rival.is_some_and(|b| tiles(q) <= tiles(b)) {
+                    continue;
+                }
+                if self.shares_border_with(p, self.players[q].small_id) {
+                    rival = Some(q);
+                }
+            }
+            candidates.push(rival);
+        }
         for target in candidates.into_iter().flatten() {
             let recent = self.nation_mirv_targets.get(&target).is_some_and(|&t| (self.ticks as i64 - t as i64) < 300);
             if !recent && self.mirv_gets_through(p, target) {
@@ -301,6 +347,16 @@ impl Game {
     /// isTrajectoryInterceptableBySam: whether an enemy SAM covers the bomb's flight
     /// outside its untargetable mid-air stretch.
     pub(super) fn is_trajectory_interceptable_by_sam(&self, p: usize, spawn: u32, target: u32) -> bool {
+        self.is_trajectory_interceptable_by_sam_excluding(p, spawn, target, &[])
+    }
+
+    pub(super) fn is_trajectory_interceptable_by_sam_excluding(
+        &self,
+        p: usize,
+        spawn: u32,
+        target: u32,
+        excluded_sam_ids: &[u32],
+    ) -> bool {
         if self.type_units(SAM_LAUNCHER).is_empty() {
             return false;
         }
@@ -334,6 +390,9 @@ impl Game {
             if self.any_nearby_unit(t, 150, &[SAM_LAUNCHER], |sam, d2| {
                 let owner = self.units[sam].owner;
                 if owner == p || self.is_friendly(p, owner, false) {
+                    return false;
+                }
+                if excluded_sam_ids.contains(&self.units[sam].id) {
                     return false;
                 }
                 let range = Self::sam_range(self.units[sam].level);
@@ -477,7 +536,8 @@ impl Game {
             return;
         }
         let structures = self.player_units_of_types(target, &[CITY, DEFENSE_POST, SAM_LAUNCHER, MISSILE_SILO, PORT, FACTORY]);
-        let random_tiles = self.rand_territory_tiles(&mut ne.random, target, 10);
+        let num_random = if self.config.difficulty == "Impossible" { 30 } else { 10 };
+        let random_tiles = self.rand_territory_tiles(&mut ne.random, target, num_random);
         let mut candidates: Vec<u32> = Vec::new();
         for t in random_tiles.into_iter().chain(structures.iter().map(|&u| self.units[u].tile)) {
             if !candidates.contains(&t) {
@@ -491,12 +551,15 @@ impl Game {
         }
         for t in types {
             if let Some(tile) = self.find_best_nuke_tile(ne, t, target, &candidates, &silos, &structures, strike) {
-                self.send_nation_nuke(ne, tile, t, target);
+                self.send_nation_nuke(ne, tile, t, target, 0);
                 if strike && self.lands_beachheads() {
                     ne.nukes.strikes.push(Strike { target, tile, tick: self.ticks, nuke: None });
                 }
                 return;
             }
+        }
+        if self.config.difficulty == "Impossible" && !saving {
+            self.maybe_destroy_enemy_sam(ne, target);
         }
     }
 
@@ -532,8 +595,24 @@ impl Game {
         if let Some(t) = self.find_teammate_fight_target(p) {
             return Some(t);
         }
+        // On Impossible in FFA, if the crown is near winning (>50% of non-fallout land), prioritize stopping them before offensive strikes.
+        if self.config.difficulty == "Impossible" && !self.config.is_team_mode {
+            let no_fallout = self.map.num_land_tiles as f64 - self.map.num_tiles_with_fallout() as f64;
+            if no_fallout > 0.0 {
+                let mut sorted = self.alive_players();
+                sorted.sort_by(|&a, &b| self.players[b].tiles.len().cmp(&self.players[a].tiles.len()));
+                if let Some(&crown) = sorted.first() {
+                    if crown != p && !self.is_friendly(p, crown, false) {
+                        let crown_share = self.players[crown].tiles.len() as f64 / no_fallout;
+                        if crown_share > 0.5 {
+                            return Some(crown);
+                        }
+                    }
+                }
+            }
+        }
         // findStrikeTarget: Medium a player we're attacking about as strong as us,
-        // Hard the strongest such neighbor it can follow up on.
+        // Hard & Impossible the strongest such neighbor it can follow up on.
         let mine = self.players[p].troops_f();
         let candidate =
             |t: usize| self.players[t].info.player_type != PlayerType::Bot && !self.is_friendly(p, t, false) && self.players[t].troops_f() >= mine * 0.5;
@@ -561,6 +640,15 @@ impl Game {
                 if best.is_some() {
                     return best;
                 }
+            }
+        }
+        // On Impossible, the richest nation targets high-structure-density players 50% of the time.
+        if self.config.difficulty == "Impossible"
+            && self.is_richest_nation(p)
+            && ne.random.next_int(0.0, 2.0) == 0.0
+        {
+            if let Some(dense) = self.find_high_density_target(p) {
+                return Some(dense);
             }
         }
         // Allies' targets
@@ -718,7 +806,7 @@ impl Game {
                 continue;
             }
             let value = self.nuke_tile_score(ne, tile, silos, structures, t);
-            if value < 0.0 {
+            if if self.config.difficulty == "Impossible" && !strike { value <= 0.0 } else { value < 0.0 } {
                 continue;
             }
             scored.push((tile, value + coverage * 50_000.0));
@@ -801,6 +889,21 @@ impl Game {
         if self.config.difficulty == "Medium" && targets.iter().any(|&u| self.units[u].type_name == SAM_LAUNCHER && self.dist2(tile, self.units[u].tile) <= 2500) {
             return -1.0;
         }
+        // On Impossible with H-bomb, boost score for nearby SAMs (< level 5) that can be destroyed from outside their interception range.
+        if self.config.difficulty == "Impossible" && t == HYDROGEN_BOMB {
+            let outer = Self::nuke_magnitude(HYDROGEN_BOMB).1;
+            for (sam, d2) in self.nearby_units(tile, outer, &[SAM_LAUNCHER]) {
+                let level = self.units[sam].level;
+                if level >= 5 {
+                    continue;
+                }
+                let sam_range = Self::sam_range(level);
+                let dist = (d2 as f64).sqrt();
+                if dist > sam_range {
+                    value += 100_000.0 * level as f64;
+                }
+            }
+        }
         let silo_tiles: Vec<u32> = silos.iter().map(|&s| self.units[s].tile).collect();
         let (closest, _) = closest_two_tiles(&self.map, &silo_tiles, &[tile]).expect("Missing result");
         let dist = (self.dist2(tile, closest) as f64).sqrt();
@@ -819,7 +922,7 @@ impl Game {
         value - recent
     }
 
-    pub(super) fn send_nation_nuke(&mut self, ne: &mut NationExec, tile: u32, t: &'static str, target: usize) {
+    pub(super) fn send_nation_nuke(&mut self, ne: &mut NationExec, tile: u32, t: &'static str, target: usize, wait_ticks: i64) {
         let tick = self.ticks;
         ne.nukes.recent.push((tick, tile, t));
         let perceived = self.inflated_nuke_cost(ne, t);
@@ -831,8 +934,273 @@ impl Game {
             ne.nukes.hydro_last_launch = Some(tick);
         }
         let p = ne.player.unwrap();
-        let e = self.new_nuke(t, p, tile, true);
+        let e = self.new_nuke_with_wait(t, p, tile, true, wait_ticks);
         self.add_execution(e);
         self.emoji_maybe_send(ne, target, &["☢️", "💥"]);
+    }
+
+    pub(super) fn is_richest_nation(&self, p: usize) -> bool {
+        let my_gold = self.players[p].gold;
+        for q in self.alive_players() {
+            if q != p && self.players[q].info.player_type == PlayerType::Nation && self.players[q].gold > my_gold {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub(super) fn find_high_density_target(&self, p: usize) -> Option<usize> {
+        let mut best = None;
+        let mut best_density = 1.0 / 75.0;
+        for q in self.alive_players() {
+            if self.players[q].info.player_type == PlayerType::Bot || self.is_friendly(p, q, false) {
+                continue;
+            }
+            let tiles = self.players[q].tiles.len();
+            if tiles == 0 {
+                continue;
+            }
+            let level_sum = self.structure_levels(q);
+            if level_sum < 5 {
+                continue;
+            }
+            let density = level_sum as f64 / tiles as f64;
+            if density > best_density {
+                best_density = density;
+                best = Some(q);
+            }
+        }
+        best
+    }
+
+    /// On Impossible, when no spot is worth a nuke, overwhelm one of the target's SAMs with atom bombs.
+    pub(super) fn maybe_destroy_enemy_sam(&mut self, ne: &mut NationExec, target: usize) {
+        let p = ne.player.unwrap();
+        if !self.player_units_of(p, ATOM_BOMB).is_empty() {
+            return;
+        }
+        let (salvo, failed) = self.plan_sam_salvo(p, target);
+        if let Some((target_tile, wait_ticks)) = salvo {
+            for w in wait_ticks {
+                self.send_nation_nuke(ne, target_tile, ATOM_BOMB, target, w);
+            }
+            return;
+        }
+        if let Some((target_tile, covering_sam_ids, total_bombs)) = failed {
+            if let Some(silo) = self.silo_to_upgrade_for_salvo(p, target_tile, &covering_sam_ids, total_bombs) {
+                let id = self.units[silo].id;
+                self.add_execution(Exec::UpgradeStructure { player: p, unit_id: id, amount: 1 });
+            }
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub(super) fn plan_sam_salvo(
+        &self,
+        p: usize,
+        target: usize,
+    ) -> (Option<(u32, Vec<i64>)>, Option<(u32, Vec<u32>, usize)>) {
+        let atom_cost = self.unit_cost(p, ATOM_BOMB);
+        let mut enemy_sams = self.player_units_of(target, SAM_LAUNCHER);
+        if enemy_sams.is_empty() {
+            return (None, None);
+        }
+        let our_silos: Vec<usize> = self
+            .player_units_of(p, MISSILE_SILO)
+            .into_iter()
+            .filter(|&s| !self.units[s].under_construction)
+            .collect();
+        if our_silos.is_empty() {
+            return (None, None);
+        }
+        enemy_sams.sort_by_key(|&s| self.units[s].level);
+        let mut failed: Option<(u32, Vec<u32>, usize)> = None;
+        let max_total_arrival_spread: i64 = 45; // Math.floor(SAMCooldown(90) / 2)
+
+        for target_sam in enemy_sams {
+            let target_tile = self.units[target_sam].tile;
+            if self.blast_hits_friendly_land(p, target_tile, ATOM_BOMB, 0) {
+                continue;
+            }
+            let covering_sams = self.find_enemy_sams_covering_tile(p, target_tile);
+            let covering_sam_ids: Vec<u32> = covering_sams.iter().map(|&s| self.units[s].id).collect();
+            let total_interceptions: usize = covering_sams.iter().map(|&s| self.units[s].level as usize).sum();
+            let bombs_needed = total_interceptions + 1;
+
+            let mut all_available_silos: Vec<(usize, usize, i64, bool)> = Vec::new();
+            for &silo in &our_silos {
+                let used = self.units[silo].missile_timers.len();
+                let level = self.units[silo].level as usize;
+                if level <= used {
+                    continue;
+                }
+                let available_slots = level - used;
+                let silo_tile = self.units[silo].tile;
+                let interceptable = self.is_trajectory_interceptable_by_sam_excluding(
+                    p,
+                    silo_tile,
+                    target_tile,
+                    &covering_sam_ids,
+                );
+                let pts = self.parabola_points(silo_tile, target_tile, true);
+                let flight_ticks = Curve::new(pts, 10.0).points.len() as i64;
+                if flight_ticks == 0 {
+                    continue;
+                }
+                all_available_silos.push((silo, available_slots, flight_ticks, interceptable));
+            }
+            all_available_silos.sort_by_key(|&(silo, _, _, _)| self.map.manhattan_dist(self.units[silo].tile, target_tile));
+
+            let mut launch_sequence: Vec<(i64, bool)> = Vec::new();
+            for &(_, slots, flight_ticks, interceptable) in &all_available_silos {
+                for _ in 0..slots {
+                    launch_sequence.push((flight_ticks, interceptable));
+                }
+            }
+
+            let extra_bombs = bombs_needed / 5;
+            let total_bombs = bombs_needed + extra_bombs;
+
+            let mut unblocked_bombs: Vec<(usize, i64)> = Vec::new();
+            for (i, &(flight_ticks, interceptable)) in launch_sequence.iter().enumerate() {
+                if !interceptable {
+                    unblocked_bombs.push((i, flight_ticks));
+                }
+            }
+            if unblocked_bombs.len() < total_bombs {
+                if failed.is_none() {
+                    failed = Some((target_tile, covering_sam_ids, total_bombs));
+                }
+                continue;
+            }
+
+            let mut sorted_by_flight = unblocked_bombs;
+            sorted_by_flight.sort_by_key(|&(_, ft)| ft);
+
+            let mut best_window_start = 0;
+            let mut best_window_count = 0;
+            for start in 0..sorted_by_flight.len() {
+                let mut end = start;
+                while end < sorted_by_flight.len()
+                    && sorted_by_flight[end].1 - sorted_by_flight[start].1 <= max_total_arrival_spread
+                {
+                    end += 1;
+                }
+                if end - start > best_window_count {
+                    best_window_count = end - start;
+                    best_window_start = start;
+                }
+            }
+            if best_window_count < total_bombs {
+                if failed.is_none() {
+                    failed = Some((target_tile, covering_sam_ids, total_bombs));
+                }
+                continue;
+            }
+
+            let mut window_by_index = sorted_by_flight[best_window_start..best_window_start + best_window_count].to_vec();
+            window_by_index.sort_by_key(|&(idx, _)| idx);
+            let selected = &window_by_index[..total_bombs];
+            let last_selected_index = selected[selected.len() - 1].0;
+            let bombs_to_fire = last_selected_index + 1;
+
+            let selected_flight_min = selected.iter().map(|&(_, ft)| ft).min().unwrap_or(0);
+            let stagger_interval = (max_total_arrival_spread / total_bombs as i64).max(1);
+            let mut selected_idx = 0;
+            let mut wait_ticks_per_bomb = Vec::with_capacity(bombs_to_fire);
+            for (i, &(ft, _)) in launch_sequence.iter().enumerate().take(bombs_to_fire) {
+                if selected_idx < selected.len() && selected[selected_idx].0 == i {
+                    let target_arrival = selected_flight_min + (selected_idx as i64) * stagger_interval;
+                    wait_ticks_per_bomb.push((target_arrival - ft).max(0));
+                    selected_idx += 1;
+                } else {
+                    wait_ticks_per_bomb.push(0);
+                }
+            }
+
+            let total_cost = atom_cost * bombs_to_fire as i64;
+            if self.players[p].gold < total_cost {
+                continue;
+            }
+            return (Some((target_tile, wait_ticks_per_bomb)), failed);
+        }
+        (None, failed)
+    }
+
+    pub(super) fn find_enemy_sams_covering_tile(&self, p: usize, tile: u32) -> Vec<usize> {
+        let mut result = Vec::new();
+        for (sam, d2) in self.nearby_units(tile, 150, &[SAM_LAUNCHER]) {
+            let owner = self.units[sam].owner;
+            if owner == p || self.is_friendly(p, owner, false) {
+                continue;
+            }
+            let range = Self::sam_range(self.units[sam].level);
+            if d2 as f64 <= range * range {
+                result.push(sam);
+            }
+        }
+        result
+    }
+
+    pub(super) fn silo_to_upgrade_for_salvo(
+        &self,
+        p: usize,
+        target_tile: u32,
+        covering_sam_ids: &[u32],
+        total_bombs: usize,
+    ) -> Option<usize> {
+        const MAX_NATION_SILO_UPGRADE_LEVEL: u32 = 5;
+        let silos = self.player_units_of(p, MISSILE_SILO);
+        if silos.is_empty() {
+            return None;
+        }
+        let unblocked: Vec<usize> = silos
+            .into_iter()
+            .filter(|&silo| {
+                !self.is_trajectory_interceptable_by_sam_excluding(
+                    p,
+                    self.units[silo].tile,
+                    target_tile,
+                    covering_sam_ids,
+                )
+            })
+            .collect();
+        if unblocked.is_empty() {
+            return None;
+        }
+        if unblocked.len() * (MAX_NATION_SILO_UPGRADE_LEVEL as usize) < total_bombs {
+            return None;
+        }
+        let our_sams = self.player_units_of(p, SAM_LAUNCHER);
+        let mut best_silo = None;
+        let mut best_protection: i64 = -1;
+        let silo_cost = self.unit_cost(p, MISSILE_SILO);
+        for silo in unblocked {
+            let u = &self.units[silo];
+            if u.level >= MAX_NATION_SILO_UPGRADE_LEVEL {
+                continue;
+            }
+            let can_upgrade = silo_cost <= self.players[p].gold
+                && self.players[p].is_alive()
+                && !u.under_construction
+                && u.deletion_at.is_none()
+                && u.owner == p;
+            if !can_upgrade {
+                continue;
+            }
+            let mut protection: i64 = 0;
+            for &sam in &our_sams {
+                let range = Self::sam_range(self.units[sam].level);
+                let d2 = self.dist2(u.tile, self.units[sam].tile) as f64;
+                if d2 <= range * range {
+                    protection += self.units[sam].level as i64;
+                }
+            }
+            if protection > best_protection {
+                best_protection = protection;
+                best_silo = Some(silo);
+            }
+        }
+        best_silo
     }
 }

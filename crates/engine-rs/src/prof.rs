@@ -1,13 +1,14 @@
 //! ENGINE_RS_PROFILE: time spent in named scopes, for finding hot spots.
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+use crate::fxhash::FxHashMap;
 
 pub static ON: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
-    static TIMES: RefCell<HashMap<&'static str, (Duration, u64)>> = RefCell::new(HashMap::new());
+    static TIMES: RefCell<FxHashMap<&'static str, (Duration, u64)>> = RefCell::new(FxHashMap::default());
 }
 
 pub struct Scope(&'static str, Option<Instant>);
