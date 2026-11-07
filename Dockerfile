@@ -28,19 +28,16 @@ RUN git init -q OpenFrontIO \
 # and the compressed maps stay built). The binaries are copied out of the
 # cache in the same step, since the cache isn't part of the image. Debug info
 # only slows the link here.
-ENV CARGO_PROFILE_RELEASE_DEBUG=false
-COPY engine-rs engine-rs
+ENV CARGO_PROFILE_RELEASE_DEBUG=false \
+    OPENFRONT_ENGINE=/src/OpenFrontIO
+COPY Cargo.toml Cargo.lock ./
+COPY crates crates
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/src/engine-rs/target \
-    cd engine-rs && cargo build --release --locked --bin openfront-video \
- && mkdir -p /out && cp target/release/openfront-video /out/
-COPY web web
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/src/web/target \
-    cd web && cargo build --release --locked \
- && cp target/release/openfront-web /out/
+    --mount=type=cache,target=/src/target \
+    cargo build --release --locked -p ofv-render --bin openfront-video -p openfront-web --bin openfront-web \
+ && mkdir -p /out \
+ && cp target/release/openfront-video target/release/openfront-web /out/
 
 # Node, git and ffmpeg run render.ts, the TypeScript fallback for games from
 # engine versions the Rust build doesn't follow: the server checks that version

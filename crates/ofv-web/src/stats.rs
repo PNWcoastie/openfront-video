@@ -1,12 +1,11 @@
 //! The admin dashboard: an event log of renders, views and cleanups
-//! (DATA_DIR/events.jsonl, 30 days kept), and /admin with its JSON stats.
-//! /admin needs ADMIN_PASSWORD (HTTP basic auth, any user name); without it
+//! (`DATA_DIR/catalog.redb`, 30 days kept), and `/admin` with its JSON stats.
+//! `/admin` needs `ADMIN_PASSWORD` (HTTP basic auth, any user name); without it
 //! the dashboard is off.
 
-use std::collections::{HashMap, VecDeque};
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
@@ -15,6 +14,7 @@ use axum::response::{Html, IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::storage::{Catalog, StoredVideoRecord};
 use crate::App;
 
 const KEEP: u64 = 30 * 24 * 3600;
@@ -45,7 +45,7 @@ pub enum Event {
 }
 
 impl Event {
-    fn t(&self) -> u64 {
+    pub fn t(&self) -> u64 {
         match self {
             Event::Render { t, .. } | Event::View { t, .. } | Event::Cleanup { t, .. } => *t,
         }
@@ -53,8 +53,7 @@ impl Event {
 }
 
 pub struct EventLog {
-    path: PathBuf,
-    events: Mutex<VecDeque<Event>>,
+    catalog: Arc<Catalog>,
     /// Secret mixed into visitor hashes, kept in DATA_DIR/.visitor-salt.
     salt: u64,
 }
@@ -117,31 +116,13 @@ fn load_salt(dir: &Path) -> u64 {
 }
 
 impl EventLog {
-    /// Loads the log, drops events older than 30 days and rewrites the file.
-    pub fn open(dir: &Path) -> EventLog {
-        let path = dir.join("events.jsonl");
-        let cutoff = now_secs().saturating_sub(KEEP);
-        let events: VecDeque<Event> = std::fs::read_to_string(&path)
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|l| serde_json::from_str::<Event>(l).ok())
-            .filter(|e| e.t() >= cutoff)
-            .collect();
-        let text: String = events.iter().map(|e| serde_json::to_string(e).unwrap() + "\n").collect();
-        let _ = std::fs::write(&path, text);
-        EventLog { path, events: Mutex::new(events), salt: load_salt(dir) }
+    /// Connects the event log to the `redb` catalog and loads the visitor salt.
+    pub fn open(dir: &Path, catalog: Arc<Catalog>) -> EventLog {
+        EventLog { catalog, salt: load_salt(dir) }
     }
 
     pub fn record(&self, e: Event) {
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&self.path) {
-            let _ = writeln!(f, "{}", serde_json::to_string(&e).unwrap());
-        }
-        let mut events = self.events.lock().unwrap();
-        let cutoff = now_secs().saturating_sub(KEEP);
-        while events.front().is_some_and(|e| e.t() < cutoff) {
-            events.pop_front();
-        }
-        events.push_back(e);
+        self.catalog.append_event(&e);
     }
 
     pub fn render(&self, id: &str, auto: bool, outcome: &str, secs: f64, msg: &str) {
@@ -227,47 +208,6 @@ pub async fn page(headers: HeaderMap) -> Response {
     ([(header::CACHE_CONTROL, "no-store")], Html(include_str!("admin.html"))).into_response()
 }
 
-struct Stored {
-    id: String,
-    map: String,
-    mode: String,
-    players: u64,
-    bytes: u64,
-    render_secs: f64,
-    rendered: u64,
-    last_used: u64,
-}
-
-fn mtime(p: &Path) -> u64 {
-    std::fs::metadata(p).and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs())
-}
-
-fn stored_games(dir: &Path) -> Vec<Stored> {
-    let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else { return out };
-    for e in entries.flatten() {
-        let name = e.file_name().to_string_lossy().to_string();
-        let Some(id) = name.strip_suffix(".json") else { continue };
-        if !crate::valid_id(id) {
-            continue;
-        }
-        let Ok(text) = std::fs::read(e.path()) else { continue };
-        let Ok(meta) = serde_json::from_slice::<Value>(&text) else { continue };
-        let size = |ext: &str| std::fs::metadata(dir.join(format!("{id}.{ext}"))).map_or(0, |m| m.len());
-        out.push(Stored {
-            id: id.to_string(),
-            map: meta["map"].as_str().unwrap_or("?").to_string(),
-            mode: meta["mode"].as_str().unwrap_or("?").to_string(),
-            players: meta["players"].as_u64().unwrap_or(0),
-            bytes: size("mp4") + size("png") + text.len() as u64,
-            render_secs: meta["renderSeconds"].as_f64().unwrap_or(0.0),
-            rendered: mtime(&dir.join(format!("{id}.mp4"))),
-            last_used: mtime(&e.path()),
-        });
-    }
-    out
-}
-
 pub async fn api(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
     if let Some(r) = guard(&headers) {
         return r;
@@ -279,8 +219,8 @@ pub async fn api(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
 
 fn build(app: &App) -> Value {
     let now = now_secs();
-    let games = stored_games(&app.dir);
-    let events: Vec<Event> = app.events.events.lock().unwrap().iter().cloned().collect();
+    let games = app.catalog.list_videos();
+    let events = app.catalog.list_events(now.saturating_sub(KEEP));
     let used: u64 = games.iter().map(|g| g.bytes).sum();
 
     // Hourly buckets, oldest first, over the last 48 hours.
@@ -433,12 +373,12 @@ fn build(app: &App) -> Value {
     let mut modes: Vec<_> = modes.into_iter().collect();
     modes.sort_by(|a, b| b.1.cmp(&a.1));
 
-    let mut by_views: Vec<&Stored> = games.iter().collect();
+    let mut by_views: Vec<&StoredVideoRecord> = games.iter().collect();
     by_views.sort_by(|a, b| {
-        let v = |g: &Stored| views_by_game.get(&g.id).copied().unwrap_or(0);
+        let v = |g: &StoredVideoRecord| views_by_game.get(&g.id).copied().unwrap_or(0);
         v(b).cmp(&v(a)).then(b.last_used.cmp(&a.last_used))
     });
-    let game_json = |g: &Stored| {
+    let game_json = |g: &StoredVideoRecord| {
         json!({
             "id": g.id, "map": g.map, "mode": g.mode, "players": g.players, "bytes": g.bytes,
             "render_secs": g.render_secs, "rendered": g.rendered, "last_used": g.last_used,
@@ -451,22 +391,22 @@ fn build(app: &App) -> Value {
 
     let auto = app.auto_status.lock().unwrap();
     let queue_value = {
-            let recent: Vec<Value> = events
-                .iter()
-                .rev()
-                .filter_map(|e| match e {
-                    Event::Render { t, id, auto, outcome, .. } if outcome != "preempted" => {
-                        Some(json!({"id": id, "t": t, "auto": auto, "outcome": outcome}))
-                    }
-                    _ => None,
-                })
-                .take(12)
-                .collect();
-            json!({
-                "waiting": auto.queue.iter().map(|(id, ended)| json!({"id": id, "ended": ended})).collect::<Vec<_>>(),
-                "recent": recent,
+        let recent: Vec<Value> = events
+            .iter()
+            .rev()
+            .filter_map(|e| match e {
+                Event::Render { t, id, auto, outcome, .. } if outcome != "preempted" => {
+                    Some(json!({"id": id, "t": t, "auto": auto, "outcome": outcome}))
+                }
+                _ => None,
             })
-        };
+            .take(12)
+            .collect();
+        json!({
+            "waiting": auto.queue.iter().map(|(id, ended)| json!({"id": id, "ended": ended})).collect::<Vec<_>>(),
+            "recent": recent,
+        })
+    };
     let avg = if render_secs24.is_empty() { 0.0 } else { render_secs24.iter().sum::<f64>() / render_secs24.len() as f64 };
     json!({
         "now": now,

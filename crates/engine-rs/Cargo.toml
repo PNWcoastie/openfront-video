@@ -1,0 +1,11 @@
+[package]
+name = "engine-rs"
+version.workspace = true
+edition.workspace = true
+description = "Pure Sans-IO Rust port of the OpenFront.io simulation engine, verified tick by tick against the TypeScript engine"
+
+[dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

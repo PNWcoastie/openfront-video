@@ -85,13 +85,21 @@ and pass that file instead.
 | `--threads <n>` | cached: a third of the CPU cores, at most 6; `--rust`: 2 | Drawing threads for cached games and `--rust` |
 | `--rust <exe>` | off | Simulate with engine-rs (the Rust port) instead of the TypeScript engine; no cache |
 
+## Workspace layout
+
+The Rust code lives in a three-crate Cargo workspace (`#![forbid(unsafe_code)]` throughout):
+
+- `crates/engine-rs/` — Pure deterministic simulation engine (`engine-rs` library and CLI harness), with zero graphics or network dependencies (`cargo check -p engine-rs` runs in under a second).
+- `crates/ofv-render/` — The standalone `openfront-video` binary (`draw.rs`, `encode.rs`, `look.rs`, `fetch.rs`, and `build.rs` for the embedded map pack, sprite atlases, and font).
+- `crates/ofv-web/` — The `openfront-web` HTTP service (`axum` + embedded `redb` catalog in `DATA_DIR/catalog.redb`).
+
 ## Rendering with the Rust engine
 
-`engine-rs/` is a Rust port of the simulation (see its README). Build it once with
-`cargo build --release` in `engine-rs/`, then pass the binary:
+`crates/engine-rs/` is a Rust port of the simulation (see its README). Build it once with
+`cargo build --release -p engine-rs`, then pass the binary:
 
 ```bash
-node --import tsx ../render.ts ../cAj8yxzNsH.json --engine . --rust ../engine-rs/target/release/engine-rs.exe
+node --import tsx ../render.ts ../cAj8yxzNsH.json --engine . --rust ../target/release/engine-rs
 ```
 
 render.ts starts `engine-rs stream`, which simulates the game and writes, at each
@@ -122,33 +130,33 @@ ported yet, such as Impossible nations, stops it with "... is not ported yet".
 
 ## openfront-video: one self-contained binary
 
-`openfront-video` does the whole job in Rust: it fetches the game, simulates it with
-engine-rs, draws the frames like render.ts and encodes the MP4 itself. It needs no
+`openfront-video` (`crates/ofv-render/`) does the whole job in Rust: it fetches the game, simulates it with
+`engine-rs`, draws the frames like `render.ts` and encodes the MP4 itself. It needs no
 Node, no ffmpeg and no OpenFrontIO checkout at run time. Maps, tribe names, the
 client's theme and render settings, the sprite atlases and the name font are built
-into the 77 MB executable.
+into the executable.
 
 ```bash
 cargo build --release --bin openfront-video
 ```
 
 ```bash
-./engine-rs/target/release/openfront-video https://openfront.io/w12/game/cLoKY3fNLi
+./target/release/openfront-video https://openfront.io/w12/game/cLoKY3fNLi
 ```
 
 Building needs the OpenFrontIO checkout at `../OpenFrontIO` (or `$OPENFRONT_ENGINE`),
 at the engine commit the port follows, and a C++ compiler for OpenH264. The first
-build takes a few minutes because every map is compressed. It takes a game link, a
+build takes a few minutes because every map is compressed (cached across rebuilds in `OUT_DIR`). It takes a game link, a
 game ID or a record file (`.json` or `.json.gz`). Options: `--out`, `--seconds`,
 `--fps`, `--width` and `--hold` as in render.ts, plus `--bitrate <Mbit/s>` (default 6),
-`--threads <n>` for the encoder (default 4) and `--strict`.
+`--threads <n>` for the encoder (hardware-adaptive default), `--thumbnail <file>`, `--meta <file>`, `--preview-meta <file>`, `--same-engine` and `--strict`.
 
-It runs on three threads. The simulation passes each frame's changes to a drawing
+It runs on three threads with a recycled frame buffer pool. The simulation passes each frame's changes to a drawing
 thread through a queue of 10 frames and waits whenever the queue is full, so it never
 gets more than 10 frames ahead of drawing. The drawing thread passes finished frames to
 an encoding thread. Drawing uses tiny-skia, and text is shaped with rustybuzz, so
-kerning matches the canvas. Text lines and unit sprites are drawn once per quarter-pixel
-offset and then copied in. Frames look the same as render.ts's, up to anti-aliasing
+kerning matches the canvas. Text lines, outlines and unit sprites are cached per quarter-pixel
+offset and blitted directly onto dirty canvas regions. Frames look the same as render.ts's, up to anti-aliasing
 and encoder differences, including team colors, player cosmetics and fallout.
 On top of what render.ts drew, it shows the game client's status icons above names
 (crown for the largest player, traitor, disconnected, nuke in flight, doomsday skull,
@@ -159,24 +167,16 @@ The video is H.264 from OpenH264 (BSD-licensed), compiled in, with BT.709 colors
 a weaker encoder than x264: at the default 6 Mbit/s the 32-second test video is about
 21 MB where x264 made 9.7 MB, and it looks about as sharp. At 3 Mbit/s fine terrain
 detail goes. Without NASM installed at build time OpenH264 has no assembly, so it
-encodes frames as slices on 4 threads to keep pace with the simulation. Characters
+encodes frames as slices across encoder threads to keep pace with the simulation. Characters
 the Overpass font lacks (CJK or emoji in names, say) are left out, since only that
 one font is built in.
 
-cLoKY3fNLi (34 min, 35 players and 400 bots) takes 15.9 s (0.46 s/min) against
-17.4 s (0.50 s/min) for render.ts `--rust`, timed back to back. cAj8yxzNsH (17 min,
-7 teams) takes about 15.5 s (0.90 s/min).
-
-The simulation is still the slowest stage. It runs about 15 s inside a render against
-12 s alone, because it shares the CPU with drawing and encoding.
-
-`--thumbnail <file>` also saves the last frame as a PNG, and `--meta <file>` writes the
-game's and video's details as JSON. The MP4 is written with its index at the front,
-like ffmpeg's `+faststart`, so playback starts before the download finishes.
+`--thumbnail <file>` saves the last frame as a PNG, `--meta <file>` writes the
+game's and video's details as JSON once rendering finishes, and `--preview-meta <file>` writes the initial game metadata JSON immediately after loading the replay (~0.15 s) so the web service can answer link previewers before the video finishes encoding. The MP4 is assembled in memory and written with its index at the front (`+faststart`), so playback starts before the download finishes.
 
 ## openfront.video (web service)
 
-`web/` is a small server (axum) around `openfront-video`, and the `Dockerfile` builds
+`crates/ofv-web/` is a small server (axum + embedded `redb` catalog) around `openfront-video`, and the `Dockerfile` builds
 both:
 
 ```bash
@@ -198,10 +198,11 @@ crates. Put a TLS-terminating proxy (Caddy, nginx, Cloudflare) in front for
 | `/game/<id>`, also `/<anything>/game/<id>` | the game's page with the video. Swapping `openfront.io` for `openfront.video` in a game link works |
 | `/video/<id>.mp4` | the video, with byte ranges |
 | `/thumb/<id>.png` | the last frame |
+| `POST /api/v1/render` | optional bearer-authenticated endpoint (`RENDER_API_TOKEN`) for bots to queue or pre-warm a game render |
 | `/health` | `ok` |
 
 The first request for a game starts its render. Afterwards the video, thumbnail and
-details (`<id>.mp4`, `.png`, `.json` in `/data`) are served from disk, with year-long
+details (`<id>.mp4`, `.png`, `.json` in `/data`, indexed in `/data/catalog.redb`) are served from disk, with year-long
 cache headers since a game's video never changes. Renders write to temporary files
 and are moved into place only when complete. A game renders once even when many
 requests arrive together, and at most `MAX_RENDERS` games render at a time. A failed
@@ -212,10 +213,13 @@ The page carries Open Graph and Twitter player tags (`og:type video.other`,
 `og:video` with type and size, `og:image` = the thumbnail), which is what Discord
 needs to show a playable video in the embed. People get the page immediately: it
 reloads every 5 s until the video is ready. Link previewers (Discordbot and others,
-recognized by user agent) are instead held for up to `EMBED_WAIT_SECS` for the render
-to finish. Discord stops waiting at some point, and a game takes 20–40 s to render. A
-link posted before its video exists may therefore embed as a plain card, and Discord
-caches that card for a while. Opening the page first, then sharing it, always embeds.
+recognized by user agent) receive the full `og:video` Open Graph HTML page as soon as
+`--preview-meta` writes the game's metadata (~0.15 s after fetching the replay), so
+Discord's link scraper gets an immediate `<0.3 s` response and then opens a separate
+request to `/video/<id>.mp4` (which waits up to `VIDEO_WAIT_SECS` for the finished MP4).
+If the preview metadata isn't ready yet, link previewers get `503 Service Unavailable`
+with `Retry-After: 5` rather than a `200 OK` placeholder page, so Discord never caches
+a text-only card.
 
 ### Deploying with HTTPS
 
@@ -279,18 +283,18 @@ request waits for a render in progress), `MAX_STORAGE_GB` (35), `OPENFRONT_VIDEO
 
 ### Games from other engine versions
 
-The Rust renderer follows the engine versions in `replay::ENGINE_COMMITS`. A game
-played on any other version, an older one or a release newer than the build, goes to
-the TypeScript engine at the exact commit it was played on. `openfront-video
---same-engine` stops right away with exit code 4 and names the commit. The server then
-makes a checkout of OpenFrontIO at that commit in `/data/engines/<commit>`: a shallow,
-sparse clone plus `npm ci --omit=dev`, about 2 minutes and 1 GB the first time. It
-then renders with `render.ts --engine <checkout> --strict`, which writes the same
-video, thumbnail and details. So a new OpenFront release renders from its first game,
-without a rebuild; port it to Rust later for speed. The `ENGINES_KEEP` (3) most
-recently used checkouts are kept, outside `MAX_STORAGE_GB`. `RENDER_TS` is
-`/app/render.ts` in the image; without it, the fallback is off and such games render
-with the Rust engine anyway, where they may desync. Auto renders skip them in that case.
+The Rust renderer follows the engine versions in `replay::ENGINE_COMMITS`. When a game
+was played on another commit, `openfront-video --same-engine` stops right away with
+exit code 4 and names the commit. The server first checks whether `packages/engine/`,
+`packages/engine-lib/` or `src/core/` actually changed between the Rust build's engine
+commit and the game's commit (`git diff --quiet`, cached in `/data/catalog.redb`). If
+only client/UI/server files changed, the server renders the game directly with the
+fast Rust `openfront-video` binary. Otherwise it makes a checkout of OpenFrontIO at
+that commit in `/data/engines/<commit>`: a shallow, sparse clone plus `npm ci --omit=dev`,
+about 2 minutes and 1 GB the first time, and renders with `render.ts --engine <checkout> --strict`.
+The `ENGINES_KEEP` (3) most recently used checkouts are kept, outside `MAX_STORAGE_GB`.
+`RENDER_TS` is `/app/render.ts` in the image; without it, the fallback is off and such
+games render with the Rust engine anyway, where they may desync. Auto renders skip them in that case.
 
 ### Admin dashboard
 

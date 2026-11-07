@@ -15,6 +15,8 @@ use std::time::Duration;
 
 use tokio::process::Command;
 
+use crate::storage::Catalog;
+
 /// What a checkout needs to load the engine and the client's colors, in both
 /// the current packages/ layout and the older src/core one.
 const SPARSE: &[&str] =
@@ -30,6 +32,8 @@ pub struct Engines {
     repo: String,
     /// One preparation at a time per commit.
     locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Serializes lightweight git diff compatibility checks in `.compat-check`.
+    compat_lock: tokio::sync::Mutex<()>,
     /// Checkouts a render is using right now, which pruning leaves alone.
     in_use: Arc<Mutex<HashMap<String, usize>>>,
 }
@@ -85,6 +89,10 @@ impl Engines {
         std::fs::create_dir_all(&dir).expect("ENGINES_DIR");
         // Checkouts cut off by a restart.
         for e in std::fs::read_dir(&dir).unwrap().flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue;
+            }
             if !e.path().join(READY).exists() {
                 let _ = std::fs::remove_dir_all(e.path());
             }
@@ -95,8 +103,90 @@ impl Engines {
             keep: env_or("ENGINES_KEEP", "3").parse().expect("ENGINES_KEEP"),
             repo: env_or("OPENFRONT_REPO", "https://github.com/openfrontio/OpenFrontIO.git"),
             locks: Mutex::new(HashMap::new()),
+            compat_lock: tokio::sync::Mutex::new(()),
             in_use: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Checks whether `commit` has zero changes in `packages/engine/`,
+    /// `packages/engine-lib/`, or `src/core/` relative to `rust_commit`.
+    /// Results are cached in `catalog` (`COMMITS_TABLE`).
+    pub async fn is_engine_compatible(&self, commit: &str, rust_commit: &str, catalog: &Catalog) -> bool {
+        if !valid_commit(commit) || !valid_commit(rust_commit) {
+            return false;
+        }
+        if commit == rust_commit {
+            return true;
+        }
+        if let Some(compat) = catalog.get_commit_compat(commit) {
+            return compat;
+        }
+        let _guard = self.compat_lock.lock().await;
+        if let Some(compat) = catalog.get_commit_compat(commit) {
+            return compat;
+        }
+        let check_dir = self.dir.join(".compat-check");
+        if !check_dir.join(READY).exists() {
+            let _ = tokio::fs::remove_dir_all(&check_dir).await;
+            if tokio::fs::create_dir_all(&check_dir).await.is_err() {
+                return false;
+            }
+            let mut init = Command::new("git");
+            init.arg("-C").arg(&check_dir).args(["init", "-q", "--bare"]);
+            if run(&mut init, "git init compat", Duration::from_secs(30)).await.is_err() {
+                return false;
+            }
+            let mut remote = Command::new("git");
+            remote.arg("-C").arg(&check_dir).args(["remote", "add", "origin", &self.repo]);
+            if run(&mut remote, "git remote compat", Duration::from_secs(30)).await.is_err() {
+                return false;
+            }
+            let _ = tokio::fs::write(check_dir.join(READY), b"").await;
+        }
+        for sha in [rust_commit, commit] {
+            let mut has_obj = Command::new("git");
+            has_obj
+                .arg("-C")
+                .arg(&check_dir)
+                .args(["cat-file", "-e", &format!("{sha}^{{commit}}")])
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true);
+            let present = tokio::time::timeout(Duration::from_secs(10), has_obj.output())
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .is_some_and(|o| o.status.success());
+            if !present {
+                let mut fetch = Command::new("git");
+                fetch
+                    .arg("-C")
+                    .arg(&check_dir)
+                    .args(["fetch", "-q", "--depth", "1", "--filter=blob:none", "origin", sha]);
+                if run(&mut fetch, "fetching commit for compat check", Duration::from_secs(60)).await.is_err() {
+                    return false;
+                }
+            }
+        }
+        let mut diff = Command::new("git");
+        diff.arg("-C")
+            .arg(&check_dir)
+            .args(["diff", "--quiet", rust_commit, commit, "--", "packages/engine/", "packages/engine-lib/", "src/core/"])
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let Ok(Ok(out)) = tokio::time::timeout(Duration::from_secs(60), diff.output()).await else {
+            return false;
+        };
+        match out.status.code() {
+            Some(0) => {
+                catalog.set_commit_compat(commit, true);
+                true
+            }
+            Some(1) => {
+                catalog.set_commit_compat(commit, false);
+                false
+            }
+            _ => false,
+        }
     }
 
     /// The checkout for `commit`, made first if needed.

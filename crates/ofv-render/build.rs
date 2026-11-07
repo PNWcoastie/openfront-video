@@ -19,8 +19,16 @@ use std::path::{Path, PathBuf};
 fn main() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let engine = std::env::var("OPENFRONT_ENGINE")
+        .ok()
         .map(PathBuf::from)
-        .unwrap_or_else(|_| manifest_dir.join("../OpenFrontIO"));
+        .into_iter()
+        .chain([
+            manifest_dir.join("../../OpenFrontIO"),
+            manifest_dir.join("../../../OpenFrontIO"),
+            PathBuf::from("/home/dr_floral_funk/Documents/antigravity/modest-rutherford/data/legacy_quarantine/repos/OpenFrontIO"),
+        ])
+        .find(|p| p.join("resources/maps").is_dir())
+        .unwrap_or_else(|| manifest_dir.join("../../OpenFrontIO"));
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     println!("cargo:rerun-if-env-changed=OPENFRONT_ENGINE");
     println!("cargo:rerun-if-changed=build.rs");
@@ -62,6 +70,14 @@ fn main() {
 /// unpacked: [u32 length + bytes] for the manifest, map.bin, map4x.bin and map16x.bin.
 fn build_maps(maps: &Path, out: &Path) {
     println!("cargo:rerun-if-changed={}", maps.display());
+    let maps_bin = out.join("maps.bin");
+    let maps_rs = out.join("maps.rs");
+    if maps_bin.is_file()
+        && maps_rs.is_file()
+        && fs::metadata(&maps_bin).map(|m| m.len() > 0).unwrap_or(false)
+    {
+        return;
+    }
     let mut dirs: Vec<PathBuf> = fs::read_dir(maps)
         .unwrap()
         .map(|e| e.unwrap().path())

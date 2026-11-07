@@ -52,20 +52,17 @@ nearby ships were scanning every ship ever built.
 
 `ENGINE_RS_PROFILE=1` also prints time in a few named scopes (`prof::scope`; water
 pathfinding, cluster checks, `nearby_units`, stream frames). Add a scope to any
-function to time it. Over the whole first game attacks take
-~7.3 s, player bookkeeping ~1.8 s, warships ~1.1 s, trade ships ~0.6 s. The late game
-is cheap in TypeScript (16.7 s for the first 3,000 ticks, 9.3 s for the other 7,300),
-so the whole-game ratio is lower than the early one. The obvious next optimization is the tile sets, which
-still hash every add and delete; each tile is in at most one player's tile set and
-one border set, so map-sized position arrays could replace the hash maps.
+function to time it. `TileSet` uses direct flat slot-indexed position arrays (zero hashing on insert, delete or compaction), `Game` precomputes a `territory_sigmoid` lookup table across land tile counts, `GameMap` precomputes static shore/edge/interior flags, and `WaterPathfinder` caches intra-cluster HPA* edge paths and reuses `BoundedAStar` scratch buffers.
+
+The simulation state and executions in `src/game.rs` are organized into focused domain submodules under `src/game/` (`units.rs`, `alliances.rs`, `structures.rs`, `ports_trade.rs`, `rail.rs`, `warships.rs`, `severed.rs`, `nukes.rs`, `namebox.rs`, `doomsday.rs`, `nation.rs`, `nation_attack.rs`, `nation_structures.rs`, `nation_warships.rs`, `nation_nukes.rs`), and the entire crate compiles under `#![forbid(unsafe_code)]`.
 
 Anything not ported stops the run with "... is not ported yet".
 
 ## Making videos
 
-`openfront-video` (`src/bin/openfront-video/`, see the top-level README) is the
+`openfront-video` (`crates/ofv-render/`, see the top-level README) is the
 standalone video maker: it uses this crate as a library (`src/lib.rs`), with
-`replay::play` producing each frame's changes, and `build.rs` embeds the maps and
+`replay::play` producing each frame's changes, and `crates/ofv-render/build.rs` embeds the maps and
 client assets from the OpenFrontIO checkout. The harness binary `engine-rs` still
 reads them from the checkout given on its command line.
 

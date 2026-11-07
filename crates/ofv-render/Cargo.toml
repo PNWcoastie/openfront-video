@@ -1,0 +1,29 @@
+[package]
+name = "ofv-render"
+version.workspace = true
+edition.workspace = true
+description = "Tightly coupled 3-thread OpenFront.io video renderer and H.264/MP4 encoder"
+
+[[bin]]
+name = "openfront-video"
+path = "src/main.rs"
+
+[dependencies]
+engine-rs.workspace = true
+serde_json.workspace = true
+ureq.workspace = true
+flate2.workspace = true
+zstd.workspace = true
+tiny-skia.workspace = true
+ttf-parser.workspace = true
+rustybuzz.workspace = true
+openh264.workspace = true
+mp4.workspace = true
+
+[build-dependencies]
+flate2.workspace = true
+serde_json.workspace = true
+zstd.workspace = true
+
+[lints]
+workspace = true

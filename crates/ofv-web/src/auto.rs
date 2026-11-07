@@ -140,7 +140,7 @@ async fn poll_loop(app: Arc<App>, queue: Arc<Mutex<Queue>>, s: Arc<Settings>) {
                     continue;
                 }
                 q.seen.insert(id.to_string(), parse_time(&g["start"]).unwrap_or(now));
-                if !wanted(g, s.min_players) || now - ended > s.max_age || app.path(id, "json").exists() {
+                if !wanted(g, s.min_players) || now - ended > s.max_age || app.catalog.has_video(id) {
                     continue;
                 }
                 q.pending.push(Pending { id: id.to_string(), ended });
@@ -193,7 +193,7 @@ async fn work_loop(app: Arc<App>, queue: Arc<Mutex<Queue>>, s: Arc<Settings>) {
             // Waits for the render (or joins one a request already started).
             // Still pending afterwards means a request took its slot: queue it again.
             if let Status::Pending = app.status_for(&job.id, Duration::from_secs(30 * 60), true).await {
-                if !app.path(&job.id, "json").exists() {
+                if !app.catalog.has_video(&job.id) {
                     let mut q = queue.lock().unwrap();
                     q.pending.push(job);
                     q.pending.sort_by(|a, b| b.ended.cmp(&a.ended));

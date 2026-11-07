@@ -1,0 +1,23 @@
+[package]
+name = "openfront-web"
+version.workspace = true
+edition.workspace = true
+description = "openfront.video: renders OpenFront games with openfront-video and serves them with Discord embeds and redb catalog"
+
+[[bin]]
+name = "openfront-web"
+path = "src/main.rs"
+
+[dependencies]
+axum.workspace = true
+tokio.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ureq.workspace = true
+chrono.workspace = true
+redb.workspace = true
+
+[lints]
+workspace = true

@@ -72,6 +72,7 @@ impl Slots {
         if !auto {
             self.demand_waiting.fetch_add(1, Ordering::SeqCst);
         }
+        let mut preempted_one = false;
         loop {
             {
                 let mut running = self.running.lock().unwrap();
@@ -85,10 +86,11 @@ impl Slots {
                     }
                     return Slot { slots: self.clone(), token, preempted: auto.then_some(rx) };
                 }
-                // A request takes the slot of an auto render (the latest started).
-                if !auto {
+                // A request takes the slot of at most one auto render (the latest started).
+                if !auto && !preempted_one {
                     if let Some(r) = running.iter_mut().rev().find(|r| r.auto && r.preempt.is_some()) {
                         let _ = r.preempt.take().unwrap().send(());
+                        preempted_one = true;
                     }
                 }
             }

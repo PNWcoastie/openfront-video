@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/engine-rs",
+    "crates/ofv-render",
+    "crates/ofv-web",
+]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+
+[workspace.dependencies]
+engine-rs = { path = "crates/engine-rs" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+ureq = "3"
+flate2 = "1"
+zstd = "0.13"
+tiny-skia = "0.11"
+ttf-parser = "0.25"
+rustybuzz = "0.20"
+openh264 = "0.9"
+mp4 = "0.14"
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "sync", "time", "signal"] }
+tower = "0.5"
+tower-http = { version = "0.7", features = ["fs"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+redb = "2.4"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[profile.dev]
+debug = "line-tables-only"
+incremental = true
+
+[profile.release]
+opt-level = 3
+debug = "line-tables-only"
+lto = "thin"
+codegen-units = 1

@@ -52,8 +52,9 @@ Options:
   --strict           stop if the replay desyncs from the archived hashes
   --same-engine      stop right away (exit code 4) if the game was played on another
                      engine version; the message names its full commit
-  --thumbnail <file> also save the last frame as a PNG
-  --meta <file>      also write the game's and video's details as JSON
+  --thumbnail <file>    also save the last frame as a PNG
+  --meta <file>         also write the game's and video's details as JSON
+  --preview-meta <file> write initial game/map metadata JSON immediately before simulating
 ";
 
 struct Options {
@@ -69,6 +70,7 @@ struct Options {
     same_engine: bool,
     thumbnail: Option<String>,
     meta: Option<String>,
+    preview_meta: Option<String>,
 }
 
 fn parse_args() -> Result<Options, String> {
@@ -88,6 +90,7 @@ fn parse_args() -> Result<Options, String> {
         same_engine: false,
         thumbnail: None,
         meta: None,
+        preview_meta: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -107,6 +110,7 @@ fn parse_args() -> Result<Options, String> {
             "--same-engine" => o.same_engine = true,
             "--thumbnail" => o.thumbnail = Some(value()?),
             "--meta" => o.meta = Some(value()?),
+            "--preview-meta" => o.preview_meta = Some(value()?),
             "-h" | "--help" => {
                 print!("{USAGE}");
                 std::process::exit(0);
@@ -259,6 +263,25 @@ fn run() -> Result<(), String> {
     let even_floor = |v: f64| ((v / 2.0).floor() as usize * 2).max(2);
     let out_w = even_floor(want_w * fit);
     let out_h = even_floor(out_w as f64 * h as f64 / w as f64).min(max_h as usize);
+    if let Some(path) = &opts.preview_meta {
+        let meta = serde_json::json!({
+            "id": game_id,
+            "map": info["config"]["gameMap"],
+            "mode": info["config"]["gameMode"],
+            "players": info["players"].as_array().map_or(0, |a| a.len()),
+            "turns": num_turns,
+            "durationSeconds": duration,
+            "width": out_w,
+            "height": out_h,
+            "fps": opts.fps,
+            "engineCommit": record["gitCommit"],
+            "previewOnly": true,
+        });
+        let tmp_path = format!("{path}.tmp");
+        std::fs::write(&tmp_path, serde_json::to_vec_pretty(&meta).unwrap())
+            .and_then(|_| std::fs::rename(&tmp_path, path))
+            .map_err(|e| format!("writing {path}: {e}"))?;
+    }
     let out = opts.out.clone().unwrap_or_else(|| format!("{game_id}.mp4"));
     let out_abs = std::path::absolute(&out).map(|p| p.display().to_string()).unwrap_or(out.clone());
     let t_init = t_init0.elapsed();

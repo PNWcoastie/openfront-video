@@ -6,6 +6,7 @@
 //!                              in a game link)
 //!   /video/<id>.mp4            the video (byte ranges supported)
 //!   /thumb/<id>.png            its last frame, the embed's preview image
+//!   /api/v1/render             optional generic Bot Render API (enabled via RENDER_API_TOKEN)
 //!
 //! The first request for a game renders it; the video, thumbnail and details
 //! are kept in DATA_DIR and served from there afterwards. One render per game
@@ -13,10 +14,11 @@
 //!
 //! Settings (environment): PORT (8080), DATA_DIR (./data), PUBLIC_URL
 //! (https://openfront.video), OPENFRONT_VIDEO_BIN (openfront-video),
-//! MAX_RENDERS (1), EMBED_WAIT_SECS (25), VIDEO_WAIT_SECS (120), and the
-//! TypeScript fallback's (see engines.rs).
+//! MAX_RENDERS (2), EMBED_WAIT_SECS (25), VIDEO_WAIT_SECS (120),
+//! RENDER_API_TOKEN (optional), and the TypeScript fallback's (see engines.rs).
 //!
 //! Games from engine versions openfront-video doesn't follow render with
+//! the Rust engine when `git diff` shows zero engine changes, or fall back to
 //! render.ts and the TypeScript engine at the version they were played on.
 
 #![forbid(unsafe_code)]
@@ -30,10 +32,10 @@ use axum::body::Body;
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::sync::watch;
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
@@ -43,6 +45,7 @@ mod cleanup;
 mod engines;
 mod slots;
 mod stats;
+mod storage;
 
 /// A failed render is remembered this long before a request may retry it.
 const FAILURE_TTL: Duration = Duration::from_secs(600);
@@ -61,8 +64,11 @@ enum Outcome {
 }
 
 enum Job {
-    /// Receives the outcome when the render ends.
-    Running(watch::Receiver<Option<Outcome>>),
+    /// Receives the preview metadata (~0.15s) and final outcome when the render ends.
+    Running {
+        done_rx: watch::Receiver<Option<Outcome>>,
+        preview_rx: watch::Receiver<Option<Value>>,
+    },
     Failed(String, Instant),
 }
 
@@ -76,6 +82,7 @@ struct App {
     jobs: Mutex<HashMap<String, Job>>,
     /// Signalled after each finished render, so the cleanup checks usage.
     rendered: tokio::sync::Notify,
+    catalog: Arc<storage::Catalog>,
     events: stats::EventLog,
     auto_status: Mutex<stats::AutoStatus>,
     /// When the server started (Unix seconds).
@@ -86,6 +93,8 @@ struct App {
 
 enum Status {
     Ready(Value),
+    /// Fast preview metadata written via `--preview-meta` before simulation begins.
+    PreviewReady(Value),
     Pending,
     NotFound,
     Failed(String),
@@ -113,15 +122,27 @@ fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#39;")
 }
 
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
 impl App {
     fn path(&self, id: &str, ext: &str) -> PathBuf {
         self.dir.join(format!("{id}.{ext}"))
     }
 
-    /// The details file is written last, so it marks a finished render.
+    /// Reads finished game metadata from the `redb` catalog (falling back to disk if placed externally).
     async fn meta(&self, id: &str) -> Option<Value> {
+        if let Some(meta) = self.catalog.get_video_meta(id) {
+            return Some(meta);
+        }
         let bytes = tokio::fs::read(self.path(id, "json")).await.ok()?;
-        serde_json::from_slice(&bytes).ok()
+        let meta: Value = serde_json::from_slice(&bytes).ok()?;
+        let mp4_len = tokio::fs::metadata(self.path(id, "mp4")).await.map_or(0, |m| m.len());
+        let png_len = tokio::fs::metadata(self.path(id, "png")).await.map_or(0, |m| m.len());
+        let now = now_secs();
+        self.catalog.upsert_video(id, &meta, mp4_len + png_len + bytes.len() as u64, now, now);
+        Some(meta)
     }
 
     /// The game's status, starting its render if needed and waiting up to
@@ -132,48 +153,90 @@ impl App {
 
     /// `status`, for an on-demand request or (auto) the background renderer.
     async fn status_for(self: &Arc<Self>, id: &str, wait: Duration, auto: bool) -> Status {
+        self.status_with_preview(id, wait, auto, false).await
+    }
+
+    /// `status`, optionally returning `Status::PreviewReady` as soon as `--preview-meta` is written (~0.15s).
+    async fn status_with_preview(self: &Arc<Self>, id: &str, wait: Duration, auto: bool, allow_preview: bool) -> Status {
         if let Some(meta) = self.meta(id).await {
             return Status::Ready(meta);
         }
-        let mut rx = {
+        let (mut done_rx, mut preview_rx) = {
             let mut jobs = self.jobs.lock().unwrap();
             match jobs.get(id) {
-                Some(Job::Running(rx)) => rx.clone(),
+                Some(Job::Running { done_rx, preview_rx }) => (done_rx.clone(), preview_rx.clone()),
                 Some(Job::Failed(msg, at)) if at.elapsed() < FAILURE_TTL => return Status::Failed(msg.clone()),
                 _ => {
-                    let (tx, rx) = watch::channel(None);
-                    jobs.insert(id.to_string(), Job::Running(rx.clone()));
+                    let (done_tx, done_rx) = watch::channel(None);
+                    let (preview_tx, preview_rx) = watch::channel(None);
+                    jobs.insert(
+                        id.to_string(),
+                        Job::Running {
+                            done_rx: done_rx.clone(),
+                            preview_rx: preview_rx.clone(),
+                        },
+                    );
                     let app = self.clone();
                     let id = id.to_string();
                     tokio::spawn(async move {
-                        let outcome = app.render(&id, auto).await;
+                        let outcome = app.render(&id, auto, preview_tx).await;
                         let mut jobs = app.jobs.lock().unwrap();
                         match &outcome {
                             Outcome::Done | Outcome::NotFound | Outcome::Preempted => jobs.remove(&id),
                             Outcome::Failed(msg) => jobs.insert(id.clone(), Job::Failed(msg.clone(), Instant::now())),
                         };
-                        let _ = tx.send(Some(outcome));
+                        let _ = done_tx.send(Some(outcome));
                     });
-                    rx
+                    (done_rx, preview_rx)
                 }
             }
         };
+        if allow_preview {
+            if let Some(meta) = preview_rx.borrow().clone() {
+                return Status::PreviewReady(meta);
+            }
+            enum WaitStep {
+                Done(Option<Outcome>),
+                Preview(Option<Value>),
+            }
+            let step = tokio::time::timeout(wait, async {
+                tokio::select! {
+                    r = done_rx.wait_for(|o| o.is_some()) => r.ok().map(|o| WaitStep::Done(o.clone())),
+                    r = preview_rx.wait_for(|p| p.is_some()) => r.ok().map(|p| WaitStep::Preview(p.clone())),
+                }
+            })
+            .await
+            .ok()
+            .flatten();
+            return match step {
+                Some(WaitStep::Preview(Some(meta))) => Status::PreviewReady(meta),
+                Some(WaitStep::Done(Some(outcome))) => self.outcome_to_status(id, outcome).await,
+                _ => Status::Pending,
+            };
+        }
         // Copied out so the channel's lock isn't held across an await.
-        let finished = tokio::time::timeout(wait, rx.wait_for(|o| o.is_some())).await.ok().and_then(|r| r.ok().map(|o| o.clone()));
+        let finished = tokio::time::timeout(wait, done_rx.wait_for(|o| o.is_some()))
+            .await
+            .ok()
+            .and_then(|r| r.ok().map(|o| o.clone()));
         match finished {
-            Some(o) => match o.unwrap() {
-                Outcome::Done => self.meta(id).await.map_or(Status::Failed("the render left no details".into()), Status::Ready),
-                Outcome::NotFound => Status::NotFound,
-                Outcome::Preempted => Status::Pending,
-                Outcome::Failed(msg) => Status::Failed(msg),
-            },
-            None => Status::Pending,
+            Some(Some(outcome)) => self.outcome_to_status(id, outcome).await,
+            _ => Status::Pending,
+        }
+    }
+
+    async fn outcome_to_status(&self, id: &str, outcome: Outcome) -> Status {
+        match outcome {
+            Outcome::Done => self.meta(id).await.map_or(Status::Failed("the render left no details".into()), Status::Ready),
+            Outcome::NotFound => Status::NotFound,
+            Outcome::Preempted => Status::Pending,
+            Outcome::Failed(msg) => Status::Failed(msg),
         }
     }
 
     /// Runs openfront-video for the game into temporary files, then moves
-    /// them into place (details last).
-    async fn render(&self, id: &str, auto: bool) -> Outcome {
+    /// them into place (details last) and records the video in `catalog.redb`.
+    async fn render(&self, id: &str, auto: bool, preview_tx: watch::Sender<Option<Value>>) -> Outcome {
         let mut slot = self.slots.acquire(id, auto).await;
         let preempted = async {
             match slot.preempted.take() {
@@ -186,6 +249,20 @@ impl App {
         let t0 = Instant::now();
         println!("render {id}: started{}", if auto { " (auto)" } else { "" });
         let tmp = |ext: &str| self.dir.join(format!(".{id}.tmp.{ext}"));
+        let preview_path = tmp("preview.json");
+        let _ = tokio::fs::remove_file(&preview_path).await;
+        let preview_watcher = async {
+            for _ in 0..60 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                if let Ok(bytes) = tokio::fs::read(&preview_path).await {
+                    if let Ok(val) = serde_json::from_slice::<Value>(&bytes) {
+                        let _ = preview_tx.send(Some(val));
+                        break;
+                    }
+                }
+            }
+            std::future::pending::<()>().await
+        };
         let work = async {
             let mut cmd = tokio::process::Command::new(&self.bin);
             cmd.arg(id)
@@ -195,8 +272,10 @@ impl App {
                 .arg(tmp("png"))
                 .arg("--meta")
                 .arg(tmp("json"))
+                .arg("--preview-meta")
+                .arg(&preview_path)
                 // Games from other engine versions stop right away (exit code 4): they
-                // go to the TypeScript engine, or are skipped by auto renders without it.
+                // are checked for engine-path git diffs, or go to the TypeScript engine.
                 .args(if auto || self.engines.is_some() { &["--same-engine"][..] } else { &[][..] })
                 .stdin(std::process::Stdio::null())
                 .kill_on_drop(true);
@@ -206,9 +285,33 @@ impl App {
                 return Ok(Ok(out.clone()));
             }
             let err = String::from_utf8_lossy(&out.stderr);
-            let Some(commit) = err.split("played on engine version ").nth(1).and_then(|r| r.split(',').next()) else {
+            let Some(commit) = err.split("played on engine version ").nth(1).and_then(|r| r.split(',').next()).map(str::trim) else {
                 return Ok(Ok(out.clone()));
             };
+            let rust_commit = err
+                .split("this build follows ")
+                .nth(1)
+                .and_then(|r| r.split(|c: char| !c.is_ascii_hexdigit()).next())
+                .unwrap_or("");
+            if !rust_commit.is_empty() && engines.is_engine_compatible(commit, rust_commit, &self.catalog).await {
+                println!(
+                    "render {id}: commit {} has 0 engine changes vs Rust build, rendering with Rust engine",
+                    &commit[..commit.len().min(9)]
+                );
+                let mut cmd2 = tokio::process::Command::new(&self.bin);
+                cmd2.arg(id)
+                    .arg("--out")
+                    .arg(tmp("mp4"))
+                    .arg("--thumbnail")
+                    .arg(tmp("png"))
+                    .arg("--meta")
+                    .arg(tmp("json"))
+                    .arg("--preview-meta")
+                    .arg(&preview_path)
+                    .stdin(std::process::Stdio::null())
+                    .kill_on_drop(true);
+                return tokio::time::timeout(RENDER_TIMEOUT, cmd2.output()).await;
+            }
             println!("render {id}: played on engine {}, rendering with the TypeScript engine", &commit[..commit.len().min(9)]);
             let lease = match engines.get(commit).await {
                 Ok(l) => l,
@@ -237,34 +340,46 @@ impl App {
         // Dropping the work on preemption kills the renderer (kill_on_drop).
         let result = tokio::select! {
             r = work => Some(r),
+            _ = preview_watcher => None,
             _ = preempted => None,
         };
+        let _ = tokio::fs::remove_file(&preview_path).await;
         let outcome = match result {
             None => Outcome::Preempted,
             Some(result) => match result {
-            Err(_) => Outcome::Failed("the render took too long".into()),
-            Ok(Err(e)) => Outcome::Failed(format!("couldn't render: {e}")),
-            Ok(Ok(out)) if out.status.code() == Some(3) => Outcome::NotFound,
-            Ok(Ok(out)) if !out.status.success() => {
-                // The renderer's last line says why ("error: ...", "... is not ported yet").
-                let err = String::from_utf8_lossy(&out.stderr);
-                let line = err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("the renderer failed");
-                let line = line.trim_start_matches("error: ").trim_start_matches("Error: ").trim_start_matches("openfront-video stopped: ");
-                Outcome::Failed(line.to_string())
-            }
-            Ok(Ok(_)) => {
-                let mut moved = Ok(());
-                for ext in ["mp4", "png", "json"] {
-                    if let Err(e) = tokio::fs::rename(tmp(ext), self.path(id, ext)).await {
-                        moved = Err(e);
-                        break;
+                Err(_) => Outcome::Failed("the render took too long".into()),
+                Ok(Err(e)) => Outcome::Failed(format!("couldn't render: {e}")),
+                Ok(Ok(out)) if out.status.code() == Some(3) => Outcome::NotFound,
+                Ok(Ok(out)) if !out.status.success() => {
+                    // The renderer's last line says why ("error: ...", "... is not ported yet").
+                    let err = String::from_utf8_lossy(&out.stderr);
+                    let line = err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("the renderer failed");
+                    let line = line.trim_start_matches("error: ").trim_start_matches("Error: ").trim_start_matches("openfront-video stopped: ");
+                    Outcome::Failed(line.to_string())
+                }
+                Ok(Ok(_)) => {
+                    let mut moved = Ok(());
+                    for ext in ["mp4", "png", "json"] {
+                        if let Err(e) = tokio::fs::rename(tmp(ext), self.path(id, ext)).await {
+                            moved = Err(e);
+                            break;
+                        }
+                    }
+                    match moved {
+                        Ok(()) => {
+                            if let Ok(json_bytes) = tokio::fs::read(self.path(id, "json")).await {
+                                if let Ok(meta) = serde_json::from_slice::<Value>(&json_bytes) {
+                                    let mp4_len = tokio::fs::metadata(self.path(id, "mp4")).await.map_or(0, |m| m.len());
+                                    let png_len = tokio::fs::metadata(self.path(id, "png")).await.map_or(0, |m| m.len());
+                                    let now = now_secs();
+                                    self.catalog.upsert_video(id, &meta, mp4_len + png_len + json_bytes.len() as u64, now, now);
+                                }
+                            }
+                            Outcome::Done
+                        }
+                        Err(e) => Outcome::Failed(format!("couldn't store the video: {e}")),
                     }
                 }
-                match moved {
-                    Ok(()) => Outcome::Done,
-                    Err(e) => Outcome::Failed(format!("couldn't store the video: {e}")),
-                }
-            }
             },
         };
         drop(slot);
@@ -379,8 +494,8 @@ async fn go(Query(q): Query<Go>) -> Response {
     }
 }
 
-/// Link previewers (Discord and friends) wait for the render; people get a
-/// page that refreshes until it's done.
+/// Link previewers (Discord and friends) receive immediate `<meta>` Open Graph tags
+/// once `--preview-meta` is ready (~0.15s), and their media proxy waits on `/video/<id>.mp4`.
 fn is_previewer(headers: &HeaderMap) -> bool {
     let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("").to_ascii_lowercase();
     ["discordbot", "twitterbot", "slackbot", "telegrambot", "facebookexternalhit", "whatsapp", "embedly"].iter().any(|b| ua.contains(b))
@@ -390,17 +505,18 @@ async fn game_page(app: Arc<App>, id: String, headers: HeaderMap) -> Response {
     if !valid_id(&id) {
         return (StatusCode::NOT_FOUND, page("<title>Not found</title>", "<h1>Not a game ID</h1>")).into_response();
     }
-    // People wait a moment too: long enough to learn a game is not finished
-    // (a quick API lookup), not for a whole render.
-    let wait = if is_previewer(&headers) { app.embed_wait } else { Duration::from_secs(3) };
+    let previewer = is_previewer(&headers);
+    // Both people and link previewers wait up to 3s on the HTML endpoint:
+    // previewers wake in ~0.15s as soon as `--preview-meta` is written.
+    let wait = Duration::from_secs(3);
     let base = &app.public_url;
     let video = format!("{base}/video/{id}.mp4");
     let thumb = format!("{base}/thumb/{id}.png");
     let url = format!("{base}/game/{id}");
     let source = format!("https://openfront.io/game/{id}");
-    match app.status(&id, wait).await {
-        Status::Ready(meta) => {
-            cleanup::touch(&app.path(&id, "json"));
+    match app.status_with_preview(&id, wait, false, previewer).await {
+        Status::Ready(meta) | Status::PreviewReady(meta) => {
+            cleanup::touch(&app.catalog, &id);
             app.events.view(&id, "page", &headers);
             let s = |k: &str| meta[k].as_str().unwrap_or("?").to_string();
             let (w, h) = (meta["width"].as_u64().unwrap_or(1280), meta["height"].as_u64().unwrap_or(1280));
@@ -440,6 +556,12 @@ async fn game_page(app: Arc<App>, id: String, headers: HeaderMap) -> Response {
             );
             page_with_ads(&head, &body).into_response()
         }
+        // Link previewers never get a 200 OK text-only pending card, so Discord
+        // does not permanently cache a broken embed without og:video.
+        Status::Pending if previewer => {
+            app.events.view(&id, "pending", &headers);
+            (StatusCode::SERVICE_UNAVAILABLE, [(header::RETRY_AFTER, "5")], "still rendering").into_response()
+        }
         Status::Pending => {
             app.events.view(&id, "pending", &headers);
             let head = format!(
@@ -455,7 +577,7 @@ After that the video is ready right away.</p><p><a href=\"{source}\">Replay on O
         }
         // Link previewers get no page at all, so they cache nothing and fetch
         // again the next time the link is posted.
-        Status::NotFound if is_previewer(&headers) => {
+        Status::NotFound if previewer => {
             app.events.view(&id, "not_found", &headers);
             (StatusCode::SERVICE_UNAVAILABLE, [(header::RETRY_AFTER, "60")], "game not finished yet").into_response()
         }
@@ -492,7 +614,7 @@ async fn media(app: Arc<App>, name: String, ext: &str, req: Request) -> Response
     };
     match app.status(id, app.video_wait).await {
         Status::Ready(_) => {
-            cleanup::touch(&app.path(id, "json"));
+            cleanup::touch(&app.catalog, id);
             // A video play: the first request (later ranges are the same play).
             let range = req.headers().get(header::RANGE).and_then(|v| v.to_str().ok()).unwrap_or("bytes=0-");
             if ext == "mp4" && range.starts_with("bytes=0-") {
@@ -506,7 +628,9 @@ async fn media(app: Arc<App>, name: String, ext: &str, req: Request) -> Response
                 .insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=31536000, immutable"));
             res
         }
-        Status::Pending => (StatusCode::SERVICE_UNAVAILABLE, [(header::RETRY_AFTER, "10")], "still rendering").into_response(),
+        Status::Pending | Status::PreviewReady(_) => {
+            (StatusCode::SERVICE_UNAVAILABLE, [(header::RETRY_AFTER, "10")], "still rendering").into_response()
+        }
         Status::NotFound => (StatusCode::NOT_FOUND, "game not finished yet").into_response(),
         Status::Failed(msg) => (StatusCode::NOT_FOUND, msg).into_response(),
     }
@@ -520,6 +644,63 @@ async fn thumb(State(app): State<Arc<App>>, Path(name): Path<String>, req: Reque
     media(app, name, "png", req).await
 }
 
+#[derive(Deserialize)]
+struct BotRenderRequest {
+    /// Game ID or full https://openfront.io/game/<id> URL
+    game: String,
+    /// Optional: if true, wait up to `video_wait` for completion; default false (queue immediately and return 202/200)
+    #[serde(default)]
+    wait: bool,
+}
+
+fn api_authorized(headers: &HeaderMap) -> Option<bool> {
+    let token = std::env::var("RENDER_API_TOKEN").ok().filter(|t| !t.is_empty())?;
+    let given = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+        .unwrap_or_default();
+    let (a, b) = (given.as_bytes(), token.as_bytes());
+    let same = a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0;
+    Some(same)
+}
+
+/// Optional generic Bot Render API (`POST /api/v1/render`), enabled when `RENDER_API_TOKEN` is set.
+async fn api_render(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    axum::Json(req): axum::Json<BotRenderRequest>,
+) -> Response {
+    match api_authorized(&headers) {
+        None => return StatusCode::NOT_FOUND.into_response(),
+        Some(false) => return StatusCode::UNAUTHORIZED.into_response(),
+        Some(true) => {}
+    }
+    let Some(id) = game_id_from(&req.game) else {
+        return (StatusCode::BAD_REQUEST, axum::Json(json!({"error": "invalid game ID or URL"}))).into_response();
+    };
+    let wait = if req.wait { app.video_wait } else { Duration::from_millis(250) };
+    let (code, status_str) = match app.status(&id, wait).await {
+        Status::Ready(_) => (StatusCode::OK, "ready"),
+        Status::Pending | Status::PreviewReady(_) => (StatusCode::ACCEPTED, "rendering"),
+        Status::NotFound => (StatusCode::NOT_FOUND, "not_found"),
+        Status::Failed(_) => (StatusCode::INTERNAL_SERVER_ERROR, "failed"),
+    };
+    let base = &app.public_url;
+    (
+        code,
+        axum::Json(json!({
+            "id": id,
+            "status": status_str,
+            "page_url": format!("{base}/game/{id}"),
+            "video_url": format!("{base}/video/{id}.mp4"),
+            "thumb_url": format!("{base}/thumb/{id}.png"),
+        })),
+    )
+        .into_response()
+}
+
 #[tokio::main]
 async fn main() {
     let dir = PathBuf::from(env_or("DATA_DIR", "./data"));
@@ -531,7 +712,9 @@ async fn main() {
         }
     }
     let secs = |k: &str, d: &str| Duration::from_secs(env_or(k, d).parse().expect(k));
-    let dir_for_events = dir.clone();
+    let catalog = storage::Catalog::open(&dir);
+    let events = stats::EventLog::open(&dir, catalog.clone());
+    let engines = engines::Engines::from_env(&dir);
     let app = Arc::new(App {
         dir,
         bin: PathBuf::from(env_or("OPENFRONT_VIDEO_BIN", "openfront-video")),
@@ -541,10 +724,11 @@ async fn main() {
         slots: slots::Slots::new(env_or("MAX_RENDERS", "2").parse().expect("MAX_RENDERS")),
         jobs: Mutex::new(HashMap::new()),
         rendered: tokio::sync::Notify::new(),
-        events: stats::EventLog::open(&dir_for_events),
+        catalog,
+        events,
         auto_status: Mutex::new(stats::AutoStatus::default()),
-        started: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
-        engines: engines::Engines::from_env(&dir_for_events),
+        started: now_secs(),
+        engines,
     });
     cleanup::start(app.clone());
     if env_or("AUTO_RENDER", "1") != "0" {
@@ -557,6 +741,7 @@ async fn main() {
         .route("/ads.txt", get(ads_txt))
         .route("/admin", get(stats::page))
         .route("/admin/api/stats", get(stats::api))
+        .route("/api/v1/render", post(api_render))
         .route("/game/{id}", get(game))
         .route("/{prefix}/game/{id}", get(game_prefixed))
         .route("/video/{name}", get(video))
@@ -564,7 +749,7 @@ async fn main() {
         .with_state(app.clone());
     let addr = format!("0.0.0.0:{}", env_or("PORT", "8080"));
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
-    println!("openfront-web on {addr}, videos in {}, public URL {}", app.dir.display(), app.public_url);
+    println!("openfront-web on {addr}, videos in {}, public URL {}, embed wait {}s", app.dir.display(), app.public_url, app.embed_wait.as_secs());
     axum::serve(listener, router)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
