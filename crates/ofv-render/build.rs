@@ -25,7 +25,6 @@ fn main() {
         .chain([
             manifest_dir.join("../../OpenFrontIO"),
             manifest_dir.join("../../../OpenFrontIO"),
-            PathBuf::from("/home/dr_floral_funk/Documents/antigravity/modest-rutherford/data/legacy_quarantine/repos/OpenFrontIO"),
         ])
         .find(|p| p.join("resources/maps").is_dir())
         .unwrap_or_else(|| manifest_dir.join("../../OpenFrontIO"));

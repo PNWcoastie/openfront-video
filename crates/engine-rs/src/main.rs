@@ -39,9 +39,9 @@ fn main() {
         PathBuf::from(&args[1])
     };
     let record: Value = serde_json::from_str(&fs::read_to_string(&rec_path).expect("read record")).expect("parse record");
-    let default_engine_dir = std::env::var("OPENFRONT_DIR").unwrap_or_else(|_| {
-        "/home/dr_floral_funk/Documents/antigravity/modest-rutherford/data/legacy_quarantine/repos/OpenFrontIO".to_string()
-    });
+    let default_engine_dir = std::env::var("OPENFRONT_DIR")
+        .or_else(|_| std::env::var("OPENFRONT_ENGINE"))
+        .unwrap_or_else(|_| "../OpenFrontIO".to_string());
     let engine_dir = Path::new(args.get(2).map(|s| s.as_str()).unwrap_or(&default_engine_dir));
     let max_ticks: usize = args.get(3).map(|s| s.parse().expect("ticks")).unwrap_or(usize::MAX);
     let out_path = args.get(4).map(|s| s.as_str()).unwrap_or("/dev/null");
