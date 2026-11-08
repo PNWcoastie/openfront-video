@@ -135,7 +135,13 @@ curl -s http://127.0.0.1:8080/api/v1/status/cAj8yxzNsH | jq .
   "percent": 100,
   "map": "Bab el-Mandeb Strait",
   "mode": "Team",
-  "players": 21
+  "players": 21,
+  "winner": "Team Red · [MYTH] Astral",
+  "winnerPct": 66.1,
+  "durationSeconds": 1031.1,
+  "ticks": 10311,
+  "hashesChecked": 1031,
+  "hashMismatches": 0
 }
 ```
 
