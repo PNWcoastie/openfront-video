@@ -1005,14 +1005,10 @@ async fn api_status_handler(State(app): State<Arc<App>>, Path(id): Path<String>)
         });
         if let Some(meta) = app.meta(&id).await {
             if let Some(obj) = body.as_object_mut() {
-                if let Some(map) = meta["map"].as_str() {
-                    obj.insert("map".into(), json!(map));
-                }
-                if let Some(mode) = meta["mode"].as_str() {
-                    obj.insert("mode".into(), json!(mode));
-                }
-                if let Some(players) = meta["players"].as_u64() {
-                    obj.insert("players".into(), json!(players));
+                for key in ["map", "mode", "players", "winner", "winnerPct", "durationSeconds", "ticks", "hashesChecked", "hashMismatches"] {
+                    if !meta[key].is_null() {
+                        obj.insert(key.into(), meta[key].clone());
+                    }
                 }
             }
         }
@@ -1161,24 +1157,28 @@ async fn api_render(
         return (StatusCode::BAD_REQUEST, axum::Json(json!({"error": "invalid game ID or URL"}))).into_response();
     };
     let wait = if req.wait { app.video_wait } else { Duration::from_millis(250) };
-    let (code, status_str) = match app.status(&id, wait).await {
-        Status::Ready(_) => (StatusCode::OK, "ready"),
-        Status::Pending | Status::PreviewReady(_) => (StatusCode::ACCEPTED, "rendering"),
-        Status::NotFound => (StatusCode::NOT_FOUND, "not_found"),
-        Status::Failed(_) => (StatusCode::INTERNAL_SERVER_ERROR, "failed"),
+    let (code, status_str, ready_meta) = match app.status(&id, wait).await {
+        Status::Ready(m) => (StatusCode::OK, "ready", Some(m)),
+        Status::Pending | Status::PreviewReady(_) => (StatusCode::ACCEPTED, "rendering", None),
+        Status::NotFound => (StatusCode::NOT_FOUND, "not_found", None),
+        Status::Failed(_) => (StatusCode::INTERNAL_SERVER_ERROR, "failed", None),
     };
     let base = &app.public_url;
-    (
-        code,
-        axum::Json(json!({
-            "id": id,
-            "status": status_str,
-            "page_url": format!("{base}/game/{id}"),
-            "video_url": format!("{base}/video/{id}.mp4"),
-            "thumb_url": format!("{base}/thumb/{id}.png"),
-        })),
-    )
-        .into_response()
+    let mut payload = json!({
+        "id": id,
+        "status": status_str,
+        "page_url": format!("{base}/game/{id}"),
+        "video_url": format!("{base}/video/{id}.mp4"),
+        "thumb_url": format!("{base}/thumb/{id}.png"),
+    });
+    if let (Some(meta), Some(obj)) = (ready_meta, payload.as_object_mut()) {
+        for key in ["map", "mode", "players", "winner", "winnerPct", "durationSeconds", "ticks", "hashesChecked", "hashMismatches"] {
+            if !meta[key].is_null() {
+                obj.insert(key.into(), meta[key].clone());
+            }
+        }
+    }
+    (code, axum::Json(payload)).into_response()
 }
 
 #[tokio::main]
