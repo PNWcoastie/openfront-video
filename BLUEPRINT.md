@@ -2,28 +2,28 @@
 
 | Metadata | Details |
 | :--- | :--- |
-| **Project** | `openfront-video` Zero-Drift Performance & Architecture Fork (Ado Co-Development & OpenFront Masters Replay Engine) |
-| **Upstream Repository** | `https://github.com/voloder/openfront-video` (Local Clone: [`.`](openfront-video)) |
+| **Project** | `openfront-video` Zero-Drift Performance & Architecture Blueprint |
+| **Upstream Repository** | `https://github.com/voloder/openfront-video` |
 | **Upstream Engine Reference** | [`OpenFrontIO`](https://github.com/openfrontio/OpenFrontIO) (`packages/engine`, `packages/engine-lib`, Baseline Commit `9f4a28f16fae951df0daf727e5e64b34ce8b77d1`) |
-| **Active Git Branch** | `perf/zero-drift-phase1` |
-| **Status** | **Phase 1, Phase 1.5 & Phase 2 Complete & Verified (`#![forbid(unsafe_code)]` + 3-Crate Workspace + 100% Bit-Exact Hash Parity)** |
+| **Active Git Branch** | `master` |
+| **Status** | **Phase 1, Phase 1.5, Phase 2 & Phase 3 Complete & Verified (`#![forbid(unsafe_code)]` + 3-Crate Workspace + 100% Bit-Exact Hash Parity)** |
 | **Verification Standard** | 100% Bit-Exact Replay Checkpoint Hash Parity (`cAj8yxzNsH`: `1,031/1,031` hashes; `cLoKY3fNLi`: `2,060/2,060` hashes; `5,800` water paths) |
 
 ---
 
 ## 1. Executive Summary & Mission Objectives
 
-[`openfront-video`](openfront-video) turns any OpenFront.io match link into an on-demand `.mp4` timelapse embed for Discord (`Discordbot/2.0`). To beat Discord's **3-to-8-second scraper timeout**, Ado ported OpenFront's TypeScript simulation engine (`packages/engine`) into Rust ([`engine-rs`](engine-rs)) and wired a 3-thread pipeline:
+[`openfront-video`](openfront-video) turns any OpenFront.io match link into an on-demand `.mp4` timelapse embed for Discord (`Discordbot/2.0`). To beat Discord's **3-to-8-second scraper timeout**, the upstream architecture ports OpenFront's TypeScript simulation engine (`packages/engine`) into Rust ([`engine-rs`](engine-rs)) and wires a 3-thread pipeline:
 * **Thread 1 (`main`):** Deterministic tick simulation + `FrameStream` delta extraction ([`game.rs`](engine-rs/src/game.rs), [`water.rs`](engine-rs/src/water.rs), [`replay.rs`](engine-rs/src/replay.rs))
 * **Thread 2 (`draw`):** Software 2D map, unit, and text rasterizer using `tiny-skia` + `rustybuzz` ([`draw.rs`](engine-rs/src/bin/openfront-video/draw.rs))
 * **Thread 3 (`encode`):** RGBA-to-I420 conversion + Cisco OpenH264 encoding + MP4 `faststart` muxer ([`encode.rs`](engine-rs/src/bin/openfront-video/encode.rs))
 
-While the port achieved a 4x speedup over TypeScript, it hit **two critical walls** that nearly caused Ado to shelve the project:
-1. **The 4-vCPU Shared-VPS Performance Wall:** On a 4-logical-core machine (like a Hetzner Standard VPS or our 4-core 4-vCPU reference test host), a 17-minute match takes **`16.34 s`** in pure simulation and **`31.45 s`** in a full 3-thread video render (~65 core-seconds of work across `Simulate + Draw + Encode` competing for 4 logical cores).
-2. **The Upstream OpenFront Drift & 12,349-Line Monolith Wall:** Almost the entire simulation engine lives in a single **12,349-line [`game.rs`](engine-rs/src/game.rs)** with 19 `impl Game` blocks, and [`replay::ENGINE_COMMITS`](engine-rs/src/replay.rs#L20-L24) rejects any OpenFront commit not in its hardcoded 3-SHA list—even when upstream commits only touch UI/CSS/server code.
+While the initial Rust port achieved a 4x speedup over TypeScript, two scaling bottlenecks remained:
+1. **The 4-vCPU Shared-VPS Performance Bottleneck:** On a standard 4-vCPU reference host, a 17-minute match takes **`16.34 s`** in pure simulation and **`31.45 s`** in a full 3-thread video render (~65 core-seconds of work across `Simulate + Draw + Encode` competing for 4 logical cores).
+2. **The Upstream OpenFront Drift & 12,349-Line Monolith:** Almost the entire simulation engine lives in a single **12,349-line [`game.rs`](engine-rs/src/game.rs)** with 19 `impl Game` blocks, and [`replay::ENGINE_COMMITS`](engine-rs/src/replay.rs#L20-L24) rejects any OpenFront commit not in its hardcoded 3-SHA list—even when upstream commits only touch UI/CSS/server code.
 
 ### Our Phased Strategy
-* **Phase 1 (Surgical Drop-In Speedup — Zero Layout Churn):** Fix the top data-structure, algorithmic, and 3-thread pipeline bottlenecks **in-place** inside `engine-rs` and `bin/openfront-video`. This produces a clean, minimal diff that Ado can immediately understand and merge while proving massive Before/After speedups with 100% bit-exact hash parity.
+* **Phase 1 (Surgical Drop-In Speedup — Zero Layout Churn):** Fix the top data-structure, algorithmic, and 3-thread pipeline bottlenecks **in-place** inside `engine-rs` and `bin/openfront-video`. This produces a clean, minimal diff that proves Before/After speedups with 100% bit-exact hash parity.
 * **Phase 1.5 (Deep Kernel & Dirty-Rect Optimization):** Squeeze the second layer of hot-path bottlenecks uncovered by the Phase 1 profiler—precomputed `territory_sigmoid` LUT (`1M+` Taylor-series `log`/`exp` calls eliminated), zero-`div` tile coordinates and `STATIC_INTERIOR` fast paths in `map.rs` & `water.rs`, zero-alloc port/warship iterations, reusable `BoundedAStar` in `refine_start_tile`, and dirty-rectangle canvas restoration + direct slice sprite blitting in `draw.rs`.
 * **Phase 2 (Zero-Drift 3-Crate Architecture, Discord SLA & Bot-Agnostic Webhook):** Graduate into the **First-Principles 3-Crate Workspace** (`crates/engine-rs`, `crates/ofv-render`, `crates/ofv-web`), modularize `game.rs` to mirror `OpenFrontIO/packages/engine/src/` 1:1, fix the Two-Stage `Discordbot/2.0` Open Graph flow (`<0.3s` HTML response + `503 Retry-After`), add automatic `git diff --quiet -- packages/engine/` upstream commit fast-forwarding, replace the 4,500-file disk scans in `web/` with **`redb`**, and (as the very last step) expose an **optional, generic Bot Render API (`POST /api/v1/render`)** that *any* bot in the ecosystem can call without hardcoding a specific bot.
 
@@ -38,7 +38,7 @@ All baseline numbers below were captured on our **4-logical-core Linux test host
 | Metric / Execution Scope | **`cAj8yxzNsH` Baseline** *(10,311 ticks, 17.19m)* | **`cAj8yxzNsH` After Phase 1 + 1.5** *(Speedup)* | **`cLoKY3fNLi` Baseline** *(20,601 ticks, 34.34m)* | **`cLoKY3fNLi` After Phase 1 + 1.5** *(Speedup)* |
 | :--- | :---: | :---: | :---: | :---: |
 | **Total Simulation Time** | `16,342.0 ms` (`16.34 s`) | **`10,821.2 ms` (`10.82 s` / `-33.8%` / `1.51x`)** | `22,880.9 ms` (`22.88 s`) | **`14,111.1 ms` (`14.11 s` / `-38.3%` / `1.62x`)** |
-| **Official Metric: `s / min of gameplay`** *(600 ticks = 1m)* | `0.951 s / min` *(~0.50 on 6800H)* | **`0.629 s / min`** *(**`~0.33 s/min` on 6800H**)* | `0.666 s / min` *(~0.35 on 6800H)* | **`0.411 s / min`** *(**`~0.22 s/min` on 6800H**)* |
+| **Official Metric: `s / min of gameplay`** *(600 ticks = 1m)* | `0.951 s / min` | **`0.629 s / min`** | `0.666 s / min` | **`0.411 s / min`** |
 | **Setup Time** | `169 ms` | **`98 ms` (`-42.0%`)** | `78 ms` | `123 ms` *(includes static shore/edge/interior precompute)* |
 | **`AttackExecution`** | `9,418.8 ms` (57.6%) | **`4,753.4 ms` (`-49.5%` / `1.98x`)** | `7,159.8 ms` (31.3%) | **`3,445.0 ms` (`-51.9%` / `2.08x`)** |
 | **`PlayerExecution`** | `2,525.4 ms` (15.5%) | **`2,360.5 ms` (`-6.5%`)** | `2,848.6 ms` (12.5%) | **`2,085.7 ms` (`-26.8%` / `1.37x`)** |
@@ -59,7 +59,7 @@ All baseline numbers below were captured on our **4-logical-core Linux test host
 
 | Pipeline Stage / Component | **`cAj8yxzNsH` Baseline** *(17.2m)* | **`cAj8yxzNsH` After Phase 1 + 1.5** *(Speedup)* | **`cLoKY3fNLi` After Phase 1 + 1.5** *(34.5m)* | Key Phase 1 + 1.5 Optimization Applied |
 | :--- | :---: | :---: | :---: | :--- |
-| **End-to-End Wall-Clock Time** | `31.45 s` *(1.82 s/min)* | **`20.56 s` (`1.19 s/min` / `-34.6%` / `1.53x`)** | **`23.90 s` (`0.69 s/min`!)** | **Shaved `10.89 s` off wall-clock render time on a 4-core i3!** |
+| **End-to-End Wall-Clock Time** | `31.45 s` *(1.82 s/min)* | **`20.56 s` (`1.19 s/min` / `-34.6%` / `1.53x`)** | **`23.90 s` (`0.69 s/min`!)** | **Shaved `10.89 s` off wall-clock render time on a 4-vCPU reference host!** |
 | **Replay Hash Verification** | `1,031 / 1,031` matched | **`1,031 / 1,031` matched (100%)** | **`2,060 / 2,060` matched (100%)** | Bit-exact checkpoint hash parity across 30,912 total ticks |
 | **Thread 1 (`Simulate` Wall Time)** | `30.32 s` *(28.75s busy)* | **`20.19 s` (`17.16 s` busy / `-40.3%` busy)** | **`23.62 s` (`20.67 s` busy)** | Flat slot `TileSet` + `territory_sigmoid_lut` + `STATIC_INTERIOR` + lazy `update_names` |
 | **Thread 2 (`Draw` Busy Work)** | `18.97 s` *(`19.8 ms/frame`)* | **`7.33 s` (`7.6 ms/frame` / `-61.4%` / `2.59x`)** | **`6.36 s` (`6.6 ms/frame` / `-66.5%` / `2.98x`)** | Direct `blit_pixmap` + dirty-rect overlay restore + cache-first `draw_names` |
@@ -115,14 +115,14 @@ Rather than artificially splitting types and media threads into 5 crates or 4 st
    - **Why `draw.rs` and `encode.rs` belong in ONE tightly coupled unit:** `draw.rs` already computes a 32×32 block dirty mask (`self.dirty`) and knows the exact bounding boxes of drawn sprites and text labels. By sharing a recycled `FrameSurface` between `draw` and `encode` inside `ofv-render`, `rgba_to_i420` only converts dirty macroblocks instead of blindly re-converting all 1,638,400 pixels on every frame!
 3. **Crate 3 — `ofv-web` (Axum Discordbot Server, `redb` Catalog & Upstream Commit Router):**
    - **Dependencies:** `tokio`, `axum`, `redb` (**0 simulation or C++ media code**).
-   - Owns the Two-Stage `Discordbot/2.0` responder (`<0.5s` `og:video` HTML + `503 Retry-After` guard), the path-filtered `git diff --quiet -- packages/engine/` upstream commit router, the preempting slot scheduler, the embedded `redb` catalog (replacing 4,500-file `stat()` scans and `events.jsonl`), and the `ofm-gatekeeper` priority render webhook.
+   - Owns the Two-Stage `Discordbot/2.0` responder (`<0.5s` `og:video` HTML + `503 Retry-After` guard), the path-filtered `git diff --quiet -- packages/engine/` upstream commit router, the preempting slot scheduler, the embedded `redb` catalog (replacing 4,500-file `stat()` scans and `events.jsonl`), and the generic bot priority render webhook.
 
 ```mermaid
 flowchart TB
     subgraph Clients["External Callers & Ecosystem Peers"]
         DBOT1["Discordbot/2.0 HTML Scraper<br/>(GET /game/:id — &lt;0.5s og:video Meta)"]
         DBOT2["Discord Media Proxy<br/>(GET /video/:id.mp4 — Byte-Range Stream)"]
-        OFM["ofm-gatekeeper (modest-rutherford)<br/>(Priority Render Webhook)"]
+        OFM["Ecosystem Bot Caller<br/>(Priority Render Webhook)"]
         OF_API["OpenFront Public API<br/>(api.openfront.io/public/game/:id)"]
     end
 
@@ -186,7 +186,7 @@ openfront-video/                   # No root Cargo.toml workspace!
 ```
 
 ### Target 3-Crate Workspace Layout (`After` — First-Principles Systems Layout)
-*Note: In **Phase 1**, we apply the hot-path surgical fixes inside the existing file paths so we can benchmark immediately and offer Ado a frictionless PR. In **Phase 2**, we split the repository into this 3-Crate Workspace:*
+*Note: In **Phase 1**, we apply the hot-path surgical fixes inside the existing file paths so we can benchmark immediately and produce a clean diff. In **Phase 2**, we split the repository into this 3-Crate Workspace:*
 
 ```text
 openfront-video/
@@ -224,7 +224,7 @@ openfront-video/
             ├── storage.rs         #  - Embedded `redb` ACID store (videos_meta, lru_access, engine_commits, audit_events)
             ├── engines.rs         #  - Path-filtered `git diff --quiet -- packages/engine/` auto-verifier + TS fallback
             ├── slots.rs           #  - Preempting slot scheduler (reserves full CPU for on-demand requests)
-            └── auto.rs            #  - Smart background poller + `ofm-gatekeeper` priority queue
+            └── auto.rs            #  - Smart background poller + on-demand priority queue
 ```
 
 ### 3.4 Target Root `Cargo.toml` (`rust-zero-drift` Guardrails)
@@ -373,7 +373,7 @@ To maximize velocity while respecting our **4-core host compute boundary**, we s
   - [x] Replaced 4,500-file `read_dir` + `stat()` scans in `stats.rs` and `cleanup.rs` and `events.jsonl` rewrites with an embedded ACID `redb` database (`DATA_DIR/catalog.redb`) with automatic startup bootstrap.
   - [x] Fixed `slots.rs` double-preemption bug (`preempted_one` guard in `Slots::acquire`).
 - [x] **Step 2.5 — Optional Generic Bot-Agnostic Render Webhook (`POST /api/v1/render`):**
-  - [x] Added bearer-authenticated `POST /api/v1/render` (`RENDER_API_TOKEN`) accepting `{"game": "...", "wait": false}` for any ecosystem bot without hardcoding `ofm-gatekeeper`.
+  - [x] Added bearer-authenticated `POST /api/v1/render` (`RENDER_API_TOKEN`) accepting `{"game": "...", "wait": false}` for any ecosystem bot without hardcoding a specific caller.
 - [x] **Step 2.6 — Phase 2 Build, Parity & End-to-End Integration Audit Gate:**
   - [x] Verified `0 errors, 0 warnings` across all 3 crates, `1,031/1,031` bit-exact state hash parity, `17.2 ms` `Discordbot/2.0` `og:video` response, `redb` bootstrap, `/admin/api/stats`, and `POST /api/v1/render` auth & response (`2026-11-07`).
   - [x] Updated repository documentation (`README.md`, `crates/engine-rs/README.md`, `.env.example`, `docker-compose.yml`).
@@ -384,7 +384,7 @@ To maximize velocity while respecting our **4-core host compute boundary**, we s
   - [x] Eliminated `7x` linear scans per train in `TrainExecution` ([`units.rs`](crates/engine-rs/src/game/units.rs), [`rail.rs`](crates/engine-rs/src/game/rail.rs)) and added single-border early-exit + pre-sized buffers in `calculate_clusters` / `flood_fill` ([`game.rs`](crates/engine-rs/src/game.rs)), plus lazy `has_unit_nearby` in `SAMLauncherExecution`.
   - [x] **Final Pure Simulation Speed (`ENGINE_RS_BENCH=1`, `0` hash mismatches):**
     - `cAj8yxzNsH` (`10,311` ticks): **`10.56s` (`0.614 s/min`)** — **`1.55x` faster** than `16.34s` baseline.
-    - `cLoKY3fNLi` (`20,601` ticks): **`12.06s` (`0.351 s/min`)** — **`1.90x` faster** than `22.88s` baseline (`~0.18 s/min` equivalent on Ryzen 6800H).
+    - `cLoKY3fNLi` (`20,601` ticks): **`12.06s` (`0.351 s/min`)** — **`1.90x` faster** than `22.88s` baseline.
 - [x] **Step 3.2 — Crate 2 (`crates/ofv-render`): OpenFront Broadcast HUD Overlay, Winner Metadata & `--progress-file`:**
   - [x] Added OpenFront-themed **Broadcast HUD Overlay** (`--no-hud` to disable) in [`draw.rs`](crates/ofv-render/src/draw.rs) & [`main.rs`](crates/ofv-render/src/main.rs): top-left `MM:SS` match clock, top-right Top-5 territory `%` leaderboard card with player/team color swatches, and bottom-center `VICTORY` callout banner on final hold frames (supporting both Team + MVP and FFA winners).
   - [x] Tuned default bitrate to `4.5 Mbps` (`15.8 MB` output MP4 vs `21.2 MB` baseline, safely under Discord's inline embed limit) with AVX2 2-row strip delta skipping in [`encode.rs`](crates/ofv-render/src/encode.rs).

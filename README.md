@@ -24,12 +24,12 @@ Given any OpenFront.io match URL, 10-character game ID, or `.json` replay record
 
 ## 2. Empirical Performance & Parity Scorecard
 
-Measured on a 4-vCPU reference host and projected to the upstream Ryzen 6800H reference (`~1.9x` single-core ratio, where `600 ticks = 1.0 min` of gameplay):
+Measured on a standard 4-vCPU reference host (`600 ticks = 1.0 min` of gameplay):
 
 | Benchmark / Metric | Original Baseline (`a035b17`) | Phase 2 (`2e9bfb8`) | Phase 3 Final (`#![forbid(unsafe_code)]`) | Total Improvement |
 | :--- | ---: | ---: | ---: | :--- |
-| **`cAj8yxzNsH` Pure Simulation** (`10,311` ticks / `17.2m` Team) | `16.34s` (`0.951 s/min`) | `10.82s` (`0.630 s/min`) | **`10.56s` (`0.614 s/min`)** *(~`0.32 s/min` on 6800H)* | **`1.55x` faster (`-35.4%`)** |
-| **`cLoKY3fNLi` Pure Simulation** (`20,601` ticks / `34.3m` FFA) | `22.88s` (`0.666 s/min`) | `14.11s` (`0.411 s/min`) | **`12.06s` (`0.351 s/min`)** *(~`0.18 s/min` on 6800H)* | **`1.90x` faster (`-47.3%`)** |
+| **`cAj8yxzNsH` Pure Simulation** (`10,311` ticks / `17.2m` Team) | `16.34s` (`0.951 s/min`) | `10.82s` (`0.630 s/min`) | **`10.56s` (`0.614 s/min`)** | **`1.55x` faster (`-35.4%`)** |
+| **`cLoKY3fNLi` Pure Simulation** (`20,601` ticks / `34.3m` FFA) | `22.88s` (`0.666 s/min`) | `14.11s` (`0.411 s/min`) | **`12.06s` (`0.351 s/min`)** | **`1.90x` faster (`-47.3%`)** |
 | **Archived State-Hash Parity (`cAj` / `cLo`)** | `1,031/1,031` & `2,060/2,060` | `1,031/1,031` & `2,060/2,060` | **`1,031/1,031` & `2,060/2,060` (`0` mismatches)** | **100% Bit-Exact** |
 | **Full Video Render (`cAj8yxzNsH`, `1280x1280`, `960` frames)** | `31.45s` (`1.83 s/min`) | `20.56s` (`1.20 s/min`) | **`24.10s` (`1.40 s/min` with Broadcast HUD)** | **`1.30x–1.53x` faster** |
 | **Output MP4 File Size (`32.0s` video)** | `21.2 MB` (`6.0 Mbps`) | `21.2 MB` (`6.0 Mbps`) | **`15.8 MB` (`4.5 Mbps`, Discord embed safe)** | **`-25.5%` smaller** |
